@@ -1,0 +1,10 @@
+name: robotics-sim
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pip:
+    - taichi>=1.7.0
+    - numpy>=1.21.0
