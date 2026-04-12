@@ -51,6 +51,7 @@ Thumbs.db
 
 # Taichi
 *.ti_cache/
+ti_cache/
 imgui.ini
 
 # Logs
@@ -77,13 +78,6 @@ Pipfile.lock
 # PEP 582
 __pypackages__/
 
-# Celery
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
 # Environments
 .env
 .venv
@@ -95,3 +89,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Claude Code
+.claude/

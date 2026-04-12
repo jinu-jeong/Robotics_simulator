@@ -1,0 +1,130 @@
+<?xml version="1.0"?>
+<robot name="simple_3dof_arm">
+
+  <!-- Base link (fixed to world) -->
+  <link name="base_link">
+    <inertial>
+      <mass value="5.0"/>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.08" length="0.1"/>
+      </geometry>
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.08" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Shoulder joint (revolute, Z-axis) -->
+  <joint name="shoulder_yaw" type="revolute">
+    <parent link="base_link"/>
+    <child link="upper_arm"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" velocity="2.0" effort="50.0"/>
+    <dynamics damping="0.1"/>
+  </joint>
+
+  <!-- Upper arm -->
+  <link name="upper_arm">
+    <inertial>
+      <mass value="2.0"/>
+      <origin xyz="0 0 0.2" rpy="0 0 0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.002"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.2" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.04" length="0.4"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.2 0.4 0.8 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.2" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.04" length="0.4"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Elbow joint (revolute, Y-axis) -->
+  <joint name="elbow_pitch" type="revolute">
+    <parent link="upper_arm"/>
+    <child link="forearm"/>
+    <origin xyz="0 0 0.4" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.35" upper="2.35" velocity="2.0" effort="30.0"/>
+    <dynamics damping="0.05"/>
+  </joint>
+
+  <!-- Forearm -->
+  <link name="forearm">
+    <inertial>
+      <mass value="1.5"/>
+      <origin xyz="0 0 0.15" rpy="0 0 0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.15" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.035" length="0.3"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0.3 0.7 0.3 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.15" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.035" length="0.3"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Wrist joint (revolute, Y-axis) -->
+  <joint name="wrist_pitch" type="revolute">
+    <parent link="forearm"/>
+    <child link="hand"/>
+    <origin xyz="0 0 0.3" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.57" upper="1.57" velocity="3.0" effort="10.0"/>
+    <dynamics damping="0.02"/>
+  </joint>
+
+  <!-- Hand / end-effector -->
+  <link name="hand">
+    <inertial>
+      <mass value="0.5"/>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.0005"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.06 0.06 0.08"/>
+      </geometry>
+      <material name="red">
+        <color rgba="0.8 0.2 0.2 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.06 0.06 0.08"/>
+      </geometry>
+    </collision>
+  </link>
+
+</robot>
