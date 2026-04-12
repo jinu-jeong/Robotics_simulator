@@ -1,133 +1,188 @@
 """Global force and stiffness matrix assembly for FEM.
 
-Vectorized with NumPy batch operations — all elements are processed in parallel.
+Supports Tet4 (legacy vectorized path) and general elements (Hex8, Tet10)
+via multi-point Gauss quadrature.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import numpy as np
 import scipy.sparse as sp
 
-from robosim.physics.fem.mesh import TetMesh
-from robosim.physics.fem.elements import compute_shape_derivatives
+from robosim.physics.fem.mesh import TetMesh, FEMesh
+from robosim.physics.fem.elements import (
+    ElementType, NODES_PER_ELEMENT,
+    compute_shape_derivatives, shape_function, gauss_rule,
+)
 from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
 
 
-def precompute_element_data(mesh: TetMesh) -> tuple[np.ndarray, np.ndarray]:
-    """Precompute shape function gradients and volumes for all elements.
+# ═══════════════════════════════════════════════════════════════
+# Precomputed element integration data
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class ElementIntegrationData:
+    """Precomputed per-element, per-Gauss-point shape gradients and weights.
+
+    For Tet4 (1 Gauss point): compatible with legacy (ne, 4, 3) shape.
+    """
+    # (ne, n_gauss, nodes_per_elem, 3) physical-space shape gradients
+    dN: np.ndarray
+    # (ne, n_gauss) integration weight = det(J) * gauss_weight
+    weights: np.ndarray
+    n_gauss: int
+    nodes_per_elem: int
+    element_type: ElementType
+
+
+def precompute_element_data(mesh) -> tuple:
+    """Precompute shape function gradients and integration weights.
+
+    Parameters
+    ----------
+    mesh : TetMesh or FEMesh
 
     Returns
     -------
-    dN_all : (n_elements, 4, 3) shape function gradients
-    volumes : (n_elements,) element volumes
+    For TetMesh (backward compatible): (dN_all, volumes) as (ne,4,3) and (ne,)
+    For FEMesh: ElementIntegrationData
     """
+    if isinstance(mesh, TetMesh):
+        return _precompute_tet4(mesh)
+
+    etype = mesh.element_type
+    if etype == ElementType.TET4:
+        return _precompute_tet4(mesh)
+
+    return _precompute_general(mesh)
+
+
+def _precompute_tet4(mesh) -> tuple[np.ndarray, np.ndarray]:
+    """Legacy Tet4 precompute — returns (dN_all, volumes)."""
     ne = mesh.n_elements
     dN_all = np.zeros((ne, 4, 3))
     volumes = np.zeros(ne)
-
     for e in range(ne):
         n0, n1, n2, n3 = mesh.elements[e]
         dN_all[e], volumes[e] = compute_shape_derivatives(
             mesh.nodes[n0], mesh.nodes[n1], mesh.nodes[n2], mesh.nodes[n3]
         )
-
     return dN_all, volumes
 
 
-def _batch_deformation_gradients(
-    x: np.ndarray, elements: np.ndarray, dN_all: np.ndarray
-) -> np.ndarray:
-    """Compute deformation gradient for all elements at once.
+def _precompute_general(mesh: FEMesh) -> ElementIntegrationData:
+    """General precompute for Hex8, Tet10, etc."""
+    etype = mesh.element_type
+    npe = NODES_PER_ELEMENT[etype]
+    ne = mesh.n_elements
+    gp_ref, gp_wts = gauss_rule(etype)
+    ng = len(gp_wts)
 
-    F_e = x_def_e^T @ dN_e   for each element e.
+    dN_all = np.zeros((ne, ng, npe, 3))
+    weights = np.zeros((ne, ng))
 
-    Parameters
-    ----------
-    x : (n_nodes, 3)
-    elements : (n_elements, 4)
-    dN_all : (n_elements, 4, 3)
+    for e in range(ne):
+        x_ref = mesh.nodes[mesh.elements[e]]  # (npe, 3)
 
-    Returns
-    -------
-    F_all : (n_elements, 3, 3)
-    """
-    x_def = x[elements]           # (ne, 4, 3)
-    F_all = np.einsum('eai,eaj->eij', x_def, dN_all)  # (ne, 3, 3)
+        for g in range(ng):
+            _, dNdxi = shape_function(etype, gp_ref[g])  # (npe, 3)
+
+            # Jacobian: J = x_ref^T @ dNdxi  (3x3)
+            J = x_ref.T @ dNdxi  # (3, 3)
+            det_J = np.linalg.det(J)
+
+            if abs(det_J) < 1e-20:
+                continue
+
+            J_inv = np.linalg.inv(J)
+            dN_phys = dNdxi @ J_inv  # (npe, 3) in physical coords
+
+            dN_all[e, g] = dN_phys
+            weights[e, g] = abs(det_J) * gp_wts[g]
+
+    return ElementIntegrationData(
+        dN=dN_all, weights=weights, n_gauss=ng,
+        nodes_per_elem=npe, element_type=etype,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Batch deformation gradient & polar decomposition
+# ═══════════════════════════════════════════════════════════════
+
+def _batch_deformation_gradients(x, elements, dN):
+    """Compute F for all elements. dN is (ne, nodes_per_elem, 3)."""
+    x_def = x[elements]                                    # (ne, npe, 3)
+    F_all = np.einsum('eai,eaj->eij', x_def, dN)          # (ne, 3, 3)
     return F_all
 
 
-def _batch_polar_decomposition(F_all: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Polar decomposition F = R @ S for all elements (batch SVD).
-
-    Returns
-    -------
-    R_all : (ne, 3, 3) rotation matrices
-    S_all : (ne, 3, 3) stretch tensors
-    """
+def _batch_polar_decomposition(F_all):
+    """Polar decomposition F = R @ S (batch SVD)."""
     ne = F_all.shape[0]
-    R_all = np.zeros_like(F_all)
-    S_all = np.zeros_like(F_all)
-
-    # Guard: replace degenerate/NaN deformation gradients with identity
     bad = ~np.all(np.isfinite(F_all.reshape(ne, -1)), axis=1)
     if np.any(bad):
         F_all[bad] = np.eye(3)
 
-    # np.linalg.svd is already batched
     U, sigma, Vt = np.linalg.svd(F_all)
-
-    # Fix reflections (ensure det(R) = +1)
     det_UV = np.linalg.det(U) * np.linalg.det(Vt)
     flip = det_UV < 0
     if np.any(flip):
         U[flip, :, 2] *= -1
         sigma[flip, 2] *= -1
 
-    # Clamp singular values: prevent inverted / degenerate elements
-    # from producing extreme stresses that blow up the simulation.
     sigma = np.maximum(sigma, 0.1)
-
-    R_all = U @ Vt                                      # (ne, 3, 3)
-    S_all = np.einsum('eji,ej,ejk->eik', Vt, sigma, Vt)  # V @ diag(sigma) @ V^T
+    R_all = U @ Vt
+    S_all = np.einsum('eji,ej,ejk->eik', Vt, sigma, Vt)
     return R_all, S_all
 
 
-def _batch_corotational_stress(
-    F_all: np.ndarray, R_all: np.ndarray, S_all: np.ndarray,
-    mu: float, lam: float
-) -> np.ndarray:
-    """Compute first Piola-Kirchhoff stress P for all elements.
-
-    P = R @ (2*mu*(S-I) + lam*tr(S-I)*I)
-
-    Returns
-    -------
-    P_all : (ne, 3, 3)
-    """
-    ne = F_all.shape[0]
-    I3 = np.eye(3)[np.newaxis]                         # (1, 3, 3)
-    eps = S_all - I3                                    # (ne, 3, 3)
-    trace_eps = np.trace(eps, axis1=1, axis2=2)         # (ne,)
+def _batch_corotational_stress(F_all, R_all, S_all, mu, lam):
+    """First Piola-Kirchhoff stress P = R @ (2μ(S-I) + λ tr(S-I) I)."""
+    I3 = np.eye(3)[np.newaxis]
+    eps = S_all - I3
+    trace_eps = np.trace(eps, axis1=1, axis2=2)
     T = 2.0 * mu * eps + lam * trace_eps[:, None, None] * I3
-    P_all = R_all @ T
+    return R_all @ T
+
+
+def _batch_neohookean_stress(F_all, mu, lam):
+    ne = F_all.shape[0]
+    P_all = np.zeros_like(F_all)
+    for e in range(ne):
+        F = F_all[e]
+        J = max(np.linalg.det(F), 1e-10)
+        F_inv_T = np.linalg.inv(F).T
+        P_all[e] = mu * (F - F_inv_T) + lam * np.log(J) * F_inv_T
     return P_all
 
 
+# ═══════════════════════════════════════════════════════════════
+# Force assembly
+# ═══════════════════════════════════════════════════════════════
+
 def assemble_forces(
-    mesh: TetMesh,
-    x: np.ndarray,
-    material: CorotationalElastic | NeoHookean,
-    dN_all: np.ndarray,
-    volumes: np.ndarray,
-    return_intermediates: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Assemble global internal force vector (vectorized).
+    mesh, x, material, dN_all, volumes,
+    return_intermediates=False,
+):
+    """Assemble global internal force vector.
 
-    f_int = -sum_e vol_e * P_e @ dN_e^T  scattered to global DOFs.
-
-    If return_intermediates=True, also returns (F_all, R_all, S_all)
-    so assemble_stiffness can skip recomputation.
+    Parameters
+    ----------
+    mesh : TetMesh or FEMesh
+    dN_all : (ne,4,3) for Tet4  OR  ElementIntegrationData for Hex8/Tet10
+    volumes : (ne,) for Tet4  OR  ignored for general (weights in dN_all)
     """
+    if isinstance(dN_all, ElementIntegrationData):
+        return _assemble_forces_general(mesh, x, material, dN_all, return_intermediates)
+    return _assemble_forces_tet4(mesh, x, material, dN_all, volumes, return_intermediates)
+
+
+def _assemble_forces_tet4(mesh, x, material, dN_all, volumes, return_intermediates):
+    """Optimized Tet4 force assembly (single Gauss point, vectorized)."""
     ne = mesh.n_elements
     n_dof = mesh.n_nodes * 3
 
@@ -140,37 +195,71 @@ def assemble_forces(
     else:
         P_all = _batch_neohookean_stress(F_all, material.mu, material.lam)
 
-    # H_all[e] = vol_e * P_e @ dN_e^T  -> (ne, 3, 4)
     H_all = volumes[:, None, None] * np.einsum('eij,ekj->eik', P_all, dN_all)
 
-    # Scatter: f[node_a*3 : node_a*3+3] -= H_all[e, :, a]
     f = np.zeros(n_dof)
     for a in range(4):
-        node_indices = mesh.elements[:, a]
-        np.add.at(f.reshape(-1, 3), node_indices, -H_all[:, :, a])
+        np.add.at(f.reshape(-1, 3), mesh.elements[:, a], -H_all[:, :, a])
 
     if return_intermediates:
         return f, F_all, R_all, S_all
     return f
 
 
+def _assemble_forces_general(mesh, x, material, edata: ElementIntegrationData, return_intermediates):
+    """General force assembly with multi-point Gauss integration."""
+    ne = mesh.n_elements
+    npe = edata.nodes_per_elem
+    ng = edata.n_gauss
+    n_dof = mesh.n_nodes * 3
+
+    f = np.zeros(n_dof)
+    # Accumulate R_all from first Gauss point (for stiffness reuse)
+    R_first = None
+    S_first = None
+    F_first = None
+
+    for g in range(ng):
+        dN_g = edata.dN[:, g, :, :]    # (ne, npe, 3)
+        w_g = edata.weights[:, g]       # (ne,)
+
+        F_all = _batch_deformation_gradients(x, mesh.elements, dN_g)
+
+        if isinstance(material, CorotationalElastic):
+            R_all, S_all = _batch_polar_decomposition(F_all)
+            P_all = _batch_corotational_stress(F_all, R_all, S_all, material.mu, material.lam)
+        else:
+            P_all = _batch_neohookean_stress(F_all, material.mu, material.lam)
+
+        if g == 0:
+            R_first, S_first, F_first = R_all, S_all, F_all
+
+        # H[e, i, a] = w * P[e,i,j] * dN[e,a,j]
+        H_all = w_g[:, None, None] * np.einsum('eij,eaj->eia', P_all, dN_g)
+
+        for a in range(npe):
+            np.add.at(f.reshape(-1, 3), mesh.elements[:, a], -H_all[:, :, a])
+
+    if return_intermediates:
+        return f, F_first, R_first, S_first
+    return f
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stiffness assembly
+# ═══════════════════════════════════════════════════════════════
+
 def assemble_stiffness(
-    mesh: TetMesh,
-    x: np.ndarray,
-    material: CorotationalElastic | NeoHookean,
-    dN_all: np.ndarray,
-    volumes: np.ndarray,
-    R_all: np.ndarray | None = None,
-) -> sp.csr_matrix:
-    """Assemble global stiffness matrix K (vectorized COO assembly).
+    mesh, x, material, dN_all, volumes, R_all=None,
+):
+    """Assemble global stiffness matrix K."""
+    if isinstance(dN_all, ElementIntegrationData):
+        return _assemble_stiffness_general(mesh, x, material, dN_all, R_all)
+    return _assemble_stiffness_tet4(mesh, x, material, dN_all, volumes, R_all)
 
-    For corotational: K_e[ab] = vol * R @ (mu*(dNa.dNb)*I + mu*dNb(x)dNa + lam*dNa(x)dNb) @ R^T
 
-    Parameters
-    ----------
-    R_all : optional pre-computed rotation matrices from assemble_forces.
-            Avoids duplicate SVD computation.
-    """
+def _assemble_stiffness_tet4(mesh, x, material, dN_all, volumes, R_all):
+    """Tet4 stiffness (single Gauss point, vectorized)."""
     ne = mesh.n_elements
     n_dof = mesh.n_nodes * 3
 
@@ -178,55 +267,73 @@ def assemble_stiffness(
         if R_all is None:
             F_all = _batch_deformation_gradients(x, mesh.elements, dN_all)
             R_all, _ = _batch_polar_decomposition(F_all)
-        Ke_all = _batch_corotational_stiffness(R_all, dN_all, volumes, material.mu, material.lam)
+        Ke_all = _batch_corotational_stiffness(R_all, dN_all, volumes, material.mu, material.lam, 4)
     else:
-        Ke_all = _batch_numerical_stiffness(mesh, x, material, dN_all, volumes)
+        Ke_all = _batch_numerical_stiffness_tet4(mesh, x, material, dN_all, volumes)
 
-    # Build COO triplets from all element stiffness matrices
-    # Ke_all: (ne, 12, 12), elements: (ne, 4)
-    # Global DOF indices for each element: (ne, 4) -> (ne, 12)
-    elem_dofs = np.repeat(mesh.elements * 3, 3, axis=1) + np.tile([0, 1, 2], 4)  # (ne, 12)
+    ndof_e = 12
+    elem_dofs = np.repeat(mesh.elements * 3, 3, axis=1) + np.tile([0, 1, 2], 4)
+    row_idx = np.repeat(elem_dofs[:, :, np.newaxis], ndof_e, axis=2)
+    col_idx = np.repeat(elem_dofs[:, np.newaxis, :], ndof_e, axis=1)
 
-    # Row/col indices for all elements: (ne, 12, 12)
-    row_idx = np.repeat(elem_dofs[:, :, np.newaxis], 12, axis=2)  # (ne, 12, 12)
-    col_idx = np.repeat(elem_dofs[:, np.newaxis, :], 12, axis=1)  # (ne, 12, 12)
-
-    K = sp.coo_matrix(
-        (Ke_all.ravel(), (row_idx.ravel(), col_idx.ravel())),
-        shape=(n_dof, n_dof),
-    )
+    K = sp.coo_matrix((Ke_all.ravel(), (row_idx.ravel(), col_idx.ravel())), shape=(n_dof, n_dof))
     return K.tocsr()
 
 
-def _batch_corotational_stiffness(
-    R_all: np.ndarray, dN_all: np.ndarray,
-    volumes: np.ndarray, mu: float, lam: float,
-) -> np.ndarray:
-    """Compute all element stiffness matrices (vectorized).
+def _assemble_stiffness_general(mesh, x, material, edata: ElementIntegrationData, R_all_hint):
+    """General stiffness assembly with multi-point Gauss integration."""
+    ne = mesh.n_elements
+    npe = edata.nodes_per_elem
+    ng = edata.n_gauss
+    n_dof = mesh.n_nodes * 3
+    ndof_e = npe * 3
 
-    Returns
-    -------
-    Ke_all : (ne, 12, 12)
-    """
+    Ke_all = np.zeros((ne, ndof_e, ndof_e))
+
+    for g in range(ng):
+        dN_g = edata.dN[:, g, :, :]  # (ne, npe, 3)
+        w_g = edata.weights[:, g]     # (ne,)
+
+        if isinstance(material, CorotationalElastic):
+            F_all = _batch_deformation_gradients(x, mesh.elements, dN_g)
+            R_all, _ = _batch_polar_decomposition(F_all)
+            Ke_g = _batch_corotational_stiffness(R_all, dN_g, w_g, material.mu, material.lam, npe)
+        else:
+            # Numerical stiffness per Gauss point (fallback)
+            Ke_g = _batch_numerical_stiffness_general(
+                mesh, x, material, dN_g, w_g, npe
+            )
+
+        Ke_all += Ke_g
+
+    # Build sparse matrix
+    elem_dofs = np.repeat(mesh.elements * 3, 3, axis=1) + np.tile([0, 1, 2], npe)
+    row_idx = np.repeat(elem_dofs[:, :, np.newaxis], ndof_e, axis=2)
+    col_idx = np.repeat(elem_dofs[:, np.newaxis, :], ndof_e, axis=1)
+
+    K = sp.coo_matrix((Ke_all.ravel(), (row_idx.ravel(), col_idx.ravel())), shape=(n_dof, n_dof))
+    return K.tocsr()
+
+
+def _batch_corotational_stiffness(R_all, dN_all, weights, mu, lam, npe):
+    """Corotational stiffness for any element (vectorized over elements)."""
     ne = R_all.shape[0]
-    Ke_all = np.zeros((ne, 12, 12))
+    ndof_e = npe * 3
+    Ke_all = np.zeros((ne, ndof_e, ndof_e))
 
-    for a in range(4):
-        for b in range(4):
+    for a in range(npe):
+        for b in range(npe):
             dNa = dN_all[:, a, :]  # (ne, 3)
             dNb = dN_all[:, b, :]  # (ne, 3)
-
-            # dot products: (ne,)
             dot_ab = np.einsum('ei,ei->e', dNa, dNb)
 
-            # Block: vol * (mu * dot * I + mu * outer(dNb, dNa) + lam * outer(dNa, dNb))
-            I3 = np.eye(3)[np.newaxis]                          # (1,3,3)
+            I3 = np.eye(3)[np.newaxis]
             K_block = (
                 mu * dot_ab[:, None, None] * I3
                 + mu * np.einsum('ei,ej->eij', dNb, dNa)
                 + lam * np.einsum('ei,ej->eij', dNa, dNb)
             )
-            K_block *= volumes[:, None, None]
+            K_block *= weights[:, None, None]
 
             # Rotate: R @ K_block @ R^T
             K_block = np.einsum('eij,ejk,elk->eil', R_all, K_block, R_all)
@@ -238,38 +345,20 @@ def _batch_corotational_stiffness(
     return Ke_all
 
 
-def _batch_neohookean_stress(F_all: np.ndarray, mu: float, lam: float) -> np.ndarray:
-    """Neo-Hookean stress for all elements."""
-    ne = F_all.shape[0]
-    P_all = np.zeros_like(F_all)
-    for e in range(ne):
-        F = F_all[e]
-        J = np.linalg.det(F)
-        if J < 1e-10:
-            J = 1e-10
-        F_inv_T = np.linalg.inv(F).T
-        P_all[e] = mu * (F - F_inv_T) + lam * np.log(J) * F_inv_T
-    return P_all
-
-
-def _batch_numerical_stiffness(
-    mesh: TetMesh, x: np.ndarray, material,
-    dN_all: np.ndarray, volumes: np.ndarray, eps: float = 1e-7,
-) -> np.ndarray:
-    """Numerical stiffness for all elements (fallback for Neo-Hookean)."""
+def _batch_numerical_stiffness_tet4(mesh, x, material, dN_all, volumes):
+    """Numerical stiffness for Tet4 (Neo-Hookean fallback)."""
     ne = mesh.n_elements
     Ke_all = np.zeros((ne, 12, 12))
+    eps = 1e-7
     for e in range(ne):
         nodes_e = mesh.elements[e]
-        dN = dN_all[e]
-        vol = volumes[e]
+        dN = dN_all[e]; vol = volumes[e]
         if vol < 1e-20:
             continue
         x_def = x[nodes_e].copy()
         F0 = x_def.T @ dN
         P0, _ = material.compute_stress(F0)
         f0 = (-vol * (P0 @ dN.T)).T.ravel()
-
         for j in range(12):
             a, d = divmod(j, 3)
             x_pert = x_def.copy()
@@ -278,38 +367,105 @@ def _batch_numerical_stiffness(
             P_p, _ = material.compute_stress(F_p)
             f_p = (-vol * (P_p @ dN.T)).T.ravel()
             Ke_all[e, :, j] = -(f_p - f0) / eps
-
         Ke_all[e] = 0.5 * (Ke_all[e] + Ke_all[e].T)
     return Ke_all
 
 
-def batch_von_mises(
-    mesh: TetMesh,
-    x: np.ndarray,
-    material: CorotationalElastic,
-    dN_all: np.ndarray,
-    volumes: np.ndarray,
-) -> np.ndarray:
-    """Compute per-node von Mises stress (vectorized).
+def _batch_numerical_stiffness_general(mesh, x, material, dN_g, w_g, npe):
+    """Numerical stiffness for general elements at a single Gauss point."""
+    ne = mesh.n_elements
+    ndof_e = npe * 3
+    Ke_all = np.zeros((ne, ndof_e, ndof_e))
+    eps = 1e-7
+    for e in range(ne):
+        nodes_e = mesh.elements[e]
+        dN = dN_g[e]; w = w_g[e]
+        if w < 1e-20:
+            continue
+        x_def = x[nodes_e].copy()
+        F0 = x_def.T @ dN
+        J0 = max(np.linalg.det(F0), 1e-10)
+        F_inv_T0 = np.linalg.inv(F0).T
+        P0 = material.mu * (F0 - F_inv_T0) + material.lam * np.log(J0) * F_inv_T0
+        f0 = (-w * (P0 @ dN.T)).T.ravel()
+        for j in range(ndof_e):
+            a, d = divmod(j, 3)
+            x_pert = x_def.copy()
+            x_pert[a, d] += eps
+            F_p = x_pert.T @ dN
+            J_p = max(np.linalg.det(F_p), 1e-10)
+            F_inv_T_p = np.linalg.inv(F_p).T
+            P_p = material.mu * (F_p - F_inv_T_p) + material.lam * np.log(J_p) * F_inv_T_p
+            f_p = (-w * (P_p @ dN.T)).T.ravel()
+            Ke_all[e, :, j] = -(f_p - f0) / eps
+        Ke_all[e] = 0.5 * (Ke_all[e] + Ke_all[e].T)
+    return Ke_all
 
-    Returns
-    -------
-    vm_per_node : (n_nodes,) averaged von Mises stress
+
+# ═══════════════════════════════════════════════════════════════
+# Mass matrix
+# ═══════════════════════════════════════════════════════════════
+
+def assemble_mass_matrix(mesh, density, volumes) -> sp.csr_matrix:
+    """Assemble lumped mass matrix (diagonal).
+
+    Parameters
+    ----------
+    mesh : TetMesh or FEMesh
+    density : material density
+    volumes : (ne,) for Tet4  OR  ElementIntegrationData
     """
+    n_dof = mesh.n_nodes * 3
+    diag = np.zeros(n_dof)
+
+    if isinstance(volumes, ElementIntegrationData):
+        edata = volumes
+        # Total weight per element = sum of Gauss weights
+        elem_vol = edata.weights.sum(axis=1)  # (ne,)
+        npe = edata.nodes_per_elem
+        elem_node_mass = density * elem_vol / npe
+        for a in range(npe):
+            node_indices = mesh.elements[:, a]
+            np.add.at(diag[::3], node_indices, elem_node_mass)
+            np.add.at(diag[1::3], node_indices, elem_node_mass)
+            np.add.at(diag[2::3], node_indices, elem_node_mass)
+    else:
+        # Tet4 legacy
+        npe = 4
+        elem_node_mass = density * volumes / npe
+        for a in range(npe):
+            node_indices = mesh.elements[:, a]
+            np.add.at(diag[::3], node_indices, elem_node_mass)
+            np.add.at(diag[1::3], node_indices, elem_node_mass)
+            np.add.at(diag[2::3], node_indices, elem_node_mass)
+
+    return sp.diags(diag, format="csr")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Von Mises stress
+# ═══════════════════════════════════════════════════════════════
+
+def batch_von_mises(mesh, x, material, dN_all, volumes) -> np.ndarray:
+    """Per-node averaged von Mises stress."""
+    if isinstance(dN_all, ElementIntegrationData):
+        return _von_mises_general(mesh, x, material, dN_all)
+    return _von_mises_tet4(mesh, x, material, dN_all)
+
+
+def _von_mises_tet4(mesh, x, material, dN_all):
     F_all = _batch_deformation_gradients(x, mesh.elements, dN_all)
     R_all, S_all = _batch_polar_decomposition(F_all)
 
     I3 = np.eye(3)[np.newaxis]
-    eps = S_all - I3                                         # (ne, 3, 3)
-    trace_eps = np.trace(eps, axis1=1, axis2=2)              # (ne,)
+    eps = S_all - I3
+    trace_eps = np.trace(eps, axis1=1, axis2=2)
     sigma = 2.0 * material.mu * eps + material.lam * trace_eps[:, None, None] * I3
 
-    # Deviatoric: s = sigma - tr(sigma)/3 * I
-    trace_sigma = np.trace(sigma, axis1=1, axis2=2)          # (ne,)
+    trace_sigma = np.trace(sigma, axis1=1, axis2=2)
     dev = sigma - (trace_sigma[:, None, None] / 3.0) * I3
-    vm = np.sqrt(1.5 * np.sum(dev**2, axis=(1, 2)))         # (ne,)
+    vm = np.sqrt(1.5 * np.sum(dev**2, axis=(1, 2)))
 
-    # Scatter to nodes (average)
     stress_sum = np.zeros(mesh.n_nodes)
     count = np.zeros(mesh.n_nodes)
     for a in range(4):
@@ -319,22 +475,26 @@ def batch_von_mises(
     return stress_sum / count
 
 
-def assemble_mass_matrix(
-    mesh: TetMesh,
-    density: float,
-    volumes: np.ndarray,
-) -> sp.csr_matrix:
-    """Assemble lumped mass matrix (diagonal, vectorized)."""
-    n_dof = mesh.n_nodes * 3
-    diag = np.zeros(n_dof)
+def _von_mises_general(mesh, x, material, edata: ElementIntegrationData):
+    """Von Mises for general elements (use first Gauss point as representative)."""
+    dN_g0 = edata.dN[:, 0, :, :]  # first Gauss point
+    F_all = _batch_deformation_gradients(x, mesh.elements, dN_g0)
+    R_all, S_all = _batch_polar_decomposition(F_all)
 
-    # Mass per node = density * volume / 4 for each adjacent element
-    elem_node_mass = density * volumes / 4.0  # (ne,)
+    I3 = np.eye(3)[np.newaxis]
+    eps = S_all - I3
+    trace_eps = np.trace(eps, axis1=1, axis2=2)
+    sigma = 2.0 * material.mu * eps + material.lam * trace_eps[:, None, None] * I3
 
-    for a in range(4):
-        node_indices = mesh.elements[:, a]
-        np.add.at(diag[::3], node_indices, elem_node_mass)
-        np.add.at(diag[1::3], node_indices, elem_node_mass)
-        np.add.at(diag[2::3], node_indices, elem_node_mass)
+    trace_sigma = np.trace(sigma, axis1=1, axis2=2)
+    dev = sigma - (trace_sigma[:, None, None] / 3.0) * I3
+    vm = np.sqrt(1.5 * np.sum(dev**2, axis=(1, 2)))
 
-    return sp.diags(diag, format="csr")
+    npe = edata.nodes_per_elem
+    stress_sum = np.zeros(mesh.n_nodes)
+    count = np.zeros(mesh.n_nodes)
+    for a in range(npe):
+        np.add.at(stress_sum, mesh.elements[:, a], vm)
+        np.add.at(count, mesh.elements[:, a], 1.0)
+    count[count == 0] = 1.0
+    return stress_sum / count
