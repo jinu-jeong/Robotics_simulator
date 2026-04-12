@@ -80,6 +80,18 @@ class Robot:
         self._q = np.zeros(dof_count)
         self._qd = np.zeros(dof_count)
 
+        # Build mimic joint map: follower_joint_idx -> (leader_joint_idx, multiplier, offset)
+        self._mimic_map: dict[int, tuple[int, float, float]] = {}
+        for j_idx, joint in enumerate(self.joints):
+            if joint.mimic_joint is not None:
+                leader_idx = self._joint_name_to_idx.get(joint.mimic_joint)
+                if leader_idx is not None:
+                    self._mimic_map[j_idx] = (
+                        leader_idx,
+                        joint.mimic_multiplier,
+                        joint.mimic_offset,
+                    )
+
         return self
 
     @property
@@ -202,6 +214,24 @@ class Robot:
                 queue.append(child_idx)
 
         return T_world
+
+    def enforce_mimic(self):
+        """Synchronize mimic (follower) joints to their leader joints.
+
+        For each mimic joint:  q_follower = multiplier * q_leader + offset
+                               qd_follower = multiplier * qd_leader
+        """
+        for follower_idx, (leader_idx, mult, offset) in self._mimic_map.items():
+            f_dof = self._dof_index[follower_idx]
+            l_dof = self._dof_index[leader_idx]
+            if self.joints[follower_idx].num_dof > 0 and self.joints[leader_idx].num_dof > 0:
+                self._q[f_dof] = mult * self._q[l_dof] + offset
+                self._qd[f_dof] = mult * self._qd[l_dof]
+
+    @property
+    def has_mimic(self) -> bool:
+        """True if any mimic joints are defined."""
+        return len(self._mimic_map) > 0
 
     def print_tree(self, indent: int = 0, link_idx: int = 0):
         """Print the kinematic tree structure."""

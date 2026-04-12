@@ -68,4 +68,13 @@ def semi_implicit_euler(
             q_new[dof_offset] = joint.limits.upper
             qd_new[dof_offset] = min(0.0, qd_new[dof_offset])
 
+    # Enforce mimic constraints
+    if robot.has_mimic:
+        # Temporarily set state so enforce_mimic works on q/qd arrays
+        q_save, qd_save = robot._q, robot._qd
+        robot._q, robot._qd = q_new, qd_new
+        robot.enforce_mimic()
+        q_new, qd_new = robot._q, robot._qd
+        robot._q, robot._qd = q_save, qd_save
+
     return q_new, qd_new

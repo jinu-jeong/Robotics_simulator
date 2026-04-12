@@ -56,6 +56,11 @@ class Joint:
     damping: float = 0.0
     friction: float = 0.0
 
+    # Mimic joint: follower mirrors a leader joint
+    mimic_joint: Optional[str] = None       # name of the leader joint
+    mimic_multiplier: float = 1.0
+    mimic_offset: float = 0.0
+
     def __post_init__(self):
         self.axis = np.asarray(self.axis, dtype=np.float64).reshape(3)
         norm = np.linalg.norm(self.axis)

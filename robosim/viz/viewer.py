@@ -124,9 +124,15 @@ def geometry_to_trimesh(geom: Geometry) -> tuple[np.ndarray, np.ndarray]:
     elif geom.geometry_type == GeometryType.CYLINDER:
         return _cylinder_triangles(geom.radius, geom.length)
     elif geom.geometry_type == GeometryType.MESH:
+        # Use cached mesh data if available (loaded by URDF parser)
+        if geom.mesh_loaded:
+            return geom.mesh_vertices.copy(), geom.mesh_faces.copy()
+        # Fallback: try loading directly
         try:
             import trimesh
-            tm = trimesh.load(geom.mesh_path)
+            tm = trimesh.load(geom.mesh_path, force="mesh")
+            if isinstance(tm, trimesh.Scene):
+                tm = tm.dump(concatenate=True)
             if geom.mesh_scale is not None:
                 tm.apply_scale(geom.mesh_scale)
             return np.array(tm.vertices, dtype=np.float64), np.array(tm.faces, dtype=np.int32)
@@ -308,11 +314,9 @@ class SimViewer:
             if entry is None:
                 continue
 
-            # Rebuild base verts (geometry + visual origin)
-            verts, _ = geometry_to_trimesh(geom)
-            mat_origin = origin.to_matrix()
-            R_o, t_o = mat_origin[:3, :3], mat_origin[:3, 3]
-            verts = (R_o @ verts.T).T + t_o
+            # Use cached base_verts (already has visual origin baked in)
+            # — avoids re-calling geometry_to_trimesh every frame
+            verts = entry.base_verts
 
             # Apply world transform
             mat_w = world_T.to_matrix()

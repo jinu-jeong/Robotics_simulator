@@ -20,30 +20,39 @@ from robosim.model.link import Collision, Link, Visual
 from robosim.model.robot import Robot
 
 
-def parse_urdf(source: str | Path) -> Robot:
+def parse_urdf(source: str | Path, mesh_dir: str | Path | None = None) -> Robot:
     """Parse a URDF file or XML string into a Robot model.
 
     Parameters
     ----------
     source : file path or XML string
+    mesh_dir : optional base directory for resolving mesh paths.
+               If *None* and *source* is a file path, the file's parent
+               directory is used automatically.
 
     Returns
     -------
     Robot with links, joints, and built kinematic tree.
     """
     source_str = str(source)
+    urdf_dir: Path | None = None
+
     if source_str.endswith(".urdf") or source_str.endswith(".xml") or Path(source_str).exists():
         tree = ET.parse(source_str)
         root = tree.getroot()
+        urdf_dir = Path(source_str).resolve().parent
     else:
         root = ET.fromstring(source_str)
+
+    # mesh_dir takes precedence over auto-detected urdf_dir
+    base_dir = Path(mesh_dir) if mesh_dir is not None else urdf_dir
 
     robot_name = root.attrib.get("name", "unnamed_robot")
     links = []
     joints = []
 
     for link_elem in root.findall("link"):
-        links.append(_parse_link(link_elem))
+        links.append(_parse_link(link_elem, base_dir=base_dir))
 
     for joint_elem in root.findall("joint"):
         joints.append(_parse_joint(joint_elem))
@@ -53,7 +62,7 @@ def parse_urdf(source: str | Path) -> Robot:
     return robot
 
 
-def _parse_link(elem: ET.Element) -> Link:
+def _parse_link(elem: ET.Element, base_dir: Path | None = None) -> Link:
     """Parse a <link> element."""
     name = elem.attrib["name"]
     link = Link(name=name)
@@ -89,7 +98,7 @@ def _parse_link(elem: ET.Element) -> Link:
 
     # Visuals
     for visual_elem in elem.findall("visual"):
-        geom = _parse_geometry(visual_elem.find("geometry"))
+        geom = _parse_geometry(visual_elem.find("geometry"), base_dir=base_dir)
         if geom is not None:
             origin = _parse_origin(visual_elem.find("origin"))
             color = _parse_color(visual_elem.find("material"))
@@ -97,7 +106,7 @@ def _parse_link(elem: ET.Element) -> Link:
 
     # Collisions
     for collision_elem in elem.findall("collision"):
-        geom = _parse_geometry(collision_elem.find("geometry"))
+        geom = _parse_geometry(collision_elem.find("geometry"), base_dir=base_dir)
         if geom is not None:
             origin = _parse_origin(collision_elem.find("origin"))
             link.collisions.append(Collision(geometry=geom, origin=origin))
@@ -151,6 +160,16 @@ def _parse_joint(elem: ET.Element) -> Joint:
         damping = float(dynamics_elem.attrib.get("damping", "0"))
         friction = float(dynamics_elem.attrib.get("friction", "0"))
 
+    # Mimic
+    mimic_joint = None
+    mimic_multiplier = 1.0
+    mimic_offset = 0.0
+    mimic_elem = elem.find("mimic")
+    if mimic_elem is not None:
+        mimic_joint = mimic_elem.attrib.get("joint", None)
+        mimic_multiplier = float(mimic_elem.attrib.get("multiplier", "1"))
+        mimic_offset = float(mimic_elem.attrib.get("offset", "0"))
+
     return Joint(
         name=name,
         joint_type=joint_type,
@@ -161,6 +180,9 @@ def _parse_joint(elem: ET.Element) -> Joint:
         limits=limits,
         damping=damping,
         friction=friction,
+        mimic_joint=mimic_joint,
+        mimic_multiplier=mimic_multiplier,
+        mimic_offset=mimic_offset,
     )
 
 
@@ -178,7 +200,9 @@ def _parse_origin(elem: Optional[ET.Element]) -> Transform:
     return T
 
 
-def _parse_geometry(elem: Optional[ET.Element]) -> Optional[Geometry]:
+def _parse_geometry(
+    elem: Optional[ET.Element], base_dir: Path | None = None,
+) -> Optional[Geometry]:
     """Parse a <geometry> element."""
     if elem is None:
         return None
@@ -199,12 +223,15 @@ def _parse_geometry(elem: Optional[ET.Element]) -> Optional[Geometry]:
         l = float(cylinder.attrib.get("length", "1.0"))
         return Geometry.cylinder(r, l)
 
-    mesh = elem.find("mesh")
-    if mesh is not None:
-        filename = mesh.attrib.get("filename", "")
-        scale_str = mesh.attrib.get("scale", None)
+    mesh_elem = elem.find("mesh")
+    if mesh_elem is not None:
+        filename = mesh_elem.attrib.get("filename", "")
+        scale_str = mesh_elem.attrib.get("scale", None)
         scale = _parse_vec3(scale_str) if scale_str else None
-        return Geometry.mesh(filename, scale)
+        geom = Geometry.mesh(filename, scale)
+        # Eagerly load mesh data
+        geom.load_mesh(base_dir)
+        return geom
 
     return None
 
