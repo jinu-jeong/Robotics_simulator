@@ -126,6 +126,127 @@ def sphere_sphere(
                         normal=n, penetration=penetration)
 
 
+# ── Triangle proximity queries ──────────────────────────────────
+
+def point_triangle_distance(
+    point: np.ndarray,
+    v0: np.ndarray, v1: np.ndarray, v2: np.ndarray,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Closest point on a triangle to a query point.
+
+    Parameters
+    ----------
+    point : (3,) query point
+    v0, v1, v2 : (3,) triangle vertices
+
+    Returns
+    -------
+    closest : (3,) closest point on triangle
+    distance : scalar distance (always >= 0)
+    bary : (3,) barycentric coordinates of closest point
+    """
+    e0 = v1 - v0
+    e1 = v2 - v0
+    v = point - v0
+
+    d00 = np.dot(e0, e0)
+    d01 = np.dot(e0, e1)
+    d11 = np.dot(e1, e1)
+    d20 = np.dot(v, e0)
+    d21 = np.dot(v, e1)
+
+    denom = d00 * d11 - d01 * d01
+    if abs(denom) < 1e-30:
+        # Degenerate triangle
+        return v0.copy(), float(np.linalg.norm(point - v0)), np.array([1.0, 0.0, 0.0])
+
+    inv_denom = 1.0 / denom
+    s = (d11 * d20 - d01 * d21) * inv_denom
+    t = (d00 * d21 - d01 * d20) * inv_denom
+
+    # Clamp to triangle: project to nearest edge/vertex if outside
+    if s >= 0 and t >= 0 and s + t <= 1:
+        # Inside triangle
+        bary = np.array([1.0 - s - t, s, t])
+        closest = v0 + s * e0 + t * e1
+    else:
+        # Project onto edges and pick closest
+        best_dist = np.inf
+        closest = v0.copy()
+        bary = np.array([1.0, 0.0, 0.0])
+
+        # Edge v0-v1
+        cp, d, b = _closest_point_on_segment(point, v0, v1)
+        if d < best_dist:
+            best_dist, closest = d, cp
+            bary = np.array([1.0 - b, b, 0.0])
+
+        # Edge v0-v2
+        cp, d, b = _closest_point_on_segment(point, v0, v2)
+        if d < best_dist:
+            best_dist, closest = d, cp
+            bary = np.array([1.0 - b, 0.0, b])
+
+        # Edge v1-v2
+        cp, d, b = _closest_point_on_segment(point, v1, v2)
+        if d < best_dist:
+            best_dist, closest = d, cp
+            bary = np.array([0.0, 1.0 - b, b])
+
+    dist = float(np.linalg.norm(point - closest))
+    return closest, dist, bary
+
+
+def _closest_point_on_segment(
+    point: np.ndarray, a: np.ndarray, b: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """Closest point on segment ab to point. Returns (closest, dist, t)."""
+    ab = b - a
+    ab_sq = np.dot(ab, ab)
+    if ab_sq < 1e-30:
+        return a.copy(), float(np.linalg.norm(point - a)), 0.0
+    t = np.clip(np.dot(point - a, ab) / ab_sq, 0.0, 1.0)
+    closest = a + t * ab
+    return closest, float(np.linalg.norm(point - closest)), float(t)
+
+
+def triangle_normal(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    """Outward normal of a triangle (unnormalized ok, will be normalized)."""
+    n = np.cross(v1 - v0, v2 - v0)
+    norm = np.linalg.norm(n)
+    if norm < 1e-20:
+        return np.array([0.0, 0.0, 1.0])
+    return n / norm
+
+
+def sphere_triangle(
+    center: np.ndarray, radius: float,
+    v0: np.ndarray, v1: np.ndarray, v2: np.ndarray,
+) -> ContactPoint | None:
+    """Sphere vs triangle contact.
+
+    Returns ContactPoint if sphere overlaps triangle (within radius distance).
+    Normal points from triangle toward sphere center.
+    """
+    closest, dist, bary = point_triangle_distance(center, v0, v1, v2)
+    penetration = radius - dist
+
+    if penetration <= 0:
+        return None
+
+    if dist < 1e-12:
+        # Center exactly on triangle — use face normal
+        normal = triangle_normal(v0, v1, v2)
+    else:
+        normal = (center - closest)
+        normal = normal / np.linalg.norm(normal)
+
+    point_a = center - radius * normal   # point on sphere surface
+    point_b = closest                     # point on triangle
+    return ContactPoint(point_a=point_a, point_b=point_b,
+                        normal=normal, penetration=penetration)
+
+
 def points_ground(
     points: np.ndarray,
     ground_height: float = 0.0,

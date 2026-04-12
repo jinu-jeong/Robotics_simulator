@@ -18,6 +18,15 @@ from robosim.physics.contact.response import (
     ContactParams,
     compute_contact_force,
 )
+from robosim.physics.contact.fem_contact import (
+    FEMSurfaceCollider,
+    FEMContactPoint,
+    RBDFEMContactPoint,
+    detect_fem_fem,
+    detect_rbd_fem,
+    resolve_fem_fem_contacts,
+    resolve_rbd_fem_contacts,
+)
 
 
 def _link_point_velocity(
@@ -99,6 +108,7 @@ class ContactSolver:
         self.params = params if params is not None else ContactParams()
         self._last_forces = []
         self._body_map = {}
+        self._fem_colliders = []
 
     def register_rbd(self, rbd_solver) -> None:
         """Register collision geometries from robot links."""
@@ -290,6 +300,101 @@ class ContactSolver:
             f_contact[node_idx * 3: node_idx * 3 + 3] += cf.force
 
         return f_contact
+
+    # ------------------------------------------------------------------
+    # FEM-FEM contact
+    # ------------------------------------------------------------------
+
+    _fem_colliders: list[FEMSurfaceCollider] = field(default_factory=list, repr=False)
+
+    def register_fem(self, fem_solver) -> None:
+        """Build surface colliders for all FEM bodies."""
+        self._fem_colliders = []
+        for i, body in enumerate(fem_solver.bodies):
+            collider = FEMSurfaceCollider.from_body(body, body_idx=i)
+            self._fem_colliders.append(collider)
+
+    def resolve_fem_fem_all(
+        self,
+        fem_solver,
+        restitution: float = 0.1,
+        friction_mu: float = 0.5,
+        d_hat: float = 0.005,
+    ) -> int:
+        """Detect and resolve all FEM-FEM contacts.
+
+        Call AFTER fem_solver.step(). Tests every pair of FEM bodies.
+
+        Returns total number of contacts resolved.
+        """
+        if len(self._fem_colliders) < 2:
+            return 0
+
+        bodies = fem_solver.bodies
+        n = len(bodies)
+        total = 0
+
+        # Update AABBs
+        for collider in self._fem_colliders:
+            collider.update_aabb(bodies[collider.body_idx].x)
+
+        # All pairs
+        for i in range(n):
+            for j in range(i + 1, n):
+                # A nodes vs B faces
+                contacts_ab = detect_fem_fem(
+                    self._fem_colliders[i], self._fem_colliders[j],
+                    bodies[i].x, bodies[j].x, d_hat,
+                )
+                # B nodes vs A faces
+                contacts_ba = detect_fem_fem(
+                    self._fem_colliders[j], self._fem_colliders[i],
+                    bodies[j].x, bodies[i].x, d_hat,
+                )
+                total += resolve_fem_fem_contacts(
+                    contacts_ab + contacts_ba, bodies, restitution, friction_mu,
+                )
+
+        return total
+
+    # ------------------------------------------------------------------
+    # RBD-FEM contact
+    # ------------------------------------------------------------------
+
+    def resolve_rbd_fem_all(
+        self,
+        rbd_solver,
+        fem_solver,
+        restitution: float = 0.1,
+        friction_mu: float = 0.5,
+        d_hat: float = 0.005,
+    ) -> int:
+        """Detect and resolve all RBD-FEM contacts.
+
+        Call AFTER both rbd_solver.step() and fem_solver.step().
+        The RBD is treated as infinite mass (already committed).
+
+        Returns total number of contacts resolved.
+        """
+        if not self._fem_colliders:
+            return 0
+
+        robot = rbd_solver.robot
+        fk = robot.forward_kinematics()
+        bodies = fem_solver.bodies
+        total = 0
+
+        # Update FEM AABBs
+        for collider in self._fem_colliders:
+            collider.update_aabb(bodies[collider.body_idx].x)
+
+        for collider in self._fem_colliders:
+            contacts = detect_rbd_fem(robot, fk, collider, bodies[collider.body_idx].x, d_hat)
+            total += resolve_rbd_fem_contacts(
+                contacts, robot, bodies, restitution, friction_mu,
+            )
+
+        return total
 
     @property
     def last_forces(self) -> list[ContactForce]:

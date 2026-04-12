@@ -75,10 +75,29 @@ class PhysicsWorld:
         if self.fem_solver is not None:
             self.fem_solver.step(extra_forces=fem_extra if fem_extra else None)
 
-        # --- 5. FEM contact (impulse-based, post-step) ---
+        # --- 5. FEM ground contact (impulse-based, post-step) ---
         if self.fem_solver is not None and self.contact is not None:
             for body in self.fem_solver.bodies:
                 self.contact.resolve_fem_contact(body, restitution=0.3, friction_mu=0.5)
+
+        # --- 6. FEM-FEM contact (impulse-based, post-step) ---
+        if self.fem_solver is not None and self.contact is not None:
+            if len(self.fem_solver.bodies) > 1:
+                if not self.contact._fem_colliders:
+                    self.contact.register_fem(self.fem_solver)
+                self.contact.resolve_fem_fem_all(
+                    self.fem_solver, restitution=0.1, friction_mu=0.5,
+                )
+
+        # --- 7. RBD-FEM contact (impulse-based, post-step) ---
+        if (self.rbd_solver is not None and self.fem_solver is not None
+                and self.contact is not None):
+            if not self.contact._fem_colliders:
+                self.contact.register_fem(self.fem_solver)
+            self.contact.resolve_rbd_fem_all(
+                self.rbd_solver, self.fem_solver,
+                restitution=0.1, friction_mu=0.5,
+            )
 
         self._time += dt
 
