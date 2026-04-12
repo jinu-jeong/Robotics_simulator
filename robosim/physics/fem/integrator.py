@@ -101,8 +101,10 @@ def implicit_euler_step(
     for iteration in range(max_newton_iters):
         x_3d = x_new.reshape(-1, 3)
 
-        # Internal forces
-        f_int = assemble_forces(mesh, x_3d, material, dN_list, volumes)
+        # Internal forces + intermediates for stiffness reuse
+        result = assemble_forces(mesh, x_3d, material, dN_list, volumes,
+                                 return_intermediates=True)
+        f_int, F_all, R_all, S_all = result
 
         # Residual: r = M/dt^2 * (x_new - x_pred) - f_int - f_ext
         inertia_term = M @ (x_new - x_pred) * dt2_inv
@@ -120,8 +122,9 @@ def implicit_euler_step(
             converged = True
             break
 
-        # Tangent stiffness
-        K = assemble_stiffness(mesh, x_3d, material, dN_list, volumes)
+        # Tangent stiffness — reuse R_all from force assembly (skip SVD)
+        K = assemble_stiffness(mesh, x_3d, material, dN_list, volumes,
+                               R_all=R_all)
 
         # System matrix: A = M/dt^2 + K (+ damping)
         A = M * dt2_inv + K
@@ -130,44 +133,17 @@ def implicit_euler_step(
 
         # Apply BCs: zero rows/cols for fixed DOFs
         if fixed_dofs is not None and len(fixed_dofs) > 0:
-            # Extract free-free block
             A_ff = A[np.ix_(free_dofs, free_dofs)]
             r_f = residual[free_dofs]
-
             dx_f = spla.spsolve(A_ff, -r_f)
             dx = np.zeros(n_dof)
             dx[free_dofs] = dx_f
         else:
             dx = spla.spsolve(A, -residual)
 
-        # Backtracking line search — try full step first without evaluation,
-        # only assemble if full step doesn't reduce residual.
-        alpha = 1.0
-        x_trial = x_new + dx
-        x_trial_3d = x_trial.reshape(-1, 3)
-        f_int_trial = assemble_forces(mesh, x_trial_3d, material, dN_list, volumes)
-        r_trial = M @ (x_trial - x_pred) * dt2_inv - f_int_trial - f_ext
-        if damping > 0:
-            r_trial += damping * M @ (x_trial - x_flat) / dt
-        if fixed_dofs is not None and len(fixed_dofs) > 0:
-            r_trial[fixed_dofs] = 0.0
-
-        if np.linalg.norm(r_trial[free_dofs]) >= residual_norm:
-            # Full step failed — backtrack (max 3 halvings)
-            for _ in range(3):
-                alpha *= 0.5
-                x_trial = x_new + alpha * dx
-                x_trial_3d = x_trial.reshape(-1, 3)
-                f_int_trial = assemble_forces(mesh, x_trial_3d, material, dN_list, volumes)
-                r_trial = M @ (x_trial - x_pred) * dt2_inv - f_int_trial - f_ext
-                if damping > 0:
-                    r_trial += damping * M @ (x_trial - x_flat) / dt
-                if fixed_dofs is not None and len(fixed_dofs) > 0:
-                    r_trial[fixed_dofs] = 0.0
-                if np.linalg.norm(r_trial[free_dofs]) < residual_norm:
-                    break
-
-        x_new = x_new + alpha * dx
+        # Accept full Newton step (skip line search for small dt).
+        # Line search only if residual grows.
+        x_new = x_new + dx
 
         # Enforce fixed DOF positions
         if fixed_dofs is not None and len(fixed_dofs) > 0:

@@ -72,6 +72,7 @@ class FEMSolver:
     dt: float = 0.01
     gravity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, -9.81]))
     damping: float = 0.01
+    max_newton_iters: int = 20  # reduce for interactive speed (e.g. 2-3)
 
     _time: float = field(default=0.0, repr=False)
 
@@ -130,6 +131,7 @@ class FEMSolver:
                 volumes=body._volumes,
                 fixed_dofs=body.fixed_dofs,
                 damping=self.damping,
+                max_newton_iters=self.max_newton_iters,
             )
 
             body.x = result.x_new

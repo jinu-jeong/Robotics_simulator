@@ -126,7 +126,7 @@ def run(use_gravity=True):
     # --- Solvers ---
     rbd = RBDSolver(robot=robot)
     rbd.initialize(dt=dt)
-    fem = FEMSolver(bodies=[body], gravity=gravity, damping=0.05)
+    fem = FEMSolver(bodies=[body], gravity=gravity, damping=0.05, max_newton_iters=2)
     fem.initialize(dt=dt)
 
     contact = ContactSolver(ground=GroundPlane(height=0.0))

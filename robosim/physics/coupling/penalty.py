@@ -53,6 +53,7 @@ class PenaltyCoupling:
         """
         robot = self._rbd_solver.robot
         fk = robot.forward_kinematics()
+        self._precompute_link_velocities(fk)
 
         rbd_wrenches: dict[int, np.ndarray] = {}
         fem_forces: dict[int, np.ndarray] = {}
@@ -81,7 +82,7 @@ class PenaltyCoupling:
 
                 # Velocity damping (mass-proportional limit)
                 v_node = body.v[node_idx]
-                v_target = self._link_point_velocity(link_idx, target)
+                v_target = self._link_point_velocity(link_idx, target, fk=fk)
                 v_rel = v_target - v_node
 
                 # Clamp damping at critical damping for this node's mass
@@ -114,37 +115,49 @@ class PenaltyCoupling:
 
         return rbd_wrenches, fem_forces
 
-    def _link_point_velocity(self, link_idx: int, point_world: np.ndarray) -> np.ndarray:
-        """Compute world velocity of a point on an RBD link."""
+    def _precompute_link_velocities(self, fk):
+        """Precompute (omega, v_origin) per link for velocity queries."""
         from robosim.model.joint import JointType
-
         robot = self._rbd_solver.robot
-        fk = robot.forward_kinematics()
 
-        omega = np.zeros(3)
-        v_origin = np.zeros(3)
+        if not hasattr(self, '_vel_cache') or self._vel_cache is None:
+            self._vel_cache = {}
 
-        path = []
-        idx = link_idx
-        while idx >= 0:
-            path.append(idx)
-            idx = robot.parent_index(idx)
-        path.reverse()
+        self._vel_cache.clear()
 
-        for i in path:
-            j_idx = robot.joint_index_for_link(i)
-            if j_idx is None:
-                continue
-            joint = robot.joints[j_idx]
-            qd_j = robot.qd[j_idx]
-            T_world_link = fk[i]
+        for link_idx in range(robot.n_links):
+            omega = np.zeros(3)
+            v_origin = np.zeros(3)
 
-            if joint.joint_type in (JointType.REVOLUTE, JointType.CONTINUOUS):
-                axis_world = T_world_link.rotation @ joint.axis
-                omega += qd_j * axis_world
-            elif joint.joint_type == JointType.PRISMATIC:
-                axis_world = T_world_link.rotation @ joint.axis
-                v_origin += qd_j * axis_world
+            path = []
+            idx = link_idx
+            while idx >= 0:
+                path.append(idx)
+                idx = robot.parent_index(idx)
+            path.reverse()
 
+            for i in path:
+                j_idx = robot.joint_index_for_link(i)
+                if j_idx is None or j_idx < 0:
+                    continue
+                joint = robot.joints[j_idx]
+                qd_j = robot.qd[j_idx]
+                T_world_link = fk[i]
+
+                if joint.joint_type in (JointType.REVOLUTE, JointType.CONTINUOUS):
+                    axis_world = T_world_link.rotation @ joint.axis
+                    omega += qd_j * axis_world
+                elif joint.joint_type == JointType.PRISMATIC:
+                    axis_world = T_world_link.rotation @ joint.axis
+                    v_origin += qd_j * axis_world
+
+            self._vel_cache[link_idx] = (omega, v_origin)
+
+    def _link_point_velocity(self, link_idx: int, point_world: np.ndarray,
+                             fk=None) -> np.ndarray:
+        """Compute world velocity of a point on an RBD link (uses cache)."""
+        omega, v_origin = self._vel_cache[link_idx]
+        if fk is None:
+            fk = self._rbd_solver.robot.forward_kinematics()
         r = point_world - fk[link_idx].translation
         return v_origin + np.cross(omega, r)

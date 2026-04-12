@@ -119,21 +119,25 @@ def assemble_forces(
     material: CorotationalElastic | NeoHookean,
     dN_all: np.ndarray,
     volumes: np.ndarray,
-) -> np.ndarray:
+    return_intermediates: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Assemble global internal force vector (vectorized).
 
     f_int = -sum_e vol_e * P_e @ dN_e^T  scattered to global DOFs.
+
+    If return_intermediates=True, also returns (F_all, R_all, S_all)
+    so assemble_stiffness can skip recomputation.
     """
     ne = mesh.n_elements
     n_dof = mesh.n_nodes * 3
 
     F_all = _batch_deformation_gradients(x, mesh.elements, dN_all)
+    R_all = S_all = None
 
     if isinstance(material, CorotationalElastic):
         R_all, S_all = _batch_polar_decomposition(F_all)
         P_all = _batch_corotational_stress(F_all, R_all, S_all, material.mu, material.lam)
     else:
-        # Neo-Hookean batch
         P_all = _batch_neohookean_stress(F_all, material.mu, material.lam)
 
     # H_all[e] = vol_e * P_e @ dN_e^T  -> (ne, 3, 4)
@@ -142,10 +146,11 @@ def assemble_forces(
     # Scatter: f[node_a*3 : node_a*3+3] -= H_all[e, :, a]
     f = np.zeros(n_dof)
     for a in range(4):
-        node_indices = mesh.elements[:, a]  # (ne,)
-        # Scatter H_all[:, :, a] into f at node_indices*3
+        node_indices = mesh.elements[:, a]
         np.add.at(f.reshape(-1, 3), node_indices, -H_all[:, :, a])
 
+    if return_intermediates:
+        return f, F_all, R_all, S_all
     return f
 
 
@@ -155,18 +160,24 @@ def assemble_stiffness(
     material: CorotationalElastic | NeoHookean,
     dN_all: np.ndarray,
     volumes: np.ndarray,
+    R_all: np.ndarray | None = None,
 ) -> sp.csr_matrix:
     """Assemble global stiffness matrix K (vectorized COO assembly).
 
     For corotational: K_e[ab] = vol * R @ (mu*(dNa.dNb)*I + mu*dNb(x)dNa + lam*dNa(x)dNb) @ R^T
+
+    Parameters
+    ----------
+    R_all : optional pre-computed rotation matrices from assemble_forces.
+            Avoids duplicate SVD computation.
     """
     ne = mesh.n_elements
     n_dof = mesh.n_nodes * 3
 
-    F_all = _batch_deformation_gradients(x, mesh.elements, dN_all)
-
     if isinstance(material, CorotationalElastic):
-        R_all, S_all = _batch_polar_decomposition(F_all)
+        if R_all is None:
+            F_all = _batch_deformation_gradients(x, mesh.elements, dN_all)
+            R_all, _ = _batch_polar_decomposition(F_all)
         Ke_all = _batch_corotational_stiffness(R_all, dN_all, volumes, material.mu, material.lam)
     else:
         Ke_all = _batch_numerical_stiffness(mesh, x, material, dN_all, volumes)
