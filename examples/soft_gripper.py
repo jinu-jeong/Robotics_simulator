@@ -1,11 +1,12 @@
-"""Phase 6 최종 데모: 강체 팔 + FEM 소프트 핑거 그리퍼.
+"""Phase 6 최종 데모: 강체 팔 + FEM 소프트 핑거 그리퍼 + 변형 물체 파지.
 
 2-DOF 강체 팔 끝에 두 개의 FEM 변형 블록(손가락)이 페널티 커플링으로
-연결되어 있습니다. 팔이 아래로 내려가 목표 물체(강체 큐브) 근처에서
-손가락을 닫아 잡는 시뮬레이션입니다.
+연결되어 있습니다. 팔이 아래로 내려가 바닥의 변형 큐브(소프트 오브젝트)를
+손가락으로 잡는 시뮬레이션입니다. FEM-FEM 접촉으로 손가락-물체 상호작용을 처리.
 
 실행:
-  python examples/soft_gripper.py
+  python examples/soft_gripper.py                  # 기본
+  python examples/soft_gripper.py --no-object      # 물체 없이 (기존 동작)
 
 조작: 좌클릭 드래그(회전), W/S(줌), ESC(종료)
 """
@@ -131,7 +132,7 @@ def stress_to_color(vm, vmax):
     return np.column_stack([r, g, b]).astype(np.float32)
 
 
-def run():
+def run(with_object: bool = True):
     dt = 0.001
     substeps = 8
     upper_len, lower_len = 0.3, 0.25
@@ -156,12 +157,38 @@ def run():
     left_finger = make_finger(left_origin)
     right_finger = make_finger(right_origin)
 
+    # ── Deformable object (soft cube) to be grasped ──
+    grasp_obj = None
+    fem_bodies = [left_finger, right_finger]
+
+    if with_object:
+        # Place object on the ground below where fingers will reach
+        # The arm reaches down: tip goes to roughly x~0.35, z~0.15
+        # We place the object at a spot the arm can reach
+        obj_size = np.array([0.03, 0.03, 0.03])
+        obj_origin = tip + np.array([-0.015, -0.015, -finger_h - 0.04])
+        # Clamp to ground
+        obj_origin[2] = max(obj_origin[2], 0.0)
+
+        mesh_obj = TetMesh.create_box(
+            origin=obj_origin,
+            size=obj_size,
+            divisions=(2, 2, 2),
+        )
+        grasp_obj = DeformableBody(
+            name="grasp_object",
+            mesh=mesh_obj,
+            material=CorotationalElastic(young=8e4, poisson=0.35),
+            density=800.0,
+        )
+        fem_bodies.append(grasp_obj)
+
     # ── Solvers ──
     rbd = RBDSolver(robot=robot)
     rbd.initialize(dt=dt)
 
     fem = FEMSolver(
-        bodies=[left_finger, right_finger],
+        bodies=fem_bodies,
         gravity=np.array([0, 0, -9.81]),
         damping=0.1,
         max_newton_iters=2,  # fast interactive mode
@@ -169,6 +196,10 @@ def run():
     fem.initialize(dt=dt)
 
     contact = ContactSolver(ground=GroundPlane(height=0.0))
+
+    # Register FEM colliders for FEM-FEM contact
+    if with_object:
+        contact.register_fem(fem)
 
     # ── Coupling: top of each finger -> lower arm link ──
     boundary_maps = []
@@ -181,13 +212,11 @@ def run():
     coupling = PenaltyCoupling(stiffness=1e4, damping=300, max_force=500)
     coupling.setup(rbd, fem, boundary_maps)
 
-    # ── Controller: trajectory to reach down then hold ──
-    # Phase 1 (0-1s): reach down (open pose)
-    # Phase 2 (1-3s): hold position (fingers close via gravity/coupling)
+    # ── Controller: trajectory to reach down, grasp, and lift ──
     waypoints = [
         Waypoint(t=0.0, q=np.array([0.3, -0.6])),
         Waypoint(t=0.8, q=np.array([0.8, -1.2])),     # reach lower
-        Waypoint(t=1.5, q=np.array([0.8, -1.2])),     # hold
+        Waypoint(t=1.5, q=np.array([0.8, -1.2])),     # hold (fingers contact object)
         Waypoint(t=3.0, q=np.array([0.5, -0.8])),     # lift slightly
         Waypoint(t=5.0, q=np.array([0.5, -0.8])),     # hold
     ]
@@ -207,32 +236,43 @@ def run():
     lm = left_finger.density * left_finger._volumes.sum()
     rm = right_finger.density * right_finger._volumes.sum()
     print(f"Finger mass: L={lm:.3f}kg  R={rm:.3f}kg")
+    if grasp_obj is not None:
+        om = grasp_obj.density * grasp_obj._volumes.sum()
+        print(f"Grasp object: {grasp_obj.mesh.n_nodes} nodes, {grasp_obj.mesh.n_elements} elems, "
+              f"mass={om:.4f}kg")
+        print(f"Object position: ({grasp_obj.x.mean(0)[0]:+.3f}, "
+              f"{grasp_obj.x.mean(0)[1]:+.3f}, {grasp_obj.x.mean(0)[2]:+.3f})")
     print(f"Trajectory duration: {traj.duration:.1f}s")
 
     # ── Viewer ──
-    viewer = SimViewer(title="RoboSim — Soft Gripper", window_size=(1200, 800))
+    viewer = SimViewer(title="RoboSim — Soft Gripper" + (" + Grasp" if with_object else ""),
+                       window_size=(1200, 800))
     viewer.initialize()
 
     renderer = RobotRenderer(robot, viewer)
     renderer.setup()
 
-    for i, (body, color) in enumerate([
-        (left_finger, np.array([0.9, 0.4, 0.3])),
-        (right_finger, np.array([0.3, 0.8, 0.4])),
-    ]):
+    finger_colors = [np.array([0.9, 0.4, 0.3]), np.array([0.3, 0.8, 0.4])]
+    for i, (body, color) in enumerate(zip([left_finger, right_finger], finger_colors)):
         surface = body.mesh.extract_surface()
         viewer.add_mesh(f"finger_{i}", body.x.copy(), surface, color=color)
 
-    # Ground plane visual (large flat quad)
+    if grasp_obj is not None:
+        obj_surface = grasp_obj.mesh.extract_surface()
+        viewer.add_mesh("grasp_obj", grasp_obj.x.copy(), obj_surface,
+                        color=np.array([0.95, 0.85, 0.3]))
+
+    # Ground plane visual
     gnd_v = np.array([[-2, -2, 0], [2, -2, 0], [2, 2, 0], [-2, 2, 0]], dtype=np.float64)
     gnd_f = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
     viewer.add_mesh("ground", gnd_v, gnd_f, color=np.array([0.85, 0.85, 0.8]), opacity=0.5)
 
     sim_time = 0.0
     frame_count = 0
+    total_fem_contacts = 0
 
     def step_callback(step):
-        nonlocal sim_time, frame_count
+        nonlocal sim_time, frame_count, total_fem_contacts
 
         for _ in range(substeps):
             # Controller torque
@@ -258,6 +298,13 @@ def run():
             for body in fem.bodies:
                 contact.resolve_fem_contact(body, restitution=0.1, friction_mu=0.6)
 
+            # FEM-FEM contact (finger-object interaction)
+            if with_object:
+                n_c = contact.resolve_fem_fem_all(
+                    fem, restitution=0.0, friction_mu=0.8, d_hat=0.005,
+                )
+                total_fem_contacts += n_c
+
             sim_time += dt
 
             # Log
@@ -277,6 +324,13 @@ def run():
                                  body._dN_list, body._volumes)
             vm_max = max(vm.max(), 1.0)
             viewer.update_mesh_color(f"finger_{i}", stress_to_color(vm, vm_max))
+
+        if grasp_obj is not None:
+            viewer.update_mesh_vertices("grasp_obj", grasp_obj.x.copy())
+            vm_obj = batch_von_mises(grasp_obj.mesh, grasp_obj.x, grasp_obj.material,
+                                     grasp_obj._dN_list, grasp_obj._volumes)
+            vm_obj_max = max(vm_obj.max(), 1.0)
+            viewer.update_mesh_color("grasp_obj", stress_to_color(vm_obj, vm_obj_max))
 
         # Drift
         max_drift = 0.0
@@ -299,13 +353,19 @@ def run():
             f"ref= [{q_des_deg[0]:+6.1f}, {q_des_deg[1]:+6.1f}] deg\n"
             f"Tip: ({tip_pos[0]:+.3f}, {tip_pos[1]:+.3f}, {tip_pos[2]:+.3f})\n"
             f"Boundary drift: {max_drift:.4f} m\n"
-            f"Frames logged: {logger.n_frames}"
         )
+        if grasp_obj is not None:
+            obj_com = grasp_obj.x.mean(axis=0)
+            info += (
+                f"Object: ({obj_com[0]:+.3f}, {obj_com[1]:+.3f}, {obj_com[2]:+.3f})\n"
+                f"FEM contacts: {total_fem_contacts}\n"
+            )
+        info += f"Frames logged: {logger.n_frames}"
         viewer.add_text(info)
         frame_count += 1
 
     viewer.add_callback(step_callback)
-    print("\nSoft Gripper Demo — ESC to quit")
+    print(f"\nSoft Gripper Demo {'+ Grasp Object' if with_object else ''} — ESC to quit")
     viewer.show()
 
     # Save log
@@ -313,19 +373,29 @@ def run():
     logger.save(log_path)
     print(f"\nLog saved to {log_path} ({logger.n_frames} frames)")
     print(f"Simulated {sim_time:.2f}s in {frame_count} render frames")
+    if with_object:
+        print(f"Total FEM-FEM contacts: {total_fem_contacts}")
     finite_ok = all(np.all(np.isfinite(b.x)) and np.all(np.isfinite(b.v)) for b in fem.bodies)
     print(f"Finite check: {'OK' if finite_ok else 'FAIL'}")
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Soft gripper demo")
+    parser.add_argument("--no-object", action="store_true",
+                        help="Run without deformable grasp object (original mode)")
+    args = parser.parse_args()
+
     ti.init(arch=ti.metal)
 
+    with_obj = not args.no_object
     print("=" * 60)
     print("  RoboSim Phase 6: Soft Gripper Demo")
-    print("  강체 2-DOF 팔 + FEM 소프트 핑거")
+    print("  강체 2-DOF 팔 + FEM 소프트 핑거" +
+          (" + 변형 물체 파지" if with_obj else ""))
     print("=" * 60)
 
-    run()
+    run(with_object=with_obj)
 
 
 if __name__ == "__main__":
