@@ -7,13 +7,14 @@ from dataclasses import dataclass, field
 import numpy as np
 import scipy.sparse as sp
 
-from robosim.physics.fem.mesh import TetMesh, FEMesh
+from robosim.physics.fem.mesh import TetMesh, FEMesh, CompositeMesh
 from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
 from robosim.physics.fem.assembly import (
     assemble_forces,
     assemble_mass_matrix,
     precompute_element_data,
     ElementIntegrationData,
+    CompositeIntegrationData,
 )
 from robosim.physics.fem.integrator import implicit_euler_step
 
@@ -32,7 +33,7 @@ class DeformableBody:
     """
 
     name: str
-    mesh: TetMesh | FEMesh
+    mesh: TetMesh | FEMesh | CompositeMesh
     material: CorotationalElastic | NeoHookean = field(
         default_factory=lambda: CorotationalElastic()
     )
@@ -91,7 +92,7 @@ class FEMSolver:
 
             # Precompute element data
             edata = precompute_element_data(body.mesh)
-            if isinstance(edata, ElementIntegrationData):
+            if isinstance(edata, (ElementIntegrationData, CompositeIntegrationData)):
                 body._dN_list = edata
                 body._volumes = edata
             else:

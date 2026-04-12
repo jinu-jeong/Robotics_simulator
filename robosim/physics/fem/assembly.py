@@ -1,7 +1,8 @@
 """Global force and stiffness matrix assembly for FEM.
 
 Supports Tet4 (legacy vectorized path) and general elements (Hex8, Tet10)
-via multi-point Gauss quadrature.
+via multi-point Gauss quadrature.  CompositeMesh with mixed element blocks
+is also supported.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import scipy.sparse as sp
 
-from robosim.physics.fem.mesh import TetMesh, FEMesh
+from robosim.physics.fem.mesh import TetMesh, FEMesh, CompositeMesh, ElementBlock
 from robosim.physics.fem.elements import (
     ElementType, NODES_PER_ELEMENT,
     compute_shape_derivatives, shape_function, gauss_rule,
@@ -38,6 +39,36 @@ class ElementIntegrationData:
     element_type: ElementType
 
 
+@dataclass
+class CompositeIntegrationData:
+    """Precomputed integration data for a CompositeMesh with multiple element blocks.
+
+    Each block has its own ElementIntegrationData and connectivity.
+    Assembly functions iterate over blocks, accumulating into the same global arrays.
+    """
+    block_data: list[ElementIntegrationData]   # one per block
+    block_elements: list[np.ndarray]           # connectivity per block
+    n_global_nodes: int                        # total unique nodes
+
+
+class _BlockAdapter:
+    """Lightweight adapter: makes an ElementBlock look like an FEMesh for assembly.
+
+    Existing general-path functions (_assemble_forces_general, etc.) access only
+    mesh.elements, mesh.n_elements, and mesh.n_nodes.  This adapter provides
+    exactly those, with n_nodes set to the *global* count so DOF vectors/matrices
+    are sized correctly for the full composite mesh.
+    """
+    __slots__ = ("nodes", "elements", "n_elements", "n_nodes")
+
+    def __init__(self, global_nodes: np.ndarray, block_elements: np.ndarray,
+                 n_global_nodes: int):
+        self.nodes = global_nodes
+        self.elements = block_elements
+        self.n_elements = block_elements.shape[0]
+        self.n_nodes = n_global_nodes
+
+
 def precompute_element_data(mesh) -> tuple:
     """Precompute shape function gradients and integration weights.
 
@@ -50,6 +81,9 @@ def precompute_element_data(mesh) -> tuple:
     For TetMesh (backward compatible): (dN_all, volumes) as (ne,4,3) and (ne,)
     For FEMesh: ElementIntegrationData
     """
+    if isinstance(mesh, CompositeMesh):
+        return _precompute_composite(mesh)
+
     if isinstance(mesh, TetMesh):
         return _precompute_tet4(mesh)
 
@@ -106,6 +140,59 @@ def _precompute_general(mesh: FEMesh) -> ElementIntegrationData:
     return ElementIntegrationData(
         dN=dN_all, weights=weights, n_gauss=ng,
         nodes_per_elem=npe, element_type=etype,
+    )
+
+
+def _precompute_composite(mesh: CompositeMesh) -> CompositeIntegrationData:
+    """Precompute integration data for every block in a CompositeMesh."""
+    block_data = []
+    block_elements = []
+
+    for block in mesh.blocks:
+        adapter = _BlockAdapter(mesh.nodes, block.elements, mesh.n_nodes)
+        etype = block.element_type
+
+        if etype == ElementType.TET4:
+            # Use general path (not legacy tuple) so all blocks have same data format
+            npe = NODES_PER_ELEMENT[etype]
+            ne = block.n_elements
+            gp_ref, gp_wts = gauss_rule(etype)
+            ng = len(gp_wts)
+            dN_all = np.zeros((ne, ng, npe, 3))
+            weights = np.zeros((ne, ng))
+            for e in range(ne):
+                x_ref = mesh.nodes[block.elements[e]]
+                for g in range(ng):
+                    _, dNdxi = shape_function(etype, gp_ref[g])
+                    J = x_ref.T @ dNdxi
+                    det_J = np.linalg.det(J)
+                    if abs(det_J) < 1e-20:
+                        continue
+                    J_inv = np.linalg.inv(J)
+                    dN_all[e, g] = dNdxi @ J_inv
+                    weights[e, g] = abs(det_J) * gp_wts[g]
+            edata = ElementIntegrationData(
+                dN=dN_all, weights=weights, n_gauss=ng,
+                nodes_per_elem=npe, element_type=etype,
+            )
+        else:
+            # Hex8, Tet10 — reuse _precompute_general via adapter
+            adapter_mesh = type('_Mesh', (), {
+                'nodes': mesh.nodes,
+                'elements': block.elements,
+                'element_type': etype,
+                'n_elements': block.n_elements,
+                'n_nodes': mesh.n_nodes,
+            })()
+            edata = _precompute_general(adapter_mesh)
+
+        block_data.append(edata)
+        block_elements.append(block.elements)
+
+    return CompositeIntegrationData(
+        block_data=block_data,
+        block_elements=block_elements,
+        n_global_nodes=mesh.n_nodes,
     )
 
 
@@ -176,6 +263,8 @@ def assemble_forces(
     dN_all : (ne,4,3) for Tet4  OR  ElementIntegrationData for Hex8/Tet10
     volumes : (ne,) for Tet4  OR  ignored for general (weights in dN_all)
     """
+    if isinstance(dN_all, CompositeIntegrationData):
+        return _assemble_forces_composite(mesh, x, material, dN_all, return_intermediates)
     if isinstance(dN_all, ElementIntegrationData):
         return _assemble_forces_general(mesh, x, material, dN_all, return_intermediates)
     return _assemble_forces_tet4(mesh, x, material, dN_all, volumes, return_intermediates)
@@ -245,6 +334,21 @@ def _assemble_forces_general(mesh, x, material, edata: ElementIntegrationData, r
     return f
 
 
+def _assemble_forces_composite(mesh, x, material, cdata: CompositeIntegrationData, return_intermediates):
+    """Composite force assembly: accumulate over all blocks."""
+    n_dof = mesh.n_nodes * 3
+    f = np.zeros(n_dof)
+
+    for edata, elements in zip(cdata.block_data, cdata.block_elements):
+        adapter = _BlockAdapter(mesh.nodes, elements, mesh.n_nodes)
+        f_block = _assemble_forces_general(adapter, x, material, edata, return_intermediates=False)
+        f += f_block
+
+    if return_intermediates:
+        return f, None, None, None
+    return f
+
+
 # ═══════════════════════════════════════════════════════════════
 # Stiffness assembly
 # ═══════════════════════════════════════════════════════════════
@@ -253,6 +357,8 @@ def assemble_stiffness(
     mesh, x, material, dN_all, volumes, R_all=None,
 ):
     """Assemble global stiffness matrix K."""
+    if isinstance(dN_all, CompositeIntegrationData):
+        return _assemble_stiffness_composite(mesh, x, material, dN_all)
     if isinstance(dN_all, ElementIntegrationData):
         return _assemble_stiffness_general(mesh, x, material, dN_all, R_all)
     return _assemble_stiffness_tet4(mesh, x, material, dN_all, volumes, R_all)
@@ -313,6 +419,19 @@ def _assemble_stiffness_general(mesh, x, material, edata: ElementIntegrationData
 
     K = sp.coo_matrix((Ke_all.ravel(), (row_idx.ravel(), col_idx.ravel())), shape=(n_dof, n_dof))
     return K.tocsr()
+
+
+def _assemble_stiffness_composite(mesh, x, material, cdata: CompositeIntegrationData):
+    """Composite stiffness assembly: sum sparse K from each block."""
+    n_dof = mesh.n_nodes * 3
+    K = sp.csr_matrix((n_dof, n_dof))
+
+    for edata, elements in zip(cdata.block_data, cdata.block_elements):
+        adapter = _BlockAdapter(mesh.nodes, elements, mesh.n_nodes)
+        K_block = _assemble_stiffness_general(adapter, x, material, edata, R_all_hint=None)
+        K = K + K_block
+
+    return K
 
 
 def _batch_corotational_stiffness(R_all, dN_all, weights, mu, lam, npe):
@@ -418,6 +537,19 @@ def assemble_mass_matrix(mesh, density, volumes) -> sp.csr_matrix:
     n_dof = mesh.n_nodes * 3
     diag = np.zeros(n_dof)
 
+    if isinstance(volumes, CompositeIntegrationData):
+        cdata = volumes
+        for edata, elements in zip(cdata.block_data, cdata.block_elements):
+            elem_vol = edata.weights.sum(axis=1)  # (ne_block,)
+            npe = edata.nodes_per_elem
+            elem_node_mass = density * elem_vol / npe
+            for a in range(npe):
+                node_indices = elements[:, a]
+                np.add.at(diag[::3], node_indices, elem_node_mass)
+                np.add.at(diag[1::3], node_indices, elem_node_mass)
+                np.add.at(diag[2::3], node_indices, elem_node_mass)
+        return sp.diags(diag, format="csr")
+
     if isinstance(volumes, ElementIntegrationData):
         edata = volumes
         # Total weight per element = sum of Gauss weights
@@ -448,6 +580,8 @@ def assemble_mass_matrix(mesh, density, volumes) -> sp.csr_matrix:
 
 def batch_von_mises(mesh, x, material, dN_all, volumes) -> np.ndarray:
     """Per-node averaged von Mises stress."""
+    if isinstance(dN_all, CompositeIntegrationData):
+        return _von_mises_composite(mesh, x, material, dN_all)
     if isinstance(dN_all, ElementIntegrationData):
         return _von_mises_general(mesh, x, material, dN_all)
     return _von_mises_tet4(mesh, x, material, dN_all)
@@ -496,5 +630,34 @@ def _von_mises_general(mesh, x, material, edata: ElementIntegrationData):
     for a in range(npe):
         np.add.at(stress_sum, mesh.elements[:, a], vm)
         np.add.at(count, mesh.elements[:, a], 1.0)
+    count[count == 0] = 1.0
+    return stress_sum / count
+
+
+def _von_mises_composite(mesh, x, material, cdata: CompositeIntegrationData):
+    """Von Mises for composite meshes: accumulate stress from all blocks."""
+    n_nodes = mesh.n_nodes
+    stress_sum = np.zeros(n_nodes)
+    count = np.zeros(n_nodes)
+
+    for edata, elements in zip(cdata.block_data, cdata.block_elements):
+        dN_g0 = edata.dN[:, 0, :, :]  # first Gauss point
+        F_all = _batch_deformation_gradients(x, elements, dN_g0)
+        R_all, S_all = _batch_polar_decomposition(F_all)
+
+        I3 = np.eye(3)[np.newaxis]
+        eps = S_all - I3
+        trace_eps = np.trace(eps, axis1=1, axis2=2)
+        sigma = 2.0 * material.mu * eps + material.lam * trace_eps[:, None, None] * I3
+
+        trace_sigma = np.trace(sigma, axis1=1, axis2=2)
+        dev = sigma - (trace_sigma[:, None, None] / 3.0) * I3
+        vm = np.sqrt(1.5 * np.sum(dev**2, axis=(1, 2)))
+
+        npe = edata.nodes_per_elem
+        for a in range(npe):
+            np.add.at(stress_sum, elements[:, a], vm)
+            np.add.at(count, elements[:, a], 1.0)
+
     count[count == 0] = 1.0
     return stress_sum / count
