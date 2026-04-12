@@ -95,6 +95,7 @@ class ContactDetector:
         self.ground = ground
         self.bodies: list[CollisionBody] = []
         self._next_id = 0
+        self._filter_pairs: set[tuple[int, int]] = set()  # body_id pairs to skip
 
     def add_body(self, geometry: Geometry, transform: Transform,
                  body_type: str = "rbd_link", owner_index: int = 0) -> int:
@@ -110,6 +111,11 @@ class ContactDetector:
     def update_transform(self, body_id: int, transform: Transform):
         """Update a body's world-frame pose."""
         self.bodies[body_id].transform = transform
+
+    def add_filter(self, body_id_a: int, body_id_b: int):
+        """Add a pair of body IDs to skip during collision detection."""
+        pair = (min(body_id_a, body_id_b), max(body_id_a, body_id_b))
+        self._filter_pairs.add(pair)
 
     def detect_all(self) -> list[tuple[ContactPoint, int, int]]:
         """Detect all contacts.
@@ -134,11 +140,15 @@ class ContactDetector:
             aabbs = [compute_aabb(b.geometry, b.transform) for b in self.bodies]
             for i in range(n):
                 for j in range(i + 1, n):
+                    # Check collision filter
+                    bi, bj = self.bodies[i].body_id, self.bodies[j].body_id
+                    pair = (min(bi, bj), max(bi, bj))
+                    if pair in self._filter_pairs:
+                        continue
                     if aabbs[i].overlaps(aabbs[j]):
                         contacts = self._narrow_pair(self.bodies[i], self.bodies[j])
                         for cp in contacts:
-                            results.append((cp, self.bodies[i].body_id,
-                                            self.bodies[j].body_id))
+                            results.append((cp, bi, bj))
 
         return results
 

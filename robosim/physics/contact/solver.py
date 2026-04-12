@@ -107,19 +107,31 @@ class ContactSolver:
         self.detector = ContactDetector(ground=ground)
         self.params = params if params is not None else ContactParams()
         self._last_forces = []
-        self._body_map = {}
+        self._body_map = {}          # bid -> (robot_id, link_idx)
+        self._robot_solvers = {}     # robot_id -> rbd_solver
+        self._robot_body_ids = {}    # robot_id -> list[bid]
         self._fem_colliders = []
 
-    def register_rbd(self, rbd_solver) -> None:
-        """Register collision geometries from robot links."""
+    def register_rbd(self, rbd_solver, robot_id: str | None = None) -> None:
+        """Register collision geometries from robot links.
+
+        Parameters
+        ----------
+        rbd_solver : RBDSolver to register
+        robot_id : unique identifier for this robot (defaults to robot.name)
+        """
         robot = rbd_solver.robot
+        if robot_id is None:
+            robot_id = robot.name
         fk = robot.forward_kinematics()
+
+        self._robot_solvers[robot_id] = rbd_solver
+        body_ids: list[int] = []
 
         for i, link in enumerate(robot.links):
             if not link.collisions:
                 continue
             col = link.collisions[0]
-            # World transform = link FK * collision origin
             T_world = fk[i].compose(col.origin)
             bid = self.detector.add_body(
                 geometry=col.geometry,
@@ -127,49 +139,128 @@ class ContactSolver:
                 body_type="rbd_link",
                 owner_index=i,
             )
-            self._body_map[bid] = ("rbd_link", i)
+            self._body_map[bid] = (robot_id, i)
+            body_ids.append(bid)
 
-    def update_rbd_transforms(self, rbd_solver) -> None:
-        """Update collision body transforms from current robot FK."""
+        self._robot_body_ids[robot_id] = body_ids
+
+        # Auto-filter parent-child link pairs (self-collision prevention)
+        self._add_adjacency_filters(robot, body_ids)
+
+    def _add_adjacency_filters(self, robot, body_ids: list[int]):
+        """Add collision filters for parent-child and sibling link pairs."""
+        # Build bid -> link_idx lookup for this robot's bodies
+        bid_to_link = {}
+        for bid in body_ids:
+            _, link_idx = self._body_map[bid]
+            bid_to_link[bid] = link_idx
+
+        link_to_bid = {v: k for k, v in bid_to_link.items()}
+
+        for bid in body_ids:
+            link_idx = bid_to_link[bid]
+            parent_idx = robot.parent_index(link_idx)
+
+            # Filter with direct parent
+            if parent_idx >= 0 and parent_idx in link_to_bid:
+                self.detector.add_filter(bid, link_to_bid[parent_idx])
+
+            # Filter with grandparent (common for multi-link chains)
+            if parent_idx >= 0:
+                gp = robot.parent_index(parent_idx)
+                if gp >= 0 and gp in link_to_bid:
+                    self.detector.add_filter(bid, link_to_bid[gp])
+
+    def update_rbd_transforms(self, rbd_solver=None) -> None:
+        """Update collision body transforms from current robot FK.
+
+        If rbd_solver is None, updates all registered robots.
+        """
+        if rbd_solver is not None:
+            self._update_single_rbd(rbd_solver)
+        else:
+            for solver in self._robot_solvers.values():
+                self._update_single_rbd(solver)
+
+    def _update_single_rbd(self, rbd_solver) -> None:
         robot = rbd_solver.robot
         fk = robot.forward_kinematics()
+        robot_id = robot.name
 
-        for body in self.detector.bodies:
-            if body.body_type == "rbd_link":
-                link_idx = body.owner_index
-                link = robot.links[link_idx]
-                if link.collisions:
-                    col = link.collisions[0]
-                    body.transform = fk[link_idx].compose(col.origin)
+        for bid in self._robot_body_ids.get(robot_id, []):
+            body = self.detector.bodies[bid]
+            link_idx = body.owner_index
+            link = robot.links[link_idx]
+            if link.collisions:
+                col = link.collisions[0]
+                body.transform = fk[link_idx].compose(col.origin)
 
     def compute_rbd_contact_forces(self, rbd_solver) -> dict[int, np.ndarray]:
-        """Detect contacts and return per-link spatial wrenches.
+        """Detect contacts and return per-link spatial wrenches for one robot.
 
         Returns dict: link_idx -> (6,) wrench [torque(3); force(3)] in link frame.
         """
-        self.update_rbd_transforms(rbd_solver)
+        # Update ALL registered robots (so cross-robot contacts are accurate)
+        self.update_rbd_transforms()
         contacts = self.detector.detect_all()
 
         robot = rbd_solver.robot
+        robot_id = robot.name
         fk = robot.forward_kinematics()
         wrenches: dict[int, np.ndarray] = {}
         self._last_forces = []
 
         for cp, bid_a, bid_b in contacts:
-            body_a = self.detector.bodies[bid_a]
-            if body_a.body_type != "rbd_link":
+            # Apply force to body_a if it belongs to this robot
+            rid_a, link_a = self._body_map.get(bid_a, (None, None))
+            if rid_a != robot_id:
+                # Also check body_b (swap direction)
+                rid_b, link_b = self._body_map.get(bid_b, (None, None))
+                if rid_b != robot_id:
+                    continue
+                # Swap: this contact has our robot on the B side
+                cp_swapped = ContactPoint(
+                    point_a=cp.point_b, point_b=cp.point_a,
+                    normal=-cp.normal, penetration=cp.penetration,
+                )
+                link_idx = link_b
+                v_a = _link_point_velocity(robot, link_idx, cp_swapped.point_a)
+
+                # Other body velocity
+                v_b = np.zeros(3)
+                if rid_a is not None:
+                    other_solver = self._robot_solvers.get(rid_a)
+                    if other_solver:
+                        v_b = _link_point_velocity(other_solver.robot, link_a, cp_swapped.point_b)
+
+                cf = compute_contact_force(cp_swapped, v_a, v_b, self.params)
+                if cf is None:
+                    continue
+                self._last_forces.append(cf)
+
+                T_inv = fk[link_idx].inverse()
+                f_link = T_inv.apply_vector(cf.force)
+                p_link = T_inv.apply_point(cf.point)
+                tau_link = np.cross(p_link, f_link)
+                wrench = np.concatenate([tau_link, f_link])
+                if link_idx in wrenches:
+                    wrenches[link_idx] += wrench
+                else:
+                    wrenches[link_idx] = wrench
                 continue
 
-            link_idx = body_a.owner_index
+            link_idx = link_a
 
             # Velocity at contact point
             v_a = _link_point_velocity(robot, link_idx, cp.point_a)
             v_b = np.zeros(3)  # ground or other body
 
             if bid_b >= 0:
-                body_b = self.detector.bodies[bid_b]
-                if body_b.body_type == "rbd_link":
-                    v_b = _link_point_velocity(robot, body_b.owner_index, cp.point_b)
+                rid_b, link_b = self._body_map.get(bid_b, (None, None))
+                if rid_b is not None:
+                    other_solver = self._robot_solvers.get(rid_b)
+                    if other_solver:
+                        v_b = _link_point_velocity(other_solver.robot, link_b, cp.point_b)
 
             cf = compute_contact_force(cp, v_a, v_b, self.params)
             if cf is None:
