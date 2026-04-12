@@ -126,6 +126,178 @@ def sphere_sphere(
                         normal=n, penetration=penetration)
 
 
+# ── Box–Box (SAT) & Box–Sphere contacts ─────────────────────────
+
+def box_box(
+    center_a: np.ndarray, rot_a: np.ndarray, half_a: np.ndarray,
+    center_b: np.ndarray, rot_b: np.ndarray, half_b: np.ndarray,
+) -> list[ContactPoint]:
+    """OBB vs OBB using Separating Axis Theorem (SAT).
+
+    Tests 15 potential separating axes (3+3 face normals + 9 edge-edge).
+    Returns contact points at the penetrating vertices of the incident face.
+    """
+    # Axes of each box in world frame
+    ax_a = rot_a.T  # (3, 3) — rows are the 3 local axes of A in world
+    ax_b = rot_b.T
+
+    d = center_b - center_a  # vector from A center to B center
+
+    # --- Collect all 15 candidate separating axes ---
+    axes: list[np.ndarray] = []
+
+    # Face normals of A (3)
+    for i in range(3):
+        axes.append(ax_a[i])
+
+    # Face normals of B (3)
+    for i in range(3):
+        axes.append(ax_b[i])
+
+    # Edge-edge cross products (9)
+    for i in range(3):
+        for j in range(3):
+            c = np.cross(ax_a[i], ax_b[j])
+            n = np.linalg.norm(c)
+            if n > 1e-8:
+                axes.append(c / n)
+
+    # --- Find axis of minimum penetration ---
+    min_pen = np.inf
+    min_axis = None
+
+    for axis in axes:
+        # Project half-extents onto axis
+        proj_a = sum(half_a[i] * abs(np.dot(ax_a[i], axis)) for i in range(3))
+        proj_b = sum(half_b[i] * abs(np.dot(ax_b[i], axis)) for i in range(3))
+        dist = abs(np.dot(d, axis))
+        pen = proj_a + proj_b - dist
+
+        if pen <= 0:
+            return []  # separating axis found — no collision
+
+        if pen < min_pen:
+            min_pen = pen
+            # Ensure normal points from B to A
+            min_axis = axis if np.dot(d, axis) < 0 else -axis
+
+    if min_axis is None:
+        return []
+
+    normal = min_axis
+    penetration = min_pen
+
+    # --- Generate contact points (vertex-based) ---
+    # Find vertices of B that are most penetrating into A
+    contacts = []
+    signs = np.array([
+        [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+        [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],
+    ], dtype=np.float64)
+
+    # Test vertices of B against A
+    verts_b = (rot_b @ (signs * half_b).T).T + center_b
+    for v in verts_b:
+        # Check if vertex is inside A (using local coordinates)
+        v_local_a = rot_a.T @ (v - center_a)
+        if (np.abs(v_local_a) <= half_a + 1e-6).all():
+            # Penetrating vertex — project onto contact plane
+            pen_depth = np.dot(v - center_a, normal) + _support_dist(half_a, ax_a, normal)
+            if pen_depth > 0:
+                point_b = v.copy()
+                point_a = v + pen_depth * normal
+                contacts.append(ContactPoint(
+                    point_a=point_a, point_b=point_b,
+                    normal=normal, penetration=pen_depth,
+                ))
+
+    # Also test vertices of A against B
+    verts_a = (rot_a @ (signs * half_a).T).T + center_a
+    for v in verts_a:
+        v_local_b = rot_b.T @ (v - center_b)
+        if (np.abs(v_local_b) <= half_b + 1e-6).all():
+            pen_depth = -np.dot(v - center_b, normal) + _support_dist(half_b, ax_b, -normal)
+            if pen_depth > 0:
+                point_a = v.copy()
+                point_b = v - pen_depth * normal
+                contacts.append(ContactPoint(
+                    point_a=point_a, point_b=point_b,
+                    normal=normal, penetration=pen_depth,
+                ))
+
+    # If no vertex contacts found, generate a single contact at midpoint
+    if not contacts:
+        mid = (center_a + center_b) / 2.0
+        contacts.append(ContactPoint(
+            point_a=mid + normal * penetration / 2,
+            point_b=mid - normal * penetration / 2,
+            normal=normal, penetration=penetration,
+        ))
+
+    return contacts
+
+
+def _support_dist(half_ext: np.ndarray, axes: np.ndarray, direction: np.ndarray) -> float:
+    """Support distance: how far box extends along direction from its center."""
+    return sum(half_ext[i] * abs(np.dot(axes[i], direction)) for i in range(3))
+
+
+def box_sphere(
+    box_center: np.ndarray, box_rot: np.ndarray, box_half: np.ndarray,
+    sphere_center: np.ndarray, sphere_radius: float,
+) -> ContactPoint | None:
+    """OBB vs Sphere contact test.
+
+    Finds closest point on OBB surface to sphere center, then checks distance.
+    """
+    # Transform sphere center into box local frame
+    local = box_rot.T @ (sphere_center - box_center)
+
+    # Clamp to box extents → closest point in local frame
+    closest_local = np.clip(local, -box_half, box_half)
+
+    # Back to world frame
+    closest_world = box_rot @ closest_local + box_center
+
+    diff = sphere_center - closest_world
+    dist = np.linalg.norm(diff)
+
+    if dist > sphere_radius or dist < 1e-12:
+        return None
+
+    normal = diff / dist
+    penetration = sphere_radius - dist
+
+    point_a = closest_world.copy()
+    point_b = sphere_center - sphere_radius * normal
+    return ContactPoint(point_a=point_a, point_b=point_b,
+                        normal=normal, penetration=penetration)
+
+
+def mesh_ground(
+    vertices: np.ndarray, rotation: np.ndarray, translation: np.ndarray,
+    ground_height: float = 0.0, ground_normal: np.ndarray | None = None,
+) -> list[ContactPoint]:
+    """Mesh vs ground plane — test each vertex against the plane."""
+    if ground_normal is None:
+        ground_normal = np.array([0.0, 0.0, 1.0])
+    n = ground_normal / np.linalg.norm(ground_normal)
+
+    world_verts = (rotation @ vertices.T).T + translation
+    dists = world_verts @ n - ground_height
+
+    contacts = []
+    for i in np.where(dists < 0)[0]:
+        v = world_verts[i]
+        contacts.append(ContactPoint(
+            point_a=v.copy(),
+            point_b=v - dists[i] * n,
+            normal=n,
+            penetration=-dists[i],
+        ))
+    return contacts
+
+
 # ── Triangle proximity queries ──────────────────────────────────
 
 def point_triangle_distance(

@@ -14,6 +14,9 @@ from robosim.physics.contact.sdf import (
     box_ground,
     cylinder_ground,
     sphere_sphere,
+    box_box,
+    box_sphere,
+    mesh_ground,
     points_ground,
 )
 
@@ -53,6 +56,13 @@ def compute_aabb(geometry: Geometry, transform: Transform) -> AABB:
         # Conservative: bounding sphere of cylinder
         bound = np.sqrt(r**2 + hl**2)
         return AABB(t - bound, t + bound)
+
+    elif geometry.geometry_type == GeometryType.MESH:
+        if geometry.mesh_loaded:
+            # Transform mesh vertices to world space, compute AABB
+            world_verts = (R @ geometry.mesh_vertices.T).T + t
+            return AABB(world_verts.min(axis=0), world_verts.max(axis=0))
+        return AABB(t - 0.1, t + 0.1)
 
     else:
         # Fallback: small sphere
@@ -150,18 +160,44 @@ class ContactDetector:
         elif g.geometry_type == GeometryType.CYLINDER:
             return cylinder_ground(center, R, g.radius, g.length / 2.0, gh, gn)
 
+        elif g.geometry_type == GeometryType.MESH:
+            if g.mesh_loaded:
+                return mesh_ground(g.mesh_vertices, R, center, gh, gn)
+
         return []
 
     def _narrow_pair(self, a: CollisionBody, b: CollisionBody) -> list[ContactPoint]:
         """Narrow phase: body vs body."""
         ga, gb = a.geometry, b.geometry
         ta, tb = a.transform, b.transform
+        type_a, type_b = ga.geometry_type, gb.geometry_type
 
         # Sphere-sphere
-        if (ga.geometry_type == GeometryType.SPHERE and
-                gb.geometry_type == GeometryType.SPHERE):
+        if type_a == GeometryType.SPHERE and type_b == GeometryType.SPHERE:
             cp = sphere_sphere(ta.translation, ga.radius,
                                tb.translation, gb.radius)
+            return [cp] if cp is not None else []
+
+        # Box-box
+        if type_a == GeometryType.BOX and type_b == GeometryType.BOX:
+            return box_box(
+                ta.translation, ta.rotation, ga.size / 2.0,
+                tb.translation, tb.rotation, gb.size / 2.0,
+            )
+
+        # Box-sphere / Sphere-box
+        if type_a == GeometryType.BOX and type_b == GeometryType.SPHERE:
+            cp = box_sphere(ta.translation, ta.rotation, ga.size / 2.0,
+                            tb.translation, gb.radius)
+            return [cp] if cp is not None else []
+
+        if type_a == GeometryType.SPHERE and type_b == GeometryType.BOX:
+            cp = box_sphere(tb.translation, tb.rotation, gb.size / 2.0,
+                            ta.translation, ga.radius)
+            if cp is not None:
+                # Flip normal direction (box_sphere returns normal from box→sphere)
+                cp.normal = -cp.normal
+                cp.point_a, cp.point_b = cp.point_b, cp.point_a
             return [cp] if cp is not None else []
 
         return []
