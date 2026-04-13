@@ -38,13 +38,14 @@ BOX_SIZE = (0.05, 0.05, 0.05)  # larger box for better visibility
 # Panda: j1(base), j2(shoulder), j3(upper_rot), j4(elbow),
 #        j5(forearm_rot), j6(wrist), j7(wrist_rot), finger_l, finger_r
 
-# Wrist angle j6=1.6 keeps the hand higher so the fingertips (not the
-# finger base) align with the box center.  j2 controls the forward reach.
+# Wrist angle j6=1.4 keeps the hand upright so the fingertips (not the
+# finger base) align with the box center.  j4=-1.4 opens the elbow for
+# reach.  j2 controls the forward lean (higher = hand goes lower).
 HOME_Q = np.array([0.0, -0.3, 0.0, -2.0, 0.0, 1.8, 0.785, 0.04, 0.04])
-PRE_GRASP_Q = np.array([0.0, 0.3, 0.0, -1.6, 0.0, 1.6, 0.785, 0.04, 0.04])
-GRASP_Q = np.array([0.0, 0.6, 0.0, -1.6, 0.0, 1.6, 0.785, 0.04, 0.04])
-GRASP_CLOSED_Q = np.array([0.0, 0.6, 0.0, -1.6, 0.0, 1.6, 0.785, 0.01, 0.01])
-LIFT_Q = np.array([0.0, 0.3, 0.0, -1.6, 0.0, 1.6, 0.785, 0.01, 0.01])
+PRE_GRASP_Q = np.array([0.0, 0.4, 0.0, -1.4, 0.0, 1.4, 0.785, 0.04, 0.04])
+GRASP_Q = np.array([0.0, 0.7, 0.0, -1.4, 0.0, 1.4, 0.785, 0.04, 0.04])
+GRASP_CLOSED_Q = np.array([0.0, 0.7, 0.0, -1.4, 0.0, 1.4, 0.785, 0.01, 0.01])
+LIFT_Q = np.array([0.0, 0.4, 0.0, -1.4, 0.0, 1.4, 0.785, 0.01, 0.01])
 
 
 def interpolate_q(q_start, q_end, t, duration):
@@ -210,16 +211,22 @@ def run():
             origin=origin,
         )]
 
-    # FK at grasp config to determine box placement
-    robot.q = GRASP_Q.copy()
+    # FK at grasp config to determine box placement.
+    # Place the box at the finger collision center (not the hand center),
+    # so the fingertips actually reach the box regardless of wrist angle.
+    robot.q = GRASP_CLOSED_Q.copy()
     robot.enforce_mimic()
     fk_grasp = robot.forward_kinematics()
-    hand_x = fk_grasp[hand_idx].translation[0]
+    lf_idx = robot.link_index("panda_leftfinger")
+    rf_idx = robot.link_index("panda_rightfinger")
+    T_cl = fk_grasp[lf_idx].compose(robot.links[lf_idx].collisions[0].origin)
+    T_cr = fk_grasp[rf_idx].compose(robot.links[rf_idx].collisions[0].origin)
+    grip_x = (T_cl.translation[0] + T_cr.translation[0]) / 2.0
 
     box_center_z = TABLE_HEIGHT + BOX_SIZE[2] / 2
-    box_pos = np.array([hand_x, 0.0, box_center_z])
-    table_pos = np.array([hand_x, 0.0, TABLE_HEIGHT / 2])
-    print(f"Table height: {TABLE_HEIGHT}m at x={hand_x:.3f}")
+    box_pos = np.array([grip_x, 0.0, box_center_z])
+    table_pos = np.array([grip_x, 0.0, TABLE_HEIGHT / 2])
+    print(f"Table height: {TABLE_HEIGHT}m at x={grip_x:.3f}")
     print(f"Box center:   ({box_pos[0]:.3f}, {box_pos[1]:.3f}, {box_pos[2]:.3f})")
 
     # Reset to home
@@ -284,7 +291,7 @@ def run():
     viewer.initialize()
 
     # Set camera close to gripper area for better visibility
-    viewer._cam_target = np.array([hand_x, 0.0, TABLE_HEIGHT + 0.1])
+    viewer._cam_target = np.array([grip_x, 0.0, TABLE_HEIGHT + 0.1])
     viewer._cam_azimuth = 60.0
     viewer._cam_elevation = 20.0
     viewer._cam_distance = 1.2
