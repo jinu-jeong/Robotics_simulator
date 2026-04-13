@@ -59,18 +59,28 @@ def _link_point_velocity(
         idx = robot.parent_index(idx)
     path.reverse()
 
+    prev_origin = fk[path[0]].translation if path else np.zeros(3)
+
     for i in path:
         parent_idx = robot.parent_index(i)
-        if parent_idx < 0:
-            # Root link: no parent velocity
-            pass
+
+        # Propagate v_origin from parent to this link:
+        # v(child_origin) = v(parent_origin) + omega × (child - parent)
+        link_origin_i = fk[i].translation
+        if parent_idx >= 0:
+            v_origin += np.cross(omega, link_origin_i - prev_origin)
+        prev_origin = link_origin_i
 
         # Add joint velocity contribution
         j_idx = robot.joint_index_for_link(i)
         if j_idx is not None:
             joint = robot.joints[j_idx]
-            q_j = robot.q[j_idx]
-            qd_j = robot.qd[j_idx]
+            # Skip fixed joints (no DOF)
+            if joint.joint_type == JointType.FIXED:
+                continue
+            # Map joint index → DOF index (handles mimic joints)
+            dof_idx = robot._dof_index[j_idx]
+            qd_j = robot.qd[dof_idx]
 
             # Joint axis in world frame
             T_world_link = fk[i]
@@ -110,7 +120,12 @@ class ContactSolver:
         self._body_map = {}          # bid -> (robot_id, link_idx)
         self._robot_solvers = {}     # robot_id -> rbd_solver
         self._robot_body_ids = {}    # robot_id -> list[bid]
+        self._solver_to_rid = {}     # id(solver) -> robot_id
         self._fem_colliders = []
+
+    def _get_robot_id(self, rbd_solver) -> str:
+        """Look up registered robot_id for a solver."""
+        return self._solver_to_rid.get(id(rbd_solver), rbd_solver.robot.name)
 
     def register_rbd(self, rbd_solver, robot_id: str | None = None) -> None:
         """Register collision geometries from robot links.
@@ -126,6 +141,7 @@ class ContactSolver:
         fk = robot.forward_kinematics()
 
         self._robot_solvers[robot_id] = rbd_solver
+        self._solver_to_rid[id(rbd_solver)] = robot_id
         body_ids: list[int] = []
 
         for i, link in enumerate(robot.links):
@@ -146,6 +162,39 @@ class ContactSolver:
 
         # Auto-filter parent-child link pairs (self-collision prevention)
         self._add_adjacency_filters(robot, body_ids)
+
+    def add_cross_filter(
+        self,
+        robot_id_a: str, link_name_a: str,
+        robot_id_b: str, link_name_b: str,
+    ) -> None:
+        """Disable collision between specific links on different robots.
+
+        Useful for filtering hand-object contacts during grasping
+        (only fingers should contact the grasped object).
+        """
+        solver_a = self._robot_solvers.get(robot_id_a)
+        solver_b = self._robot_solvers.get(robot_id_b)
+        if solver_a is None or solver_b is None:
+            return
+
+        # Find link indices
+        link_idx_a = solver_a.robot.link_index(link_name_a)
+        link_idx_b = solver_b.robot.link_index(link_name_b)
+
+        # Find body IDs for those links
+        bid_a = bid_b = None
+        for bid in self._robot_body_ids.get(robot_id_a, []):
+            if self._body_map[bid][1] == link_idx_a:
+                bid_a = bid
+                break
+        for bid in self._robot_body_ids.get(robot_id_b, []):
+            if self._body_map[bid][1] == link_idx_b:
+                bid_b = bid
+                break
+
+        if bid_a is not None and bid_b is not None:
+            self.detector.add_filter(bid_a, bid_b)
 
     def _add_adjacency_filters(self, robot, body_ids: list[int]):
         """Add collision filters for parent-child and sibling link pairs."""
@@ -185,7 +234,7 @@ class ContactSolver:
     def _update_single_rbd(self, rbd_solver) -> None:
         robot = rbd_solver.robot
         fk = robot.forward_kinematics()
-        robot_id = robot.name
+        robot_id = self._get_robot_id(rbd_solver)
 
         for bid in self._robot_body_ids.get(robot_id, []):
             body = self.detector.bodies[bid]
@@ -199,70 +248,79 @@ class ContactSolver:
         """Detect contacts and return per-link spatial wrenches for one robot.
 
         Returns dict: link_idx -> (6,) wrench [torque(3); force(3)] in link frame.
+
+        Uses a two-pass approach:
+          1. Count contacts per link to distribute effective mass.
+          2. Compute forces with effective_mass = link_mass / n_contacts,
+             preventing over-damped energy injection on light bodies.
         """
         # Update ALL registered robots (so cross-robot contacts are accurate)
         self.update_rbd_transforms()
         contacts = self.detector.detect_all()
 
         robot = rbd_solver.robot
-        robot_id = robot.name
+        robot_id = self._get_robot_id(rbd_solver)
         fk = robot.forward_kinematics()
         wrenches: dict[int, np.ndarray] = {}
         self._last_forces = []
 
+        # ── Pass 1: classify contacts and count per-link ──
+        # Each entry: (ContactPoint, link_idx, v_a, v_b)
+        classified: list[tuple[ContactPoint, int, np.ndarray, np.ndarray]] = []
+        contacts_per_link: dict[int, int] = {}
+
         for cp, bid_a, bid_b in contacts:
-            # Apply force to body_a if it belongs to this robot
             rid_a, link_a = self._body_map.get(bid_a, (None, None))
-            if rid_a != robot_id:
-                # Also check body_b (swap direction)
-                rid_b, link_b = self._body_map.get(bid_b, (None, None))
-                if rid_b != robot_id:
-                    continue
-                # Swap: this contact has our robot on the B side
-                cp_swapped = ContactPoint(
-                    point_a=cp.point_b, point_b=cp.point_a,
-                    normal=-cp.normal, penetration=cp.penetration,
-                )
-                link_idx = link_b
-                v_a = _link_point_velocity(robot, link_idx, cp_swapped.point_a)
 
-                # Other body velocity
+            if rid_a == robot_id:
+                link_idx = link_a
+                v_a = _link_point_velocity(robot, link_idx, cp.point_a)
                 v_b = np.zeros(3)
-                if rid_a is not None:
-                    other_solver = self._robot_solvers.get(rid_a)
-                    if other_solver:
-                        v_b = _link_point_velocity(other_solver.robot, link_a, cp_swapped.point_b)
-
-                cf = compute_contact_force(cp_swapped, v_a, v_b, self.params)
-                if cf is None:
-                    continue
-                self._last_forces.append(cf)
-
-                T_inv = fk[link_idx].inverse()
-                f_link = T_inv.apply_vector(cf.force)
-                p_link = T_inv.apply_point(cf.point)
-                tau_link = np.cross(p_link, f_link)
-                wrench = np.concatenate([tau_link, f_link])
-                if link_idx in wrenches:
-                    wrenches[link_idx] += wrench
-                else:
-                    wrenches[link_idx] = wrench
+                if bid_b >= 0:
+                    rid_b, link_b = self._body_map.get(bid_b, (None, None))
+                    if rid_b is not None:
+                        other_solver = self._robot_solvers.get(rid_b)
+                        if other_solver:
+                            v_b = _link_point_velocity(
+                                other_solver.robot, link_b, cp.point_b)
+                classified.append((cp, link_idx, v_a, v_b))
+                contacts_per_link[link_idx] = contacts_per_link.get(link_idx, 0) + 1
                 continue
 
-            link_idx = link_a
+            # Check body_b (our robot on the B side)
+            rid_b, link_b = self._body_map.get(bid_b, (None, None))
+            if rid_b != robot_id:
+                continue
 
-            # Velocity at contact point
-            v_a = _link_point_velocity(robot, link_idx, cp.point_a)
-            v_b = np.zeros(3)  # ground or other body
+            cp_swapped = ContactPoint(
+                point_a=cp.point_b, point_b=cp.point_a,
+                normal=-cp.normal, penetration=cp.penetration,
+            )
+            link_idx = link_b
+            v_a = _link_point_velocity(robot, link_idx, cp_swapped.point_a)
+            v_b = np.zeros(3)
+            if rid_a is not None:
+                other_solver = self._robot_solvers.get(rid_a)
+                if other_solver:
+                    v_b = _link_point_velocity(
+                        other_solver.robot, link_a, cp_swapped.point_b)
+            classified.append((cp_swapped, link_idx, v_a, v_b))
+            contacts_per_link[link_idx] = contacts_per_link.get(link_idx, 0) + 1
 
-            if bid_b >= 0:
-                rid_b, link_b = self._body_map.get(bid_b, (None, None))
-                if rid_b is not None:
-                    other_solver = self._robot_solvers.get(rid_b)
-                    if other_solver:
-                        v_b = _link_point_velocity(other_solver.robot, link_b, cp.point_b)
+        # ── Pass 2: compute forces with per-contact effective mass ──
+        for contact_pt, link_idx, v_a, v_b in classified:
+            link_mass = robot.links[link_idx].mass
+            n_contacts = contacts_per_link.get(link_idx, 1)
 
-            cf = compute_contact_force(cp, v_a, v_b, self.params)
+            # Effective mass per contact: total link mass shared among contacts
+            eff_mass = None
+            if link_mass > 0:
+                eff_mass = link_mass / n_contacts
+
+            cf = compute_contact_force(
+                contact_pt, v_a, v_b, self.params,
+                effective_mass=eff_mass,
+            )
             if cf is None:
                 continue
 
@@ -486,6 +544,106 @@ class ContactSolver:
             )
 
         return total
+
+    def compute_all_rbd_contact_forces(
+        self,
+    ) -> dict[str, dict[int, np.ndarray]]:
+        """Detect contacts once and compute forces for ALL registered robots.
+
+        Ensures consistent contact detection across all bodies. Returns::
+
+            { robot_id: { link_idx: wrench(6,) } }
+
+        Call this once per timestep, then apply forces and step all robots.
+        """
+        self.update_rbd_transforms()
+        contacts = self.detector.detect_all()
+
+        # Prepare result per robot
+        all_wrenches: dict[str, dict[int, np.ndarray]] = {
+            rid: {} for rid in self._robot_solvers
+        }
+        self._last_forces = []
+
+        # ── Pass 1: classify contacts per robot, count per-link ──
+        # Key: (robot_id, link_idx) → list of (ContactPoint, v_a, v_b)
+        classified: dict[tuple[str, int], list] = {}
+        contacts_per_link: dict[tuple[str, int], int] = {}
+
+        for cp, bid_a, bid_b in contacts:
+            rid_a, link_a = self._body_map.get(bid_a, (None, None))
+            rid_b, link_b = self._body_map.get(bid_b, (None, None))
+
+            # For each body in the contact that belongs to a robot,
+            # record the contact from that body's perspective.
+            entries = []
+
+            if rid_a is not None and rid_a in self._robot_solvers:
+                robot_a = self._robot_solvers[rid_a].robot
+                fk_a = robot_a.forward_kinematics()
+                v_a = _link_point_velocity(robot_a, link_a, cp.point_a)
+                v_b = np.zeros(3)
+                if rid_b is not None:
+                    robot_b_solver = self._robot_solvers.get(rid_b)
+                    if robot_b_solver:
+                        v_b = _link_point_velocity(
+                            robot_b_solver.robot, link_b, cp.point_b)
+                entries.append((rid_a, link_a, cp, v_a, v_b, fk_a))
+
+            if rid_b is not None and rid_b in self._robot_solvers and bid_b >= 0:
+                robot_b = self._robot_solvers[rid_b].robot
+                fk_b = robot_b.forward_kinematics()
+                cp_swapped = ContactPoint(
+                    point_a=cp.point_b, point_b=cp.point_a,
+                    normal=-cp.normal, penetration=cp.penetration,
+                )
+                v_a_b = _link_point_velocity(robot_b, link_b, cp_swapped.point_a)
+                v_b_b = np.zeros(3)
+                if rid_a is not None:
+                    robot_a_solver = self._robot_solvers.get(rid_a)
+                    if robot_a_solver:
+                        v_b_b = _link_point_velocity(
+                            robot_a_solver.robot, link_a, cp_swapped.point_b)
+                entries.append((rid_b, link_b, cp_swapped, v_a_b, v_b_b, fk_b))
+
+            for rid, lidx, cpt, va, vb, fk in entries:
+                key = (rid, lidx)
+                if key not in classified:
+                    classified[key] = []
+                classified[key].append((cpt, va, vb, fk))
+                contacts_per_link[key] = contacts_per_link.get(key, 0) + 1
+
+        # ── Pass 2: compute forces ──
+        for (rid, lidx), contact_list in classified.items():
+            robot = self._robot_solvers[rid].robot
+            link_mass = robot.links[lidx].mass
+            n_contacts = contacts_per_link[(rid, lidx)]
+
+            eff_mass = None
+            if link_mass > 0:
+                eff_mass = link_mass / n_contacts
+
+            for cpt, va, vb, fk in contact_list:
+                cf = compute_contact_force(
+                    cpt, va, vb, self.params, effective_mass=eff_mass,
+                )
+                if cf is None:
+                    continue
+                self._last_forces.append(cf)
+
+                T_inv = fk[lidx].inverse()
+                f_link = T_inv.apply_vector(cf.force)
+                p_link = T_inv.apply_point(cf.point)
+                tau_link = np.cross(p_link, f_link)
+                wrench = np.concatenate([tau_link, f_link])
+
+                w_dict = all_wrenches[rid]
+                if lidx in w_dict:
+                    w_dict[lidx] += wrench
+                else:
+                    w_dict[lidx] = wrench
+
+        return all_wrenches
 
     @property
     def last_forces(self) -> list[ContactForce]:

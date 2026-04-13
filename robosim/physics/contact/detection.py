@@ -16,6 +16,7 @@ from robosim.physics.contact.sdf import (
     sphere_sphere,
     box_box,
     box_sphere,
+    mesh_box,
     mesh_ground,
     points_ground,
 )
@@ -209,5 +210,23 @@ class ContactDetector:
                 cp.normal = -cp.normal
                 cp.point_a, cp.point_b = cp.point_b, cp.point_a
             return [cp] if cp is not None else []
+
+        # Mesh-box / Box-mesh
+        if type_a == GeometryType.MESH and type_b == GeometryType.BOX:
+            if ga.mesh_loaded:
+                world_verts = (ta.rotation @ ga.mesh_vertices.T).T + ta.translation
+                return mesh_box(world_verts, tb.translation, tb.rotation, gb.size / 2.0)
+            return []
+
+        if type_a == GeometryType.BOX and type_b == GeometryType.MESH:
+            if gb.mesh_loaded:
+                world_verts = (tb.rotation @ gb.mesh_vertices.T).T + tb.translation
+                contacts = mesh_box(world_verts, ta.translation, ta.rotation, ga.size / 2.0)
+                # Flip: mesh_box returns normal from box→mesh, we need B→A
+                for cp in contacts:
+                    cp.normal = -cp.normal
+                    cp.point_a, cp.point_b = cp.point_b, cp.point_a
+                return contacts
+            return []
 
         return []

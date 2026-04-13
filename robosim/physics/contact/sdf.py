@@ -155,11 +155,14 @@ def box_box(
         axes.append(ax_b[i])
 
     # Edge-edge cross products (9)
+    # Use a generous threshold to filter near-parallel edge pairs —
+    # their cross products are numerically unreliable and create
+    # ghost contacts between nearly-aligned OBBs.
     for i in range(3):
         for j in range(3):
             c = np.cross(ax_a[i], ax_b[j])
             n = np.linalg.norm(c)
-            if n > 1e-8:
+            if n > 0.01:
                 axes.append(c / n)
 
     # --- Find axis of minimum penetration ---
@@ -272,6 +275,53 @@ def box_sphere(
     point_b = sphere_center - sphere_radius * normal
     return ContactPoint(point_a=point_a, point_b=point_b,
                         normal=normal, penetration=penetration)
+
+
+def mesh_box(
+    mesh_verts_world: np.ndarray,
+    box_center: np.ndarray, box_rot: np.ndarray, box_half: np.ndarray,
+) -> list[ContactPoint]:
+    """Mesh vertices vs OBB contact test.
+
+    Tests each mesh vertex (already in world frame) against the oriented
+    bounding box.  Returns contacts for vertices that are inside the box.
+
+    Normal points from box → mesh (B → A convention).
+    """
+    contacts: list[ContactPoint] = []
+    ax = box_rot.T  # rows = box local axes
+
+    for v in mesh_verts_world:
+        local = ax @ (v - box_center)
+
+        # Check if vertex is inside the box
+        inside = np.abs(local) <= box_half
+        if not inside.all():
+            continue
+
+        # Find face of minimum penetration for this vertex
+        pen_per_face = box_half - np.abs(local)  # positive if inside
+        face_idx = int(np.argmin(pen_per_face))
+        pen = pen_per_face[face_idx]
+
+        # Normal points outward from the face (in box local frame)
+        sign = -1.0 if local[face_idx] < 0 else 1.0
+        normal_local = np.zeros(3)
+        normal_local[face_idx] = sign
+
+        # To world frame
+        normal_world = box_rot @ normal_local
+
+        # Contact points
+        point_a = v.copy()                    # on the mesh
+        point_b = v - pen * normal_world      # on the box surface
+
+        contacts.append(ContactPoint(
+            point_a=point_a, point_b=point_b,
+            normal=normal_world, penetration=pen,
+        ))
+
+    return contacts
 
 
 def mesh_ground(
