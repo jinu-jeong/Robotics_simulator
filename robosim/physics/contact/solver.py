@@ -517,6 +517,7 @@ class ContactSolver:
         restitution: float = 0.1,
         friction_mu: float = 0.5,
         d_hat: float = 0.005,
+        dt: float = 0.001,
     ) -> int:
         """Detect and resolve all RBD-FEM contacts.
 
@@ -541,6 +542,7 @@ class ContactSolver:
             contacts = detect_rbd_fem(robot, fk, collider, bodies[collider.body_idx].x, d_hat)
             total += resolve_rbd_fem_contacts(
                 contacts, robot, bodies, restitution, friction_mu,
+                dt=dt,
             )
 
         return total

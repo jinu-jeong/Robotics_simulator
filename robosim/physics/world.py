@@ -97,6 +97,7 @@ class PhysicsWorld:
             self.contact.resolve_rbd_fem_all(
                 self.rbd_solver, self.fem_solver,
                 restitution=0.1, friction_mu=0.5,
+                dt=dt,
             )
 
         self._time += dt
