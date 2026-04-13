@@ -366,8 +366,6 @@ def resolve_fem_fem_contacts(
     bodies: list,
     restitution: float = 0.1,
     friction_mu: float = 0.5,
-    dt: float = 0.001,
-    max_correction_speed: float = 2.0,
 ) -> int:
     """Apply impulse-based contact response for FEM-FEM collisions.
 
@@ -376,23 +374,16 @@ def resolve_fem_fem_contacts(
       2. Split position correction and velocity impulse by mass ratio
       3. Apply Coulomb friction
 
-    Position correction is rate-limited to ``max_correction_speed * dt``
-    per step to prevent elastic energy injection in stiff materials.
-
     Parameters
     ----------
     contacts : detected FEM-FEM contacts
     bodies : list of DeformableBody (from FEMSolver.bodies)
     restitution : velocity restitution coefficient
     friction_mu : Coulomb friction coefficient
-    dt : simulation timestep (for rate-limiting)
-    max_correction_speed : max correction velocity (m/s)
 
     Returns number of contacts resolved.
     """
     n_resolved = 0
-    max_correction = max_correction_speed * dt
-
     for c in contacts:
         body_a = bodies[c.body_a_idx]
         body_b = bodies[c.body_b_idx]
@@ -420,9 +411,8 @@ def resolve_fem_fem_contacts(
         w_a = m_b_eff / m_total   # weight for A (heavier B → A moves more)
         w_b = m_a / m_total
 
-        # --- Position correction (rate-limited) ---
-        pen_clamped = min(c.penetration, max_correction)
-        correction = pen_clamped * normal
+        # --- Position correction ---
+        correction = c.penetration * normal
         body_a.x[node_a] += w_a * correction
         for i, ni in enumerate(face_nodes_b):
             body_b.x[ni] -= w_b * bary[i] * correction
@@ -434,21 +424,13 @@ def resolve_fem_fem_contacts(
         v_rel = v_a - v_b_contact
         v_n = float(np.dot(v_rel, normal))
 
-        # Deep penetration: suppress bounce to prevent energy injection
-        still_deep = c.penetration > pen_clamped * 1.5
-
         # Only resolve if approaching
-        if v_n >= 0 and not still_deep:
-            n_resolved += 1
-            continue
-
         if v_n >= 0:
             n_resolved += 1
             continue
 
         # Normal impulse magnitude
-        eff_restitution = 0.0 if still_deep else restitution
-        j_n = -(1.0 + eff_restitution) * v_n / (1.0 / m_a + 1.0 / m_b_eff)
+        j_n = -(1.0 + restitution) * v_n / (1.0 / m_a + 1.0 / m_b_eff)
 
         # Apply normal impulse
         body_a.v[node_a] += (j_n / m_a) * normal
@@ -478,20 +460,11 @@ def resolve_rbd_fem_contacts(
     fem_bodies: list,
     restitution: float = 0.1,
     friction_mu: float = 0.5,
-    dt: float = 0.001,
-    max_correction_speed: float = 2.0,
 ) -> int:
     """Apply impulse-based contact response for RBD-FEM collisions.
 
     The RBD is treated as infinite mass (already stepped). The FEM node
     absorbs the full correction.
-
-    Position correction is rate-limited to prevent energy injection:
-    if the full correction were applied instantly, the resulting mesh
-    distortion × material stiffness can launch the body.  Instead, the
-    correction is clamped to ``max_correction_speed * dt`` per step,
-    and the node velocity is set to match the RBD surface velocity
-    (no bounce) while it is still penetrating deeply.
 
     Parameters
     ----------
@@ -499,8 +472,6 @@ def resolve_rbd_fem_contacts(
     robot : Robot model (for velocity computation)
     fem_bodies : list of DeformableBody
     restitution, friction_mu : contact parameters
-    dt : simulation timestep (for rate-limiting)
-    max_correction_speed : max position correction velocity (m/s)
 
     Returns number of contacts resolved.
     """
@@ -508,8 +479,6 @@ def resolve_rbd_fem_contacts(
 
     n_resolved = 0
     fk = robot.forward_kinematics()
-
-    max_correction = max_correction_speed * dt
 
     for c in contacts:
         body = fem_bodies[c.fem_body_idx]
@@ -519,52 +488,31 @@ def resolve_rbd_fem_contacts(
         if c.penetration <= 0:
             continue
 
-        # --- Position correction: rate-limited push out ---
-        # Clamp correction to prevent sudden jumps that generate
-        # huge elastic forces in stiff FEM materials.
-        correction = min(c.penetration, max_correction)
-        body.x[node_idx] += correction * normal
+        # --- Position correction: push FEM node out ---
+        body.x[node_idx] += c.penetration * normal
 
-        # --- Velocity relative to RBD surface ---
+        # --- Velocity: reflect relative to RBD surface velocity ---
         v_fem = body.v[node_idx]
         v_rbd = _link_point_velocity(robot, c.link_idx, c.rbd_contact_point)
 
         v_rel = v_fem - v_rbd
         v_n = float(np.dot(v_rel, normal))
 
-        # If still deeply penetrating (correction was clamped),
-        # don't bounce — just match the RBD surface velocity
-        # to let the node slide out gradually.
-        still_penetrating = c.penetration > correction * 1.5
-
-        if v_n >= 0 and not still_penetrating:
-            # Already separating and near surface — done
+        if v_n >= 0:
             n_resolved += 1
             continue
 
-        if still_penetrating:
-            # Deep penetration: kill relative normal velocity (no bounce).
-            # The node should track the RBD surface until it emerges.
-            if v_n < 0:
-                body.v[node_idx] -= v_n * normal
-        else:
-            # Near surface: apply normal impulse with restitution
-            if v_n < 0:
-                dv_n = -(1.0 + restitution) * v_n
-                body.v[node_idx] += dv_n * normal
+        # Normal impulse: reflect
+        dv_n = -(1.0 + restitution) * v_n
+        body.v[node_idx] += dv_n * normal
 
         # Coulomb friction
-        v_rel_updated = body.v[node_idx] - v_rbd
-        v_n_updated = float(np.dot(v_rel_updated, normal))
-        v_t = v_rel_updated - v_n_updated * normal
+        v_t = v_rel - v_n * normal
         v_t_mag = np.linalg.norm(v_t)
         if v_t_mag > 1e-10:
-            # Use original approach speed for friction impulse magnitude
-            normal_impulse = abs(v_n) if v_n < 0 else 0.0
-            max_dv_t = friction_mu * (1.0 + restitution) * normal_impulse
-            if max_dv_t > 0:
-                scale = min(1.0, max_dv_t / v_t_mag)
-                body.v[node_idx] -= scale * v_t
+            max_dv_t = friction_mu * (1.0 + restitution) * abs(v_n)
+            scale = min(1.0, max_dv_t / v_t_mag)
+            body.v[node_idx] -= scale * v_t
 
         n_resolved += 1
 

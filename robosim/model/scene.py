@@ -409,7 +409,6 @@ class SceneWorld:
                 self.contact.resolve_rbd_fem_all(
                     first_solver, fem_solver,
                     restitution=0.1, friction_mu=0.5,
-                    dt=self.dt,
                 )
 
         self._time += self.dt

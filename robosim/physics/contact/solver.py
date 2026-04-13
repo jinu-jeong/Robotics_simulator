@@ -31,15 +31,10 @@ from robosim.physics.contact.fem_contact import (
 
 def _link_point_velocity(
     robot, link_idx: int, point_world: np.ndarray,
-    fk: list | None = None,
 ) -> np.ndarray:
     """Compute world-frame velocity of a point attached to a link.
 
     Uses joint velocity propagation through the kinematic chain.
-
-    Parameters
-    ----------
-    fk : optional pre-computed forward kinematics (avoids redundant FK).
     """
     from robosim.math.spatial import (
         joint_transform,
@@ -48,8 +43,7 @@ def _link_point_velocity(
     )
     from robosim.model.joint import JointType
 
-    if fk is None:
-        fk = robot.forward_kinematics()
+    fk = robot.forward_kinematics()
     n_links = robot.n_links
 
     # Propagate spatial velocities from root to link_idx
@@ -270,15 +264,6 @@ class ContactSolver:
         wrenches: dict[int, np.ndarray] = {}
         self._last_forces = []
 
-        # Cache FK per robot to avoid redundant recomputation
-        fk_cache: dict[str, list] = {robot_id: fk}
-
-        def _get_fk(rid):
-            if rid not in fk_cache:
-                s = self._robot_solvers.get(rid)
-                fk_cache[rid] = s.robot.forward_kinematics() if s else []
-            return fk_cache[rid]
-
         # ── Pass 1: classify contacts and count per-link ──
         # Each entry: (ContactPoint, link_idx, v_a, v_b)
         classified: list[tuple[ContactPoint, int, np.ndarray, np.ndarray]] = []
@@ -289,7 +274,7 @@ class ContactSolver:
 
             if rid_a == robot_id:
                 link_idx = link_a
-                v_a = _link_point_velocity(robot, link_idx, cp.point_a, fk=fk)
+                v_a = _link_point_velocity(robot, link_idx, cp.point_a)
                 v_b = np.zeros(3)
                 if bid_b >= 0:
                     rid_b, link_b = self._body_map.get(bid_b, (None, None))
@@ -297,8 +282,7 @@ class ContactSolver:
                         other_solver = self._robot_solvers.get(rid_b)
                         if other_solver:
                             v_b = _link_point_velocity(
-                                other_solver.robot, link_b, cp.point_b,
-                                fk=_get_fk(rid_b))
+                                other_solver.robot, link_b, cp.point_b)
                 classified.append((cp, link_idx, v_a, v_b))
                 contacts_per_link[link_idx] = contacts_per_link.get(link_idx, 0) + 1
                 continue
@@ -313,14 +297,13 @@ class ContactSolver:
                 normal=-cp.normal, penetration=cp.penetration,
             )
             link_idx = link_b
-            v_a = _link_point_velocity(robot, link_idx, cp_swapped.point_a, fk=fk)
+            v_a = _link_point_velocity(robot, link_idx, cp_swapped.point_a)
             v_b = np.zeros(3)
             if rid_a is not None:
                 other_solver = self._robot_solvers.get(rid_a)
                 if other_solver:
                     v_b = _link_point_velocity(
-                        other_solver.robot, link_a, cp_swapped.point_b,
-                        fk=_get_fk(rid_a))
+                        other_solver.robot, link_a, cp_swapped.point_b)
             classified.append((cp_swapped, link_idx, v_a, v_b))
             contacts_per_link[link_idx] = contacts_per_link.get(link_idx, 0) + 1
 
@@ -534,7 +517,6 @@ class ContactSolver:
         restitution: float = 0.1,
         friction_mu: float = 0.5,
         d_hat: float = 0.005,
-        dt: float = 0.001,
     ) -> int:
         """Detect and resolve all RBD-FEM contacts.
 
@@ -559,7 +541,6 @@ class ContactSolver:
             contacts = detect_rbd_fem(robot, fk, collider, bodies[collider.body_idx].x, d_hat)
             total += resolve_rbd_fem_contacts(
                 contacts, robot, bodies, restitution, friction_mu,
-                dt=dt,
             )
 
         return total
@@ -584,15 +565,6 @@ class ContactSolver:
         }
         self._last_forces = []
 
-        # Cache FK per robot to avoid redundant recomputation
-        fk_cache: dict[str, list] = {}
-
-        def _get_fk(rid):
-            if rid not in fk_cache:
-                s = self._robot_solvers.get(rid)
-                fk_cache[rid] = s.robot.forward_kinematics() if s else []
-            return fk_cache[rid]
-
         # ── Pass 1: classify contacts per robot, count per-link ──
         # Key: (robot_id, link_idx) → list of (ContactPoint, v_a, v_b)
         classified: dict[tuple[str, int], list] = {}
@@ -608,35 +580,30 @@ class ContactSolver:
 
             if rid_a is not None and rid_a in self._robot_solvers:
                 robot_a = self._robot_solvers[rid_a].robot
-                fk_a = _get_fk(rid_a)
-                v_a = _link_point_velocity(robot_a, link_a, cp.point_a, fk=fk_a)
+                fk_a = robot_a.forward_kinematics()
+                v_a = _link_point_velocity(robot_a, link_a, cp.point_a)
                 v_b = np.zeros(3)
                 if rid_b is not None:
                     robot_b_solver = self._robot_solvers.get(rid_b)
                     if robot_b_solver:
-                        fk_b_tmp = _get_fk(rid_b)
                         v_b = _link_point_velocity(
-                            robot_b_solver.robot, link_b, cp.point_b,
-                            fk=fk_b_tmp)
+                            robot_b_solver.robot, link_b, cp.point_b)
                 entries.append((rid_a, link_a, cp, v_a, v_b, fk_a))
 
             if rid_b is not None and rid_b in self._robot_solvers and bid_b >= 0:
                 robot_b = self._robot_solvers[rid_b].robot
-                fk_b = _get_fk(rid_b)
+                fk_b = robot_b.forward_kinematics()
                 cp_swapped = ContactPoint(
                     point_a=cp.point_b, point_b=cp.point_a,
                     normal=-cp.normal, penetration=cp.penetration,
                 )
-                v_a_b = _link_point_velocity(robot_b, link_b, cp_swapped.point_a,
-                                             fk=fk_b)
+                v_a_b = _link_point_velocity(robot_b, link_b, cp_swapped.point_a)
                 v_b_b = np.zeros(3)
                 if rid_a is not None:
                     robot_a_solver = self._robot_solvers.get(rid_a)
                     if robot_a_solver:
-                        fk_a_tmp = _get_fk(rid_a)
                         v_b_b = _link_point_velocity(
-                            robot_a_solver.robot, link_a, cp_swapped.point_b,
-                            fk=fk_a_tmp)
+                            robot_a_solver.robot, link_a, cp_swapped.point_b)
                 entries.append((rid_b, link_b, cp_swapped, v_a_b, v_b_b, fk_b))
 
             for rid, lidx, cpt, va, vb, fk in entries:
