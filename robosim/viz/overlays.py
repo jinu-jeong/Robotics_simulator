@@ -228,7 +228,7 @@ class JointAxisOverlay:
             if joint.joint_type == JointType.FIXED:
                 continue
 
-            child_idx = robot.link_index(joint.child)
+            child_idx = robot.link_index(joint.child_link)
             if child_idx is None:
                 continue
 

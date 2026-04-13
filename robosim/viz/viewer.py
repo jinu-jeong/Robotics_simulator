@@ -190,15 +190,97 @@ class SimViewer:
         self._hud_lines: list[str] = []
         self._initialized = False
 
+        # ── Custom orbit camera state (Z-up) ──
+        self._cam_target = np.array([0.0, 0.0, 0.4])
+        self._cam_azimuth = 45.0    # degrees, 0 = +X
+        self._cam_elevation = 25.0  # degrees above horizon
+        self._cam_distance = 3.0
+        self._prev_mouse = None     # (x, y) or None
+        self._prev_rmouse = None    # for panning
+        self._orbit_speed = 0.3     # degrees per pixel
+        self._zoom_speed = 0.05
+        self._pan_speed = 0.003
+
+    def _cam_position(self) -> np.ndarray:
+        """Compute camera world position from orbit parameters."""
+        az = np.radians(self._cam_azimuth)
+        el = np.radians(self._cam_elevation)
+        r = self._cam_distance
+        x = r * np.cos(el) * np.cos(az)
+        y = r * np.cos(el) * np.sin(az)
+        z = r * np.sin(el)
+        return self._cam_target + np.array([x, y, z])
+
+    def _apply_camera(self):
+        """Apply orbit camera state to the Taichi camera object."""
+        pos = self._cam_position()
+        self._camera.position(*pos)
+        self._camera.lookat(*self._cam_target)
+        self._camera.up(0, 0, 1)
+
+    def _handle_camera_input(self):
+        """Process mouse/keyboard input for orbit camera (Z-up correct)."""
+        window = self._window
+
+        # ── Mouse orbit (LMB drag) ──
+        curr_mouse = window.get_cursor_pos()
+        lmb = window.is_pressed(ti.ui.LMB)
+        rmb = window.is_pressed(ti.ui.RMB)
+
+        if lmb:
+            if self._prev_mouse is not None:
+                dx = (curr_mouse[0] - self._prev_mouse[0]) * self.window_size[0]
+                dy = (curr_mouse[1] - self._prev_mouse[1]) * self.window_size[1]
+                # Mouse left-right → azimuth (horizontal orbit)
+                self._cam_azimuth -= dx * self._orbit_speed
+                # Mouse up-down → elevation (vertical orbit)
+                self._cam_elevation += dy * self._orbit_speed
+                self._cam_elevation = np.clip(self._cam_elevation, -85.0, 89.0)
+            self._prev_mouse = curr_mouse
+        else:
+            self._prev_mouse = None
+
+        # ── Mouse pan (RMB drag) ──
+        if rmb:
+            if self._prev_rmouse is not None:
+                dx = (curr_mouse[0] - self._prev_rmouse[0]) * self.window_size[0]
+                dy = (curr_mouse[1] - self._prev_rmouse[1]) * self.window_size[1]
+                az = np.radians(self._cam_azimuth)
+                # Screen-right in world (perpendicular to view, horizontal)
+                right = np.array([-np.sin(az), np.cos(az), 0.0])
+                up = np.array([0.0, 0.0, 1.0])
+                self._cam_target -= right * dx * self._pan_speed * self._cam_distance
+                self._cam_target += up * dy * self._pan_speed * self._cam_distance
+            self._prev_rmouse = curr_mouse
+        else:
+            self._prev_rmouse = None
+
+        # ── Keyboard zoom (W/S) ──
+        if window.is_pressed('w'):
+            self._cam_distance *= (1.0 - self._zoom_speed)
+        if window.is_pressed('s'):
+            self._cam_distance *= (1.0 + self._zoom_speed)
+        self._cam_distance = np.clip(self._cam_distance, 0.2, 20.0)
+
+        # ── Keyboard pan (A/D/Q/E) ──
+        az = np.radians(self._cam_azimuth)
+        right = np.array([-np.sin(az), np.cos(az), 0.0])
+        if window.is_pressed('a'):
+            self._cam_target -= right * 0.02
+        if window.is_pressed('d'):
+            self._cam_target += right * 0.02
+        if window.is_pressed('e'):
+            self._cam_target[2] += 0.02
+        if window.is_pressed('q'):
+            self._cam_target[2] -= 0.02
+
     def initialize(self):
         """Create the Taichi window and set up the scene."""
         self._window = ti.ui.Window(self.title, self.window_size, vsync=True)
         self._canvas = self._window.get_canvas()
         self._scene = self._window.get_scene()
         self._camera = ti.ui.Camera()
-        self._camera.position(2.0, 2.0, 1.5)
-        self._camera.lookat(0, 0, 0.4)
-        self._camera.up(0, 0, 1)
+        self._apply_camera()
 
         # Ground plane
         gv = np.array([
@@ -384,7 +466,8 @@ class SimViewer:
 
     def _render_frame(self):
         """Render one frame."""
-        self._camera.track_user_inputs(self._window, movement_speed=0.3, hold_key=ti.ui.LMB)
+        self._handle_camera_input()
+        self._apply_camera()
         self._scene.set_camera(self._camera)
 
         self._scene.ambient_light((0.7, 0.7, 0.7))
