@@ -13,27 +13,44 @@ from robosim.viz.viewer import SimViewer, geometry_to_trimesh
 class RobotRenderer:
     """Renders a Robot model in the SimViewer.
 
-    Extracts visual geometries from the robot and manages their
-    transforms each frame.
+    Extracts visual **and** collision geometries from the robot.
+    By default visual meshes are shown; collision meshes are hidden.
+    Use :meth:`show_collision` to toggle.
     """
 
     def __init__(self, robot: Robot, viewer: SimViewer):
         self.robot = robot
         self.viewer = viewer
+
+        # Visual layer
         self._visual_link_names: list[str] = []
         self._visual_geoms: list[tuple[Geometry, Transform]] = []
         self._visual_colors: list[np.ndarray | None] = []
 
+        # Collision layer
+        self._collision_link_names: list[str] = []
+        self._collision_geoms: list[tuple[Geometry, Transform]] = []
+        self._collision_colors: list[np.ndarray | None] = []
+
+        self._show_collision = False
+
+    # ── Visual mesh prefix ──
+    def _vis_prefix(self) -> str:
+        return f"{self.robot.name}/"
+
+    def _col_prefix(self) -> str:
+        return f"{self.robot.name}_col/"
+
     def setup(self):
-        """Extract visual geometries from robot and add to viewer."""
+        """Extract visual and collision geometries from robot and add to viewer."""
+        # ── Visual meshes ──
         for link in self.robot.links:
             if link.visuals:
-                vis = link.visuals[0]  # Use first visual
+                vis = link.visuals[0]
                 self._visual_link_names.append(link.name)
                 self._visual_geoms.append((vis.geometry, vis.origin))
                 self._visual_colors.append(vis.color)
             else:
-                # Create a default small sphere for links without visuals
                 default_geom = Geometry.sphere(0.015)
                 self._visual_link_names.append(link.name)
                 self._visual_geoms.append((default_geom, Transform.identity()))
@@ -46,22 +63,77 @@ class RobotRenderer:
             self._visual_colors,
         )
 
-    def update(self):
-        """Update all link transforms from current robot state."""
-        fk = self.robot.forward_kinematics()
+        # ── Collision meshes (added hidden) ──
+        col_color = np.array([0.2, 0.8, 0.3, 0.7])  # translucent green
+        for link in self.robot.links:
+            if link.collisions:
+                col = link.collisions[0]
+                self._collision_link_names.append(link.name)
+                self._collision_geoms.append((col.geometry, col.origin))
+                self._collision_colors.append(col_color.copy())
 
-        transforms = []
-        for link_name in self._visual_link_names:
-            idx = self.robot.link_index(link_name)
-            transforms.append(fk[idx])
+        if self._collision_link_names:
+            self.viewer.add_robot_meshes(
+                f"{self.robot.name}_col",
+                self._collision_link_names,
+                self._collision_geoms,
+                self._collision_colors,
+            )
+            # Hide collision meshes by default
+            self.viewer.set_meshes_visible_by_prefix(
+                self._col_prefix(), False)
 
-        self.viewer.update_link_transforms(
-            self.robot.name,
-            self._visual_link_names,
-            transforms,
-            self._visual_geoms,
-            self._visual_colors,
-        )
+    @property
+    def collision_visible(self) -> bool:
+        return self._show_collision
+
+    def show_collision(self, show: bool):
+        """Toggle collision mesh visibility (hides visual meshes when on)."""
+        if show == self._show_collision:
+            return
+        self._show_collision = show
+        self.viewer.set_meshes_visible_by_prefix(
+            self._vis_prefix(), not show)
+        self.viewer.set_meshes_visible_by_prefix(
+            self._col_prefix(), show)
+
+    def update(self, fk: list | None = None):
+        """Update all link transforms from current robot state.
+
+        Parameters
+        ----------
+        fk : optional pre-computed FK to avoid redundant recomputation.
+        """
+        if fk is None:
+            fk = self.robot.forward_kinematics()
+
+        # Update the active layer (visual or collision)
+        if not self._show_collision:
+            transforms = []
+            for link_name in self._visual_link_names:
+                idx = self.robot.link_index(link_name)
+                transforms.append(fk[idx])
+
+            self.viewer.update_link_transforms(
+                self.robot.name,
+                self._visual_link_names,
+                transforms,
+                self._visual_geoms,
+                self._visual_colors,
+            )
+        else:
+            transforms = []
+            for link_name in self._collision_link_names:
+                idx = self.robot.link_index(link_name)
+                transforms.append(fk[idx])
+
+            self.viewer.update_link_transforms(
+                f"{self.robot.name}_col",
+                self._collision_link_names,
+                transforms,
+                self._collision_geoms,
+                self._collision_colors,
+            )
 
 
 def create_joint_markers(robot: Robot, viewer: SimViewer) -> None:

@@ -55,6 +55,7 @@ def interpolate_q(q_start, q_end, t, duration):
 def compute_finger_box_forces(
     robot, fk, target_box, box_solver,
     stiffness=5e3, damping=200, friction_mu=0.6,
+    box_fk=None,
 ):
     """Analytical parallel-jaw grasp forces between finger boxes and target box.
 
@@ -66,13 +67,18 @@ def compute_finger_box_forces(
     Forces are only generated when BOTH fingers overlap the box (a true
     grip).  A single-finger contact would push the box away, not grip it.
 
+    Parameters
+    ----------
+    box_fk : optional pre-computed FK for target_box (avoids redundant call).
+
     Returns: (finger_wrenches, box_wrench)
         finger_wrenches: dict {link_idx: wrench(6)} for each finger
         box_wrench:      (6,) combined wrench on the box
     """
     from robosim.physics.contact.solver import _link_point_velocity
 
-    box_fk = target_box.forward_kinematics()
+    if box_fk is None:
+        box_fk = target_box.forward_kinematics()
     box_body_idx = len(target_box.links) - 1
     T_box = box_fk[box_body_idx]
     box_center = T_box.translation
@@ -128,8 +134,8 @@ def compute_finger_box_forces(
 
         normal = np.array([0.0, float(sign), 0.0])
 
-        v_finger = _link_point_velocity(robot, idx, contact_pt)
-        v_box = _link_point_velocity(target_box, box_body_idx, contact_pt)
+        v_finger = _link_point_velocity(robot, idx, contact_pt, fk=fk)
+        v_box = _link_point_velocity(target_box, box_body_idx, contact_pt, fk=box_fk)
         v_rel = v_finger - v_box
         v_n = float(np.dot(v_rel, normal))
 
@@ -304,6 +310,7 @@ def run():
     panel.add_slider("Damping", 50, 1000, 200)
     panel.add_slider("Friction", 0.1, 1.5, 0.6)
     panel.add_checkbox("Show Forces", False)
+    panel.add_checkbox("Show Collision", False)
 
     force_overlay = ContactForceOverlay(
         viewer, scale=0.0003, max_arrows=20,
@@ -345,6 +352,7 @@ def run():
         box_table_params.stiffness = grasp_k
         box_table_params.damping = grasp_c
         force_overlay.active = panel.get_bool("Show Forces")
+        renderer.show_collision(panel.get_bool("Show Collision"))
 
         import time as _t
         panel.playback.update_fps(_t.time())
@@ -370,10 +378,12 @@ def run():
             # Only engage during close / lift / hold to prevent false
             # triggers from wrist-tilt projecting finger extents onto y.
             fk_now = robot.forward_kinematics()
+            box_fk_now = target_box.forward_kinematics()
             if phase_name in ("close", "lift", "hold", "done"):
                 finger_wrenches, box_grasp_wrench = compute_finger_box_forces(
                     robot, fk_now, target_box, box_solver,
                     stiffness=grasp_k, damping=grasp_c, friction_mu=grasp_mu,
+                    box_fk=box_fk_now,
                 )
             else:
                 finger_wrenches, box_grasp_wrench = {}, np.zeros(6)
@@ -408,9 +418,9 @@ def run():
                 from robosim.physics.contact.solver import _link_point_velocity
                 _l_idx = robot.link_index("panda_leftfinger")
                 _r_idx = robot.link_index("panda_rightfinger")
-                box_c = target_box.forward_kinematics()[box_body_idx].translation
-                vl = _link_point_velocity(robot, _l_idx, box_c)
-                vr = _link_point_velocity(robot, _r_idx, box_c)
+                box_c = box_fk_now[box_body_idx].translation
+                vl = _link_point_velocity(robot, _l_idx, box_c, fk=fk_now)
+                vr = _link_point_velocity(robot, _r_idx, box_c, fk=fk_now)
                 avg_v = 0.5 * (vl + vr)
                 target_box.q[:3] += avg_v * dt
                 target_box.qd[:3] = avg_v
@@ -430,7 +440,8 @@ def run():
             sim_time += dt
 
         # ── Update visuals ──
-        renderer.update()
+        fk_render = robot.forward_kinematics()
+        renderer.update(fk=fk_render)
 
         # Table is static — no update needed
 
@@ -445,8 +456,7 @@ def run():
 
         # Status info via UI panel
         q_des, phase_name = get_target_q(sim_time)
-        fk_now = robot.forward_kinematics()
-        hand_now = fk_now[hand_idx].translation
+        hand_now = fk_render[hand_idx].translation
         finger_q = robot.q[7]
         box_z = target_box.q[2]
         n_contacts = len(contact.last_forces)

@@ -155,6 +155,7 @@ class _MeshEntry:
     per_vertex_color: np.ndarray | None = None
     # Current world-space vertices (updated each frame)
     world_verts: np.ndarray | None = None
+    visible: bool = True
 
 
 # ── SimViewer ────────────────────────────────────────────────────
@@ -351,6 +352,17 @@ class SimViewer:
         """Update per-vertex color of an existing mesh."""
         self._meshes[name].per_vertex_color = per_vertex_color
 
+    def set_mesh_visible(self, name: str, visible: bool):
+        """Show or hide a mesh by name."""
+        if name in self._meshes:
+            self._meshes[name].visible = visible
+
+    def set_meshes_visible_by_prefix(self, prefix: str, visible: bool):
+        """Show or hide all meshes whose name starts with *prefix*."""
+        for name, entry in self._meshes.items():
+            if name.startswith(prefix):
+                entry.visible = visible
+
     def add_robot_meshes(
         self,
         robot_name: str,
@@ -438,6 +450,8 @@ class SimViewer:
         offset = 0
 
         for entry in self._meshes.values():
+            if not entry.visible:
+                continue
             nv = entry.world_verts.shape[0]
             all_verts.append(entry.world_verts)
 
