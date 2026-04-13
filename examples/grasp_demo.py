@@ -32,7 +32,7 @@ from robosim.viz.overlays import ContactForceOverlay
 
 PANDA_URDF = Path(__file__).parent / "urdf" / "panda" / "panda.urdf"
 TABLE_HEIGHT = 0.15  # table surface height in meters
-BOX_SIZE = (0.04, 0.04, 0.04)
+BOX_SIZE = (0.05, 0.05, 0.05)  # larger box for better visibility
 
 # ── Joint configurations ──
 # Panda: j1(base), j2(shoulder), j3(upper_rot), j4(elbow),
@@ -41,8 +41,8 @@ BOX_SIZE = (0.04, 0.04, 0.04)
 HOME_Q = np.array([0.0, -0.3, 0.0, -2.0, 0.0, 1.8, 0.785, 0.04, 0.04])
 PRE_GRASP_Q = np.array([0.0, 0.5, 0.0, -1.6, 0.0, 2.0, 0.785, 0.04, 0.04])
 GRASP_Q = np.array([0.0, 0.7, 0.0, -1.6, 0.0, 2.4, 0.785, 0.04, 0.04])
-GRASP_CLOSED_Q = np.array([0.0, 0.7, 0.0, -1.6, 0.0, 2.4, 0.785, 0.005, 0.005])
-LIFT_Q = np.array([0.0, 0.5, 0.0, -1.6, 0.0, 2.0, 0.785, 0.005, 0.005])
+GRASP_CLOSED_Q = np.array([0.0, 0.7, 0.0, -1.6, 0.0, 2.4, 0.785, 0.01, 0.01])
+LIFT_Q = np.array([0.0, 0.5, 0.0, -1.6, 0.0, 2.0, 0.785, 0.01, 0.01])
 
 
 def interpolate_q(q_start, q_end, t, duration):
@@ -281,22 +281,28 @@ def run():
     )
     viewer.initialize()
 
+    # Set camera close to gripper area for better visibility
+    viewer._cam_target = np.array([hand_x, 0.0, TABLE_HEIGHT + 0.1])
+    viewer._cam_azimuth = 60.0
+    viewer._cam_elevation = 20.0
+    viewer._cam_distance = 1.2
+
     renderer = RobotRenderer(robot, viewer)
     renderer.setup()
 
     # Table visualization (static box)
     from robosim.viz.viewer import geometry_to_trimesh
     from robosim.model.geometry import Geometry as _Geo
-    _table_geo = _Geo.box(0.30, 0.30, TABLE_HEIGHT)
+    _table_geo = _Geo.box(0.35, 0.35, TABLE_HEIGHT)
     tv, tf = geometry_to_trimesh(_table_geo)
     viewer.add_mesh("table", tv + table_pos, tf,
                     color=np.array([0.6, 0.5, 0.4]))
 
-    # Box visualization
+    # Box visualization — bright orange-red for high contrast
     box_body = target_box.links[-1]
     bv, bf = geometry_to_trimesh(box_body.visuals[0].geometry)
     viewer.add_mesh("target_box", bv + box_pos, bf,
-                    color=np.array([0.9, 0.3, 0.2]))
+                    color=np.array([1.0, 0.35, 0.1]))
 
     # ── UI Panel ──
     panel = UIPanel("Grasp Controls")
@@ -304,6 +310,7 @@ def run():
     panel.add_slider("Damping", 50, 1000, 200)
     panel.add_slider("Friction", 0.1, 1.5, 0.6)
     panel.add_checkbox("Show Forces", False)
+    panel.add_checkbox("Track Hand", True)
 
     force_overlay = ContactForceOverlay(
         viewer, scale=0.0003, max_arrows=20,
@@ -443,10 +450,16 @@ def run():
         # Force overlay
         force_overlay.update(contact.last_forces)
 
-        # Status info via UI panel
+        # Camera hand tracking: smoothly follow the hand position
         q_des, phase_name = get_target_q(sim_time)
         fk_now = robot.forward_kinematics()
         hand_now = fk_now[hand_idx].translation
+        if panel.get_bool("Track Hand"):
+            # Smooth interpolation toward hand position
+            alpha = 0.05  # smoothing factor
+            viewer._cam_target += alpha * (hand_now - viewer._cam_target)
+
+        # Status info via UI panel
         finger_q = robot.q[7]
         box_z = target_box.q[2]
         n_contacts = len(contact.last_forces)
