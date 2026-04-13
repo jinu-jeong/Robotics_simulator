@@ -232,7 +232,7 @@ class SimViewer:
                 dx = (curr_mouse[0] - self._prev_mouse[0]) * self.window_size[0]
                 dy = (curr_mouse[1] - self._prev_mouse[1]) * self.window_size[1]
                 # Mouse left-right → azimuth (horizontal orbit)
-                self._cam_azimuth += dx * self._orbit_speed
+                self._cam_azimuth -= dx * self._orbit_speed
                 # Mouse up-down → elevation (vertical orbit)
                 self._cam_elevation -= dy * self._orbit_speed
                 self._cam_elevation = np.clip(self._cam_elevation, -85.0, 89.0)
