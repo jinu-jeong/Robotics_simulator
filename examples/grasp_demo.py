@@ -38,11 +38,13 @@ BOX_SIZE = (0.05, 0.05, 0.05)  # larger box for better visibility
 # Panda: j1(base), j2(shoulder), j3(upper_rot), j4(elbow),
 #        j5(forearm_rot), j6(wrist), j7(wrist_rot), finger_l, finger_r
 
+# Wrist angle j6=1.6 keeps the hand higher so the fingertips (not the
+# finger base) align with the box center.  j2 controls the forward reach.
 HOME_Q = np.array([0.0, -0.3, 0.0, -2.0, 0.0, 1.8, 0.785, 0.04, 0.04])
-PRE_GRASP_Q = np.array([0.0, 0.5, 0.0, -1.6, 0.0, 2.0, 0.785, 0.04, 0.04])
-GRASP_Q = np.array([0.0, 0.7, 0.0, -1.6, 0.0, 2.4, 0.785, 0.04, 0.04])
-GRASP_CLOSED_Q = np.array([0.0, 0.7, 0.0, -1.6, 0.0, 2.4, 0.785, 0.01, 0.01])
-LIFT_Q = np.array([0.0, 0.5, 0.0, -1.6, 0.0, 2.0, 0.785, 0.01, 0.01])
+PRE_GRASP_Q = np.array([0.0, 0.3, 0.0, -1.6, 0.0, 1.6, 0.785, 0.04, 0.04])
+GRASP_Q = np.array([0.0, 0.6, 0.0, -1.6, 0.0, 1.6, 0.785, 0.04, 0.04])
+GRASP_CLOSED_Q = np.array([0.0, 0.6, 0.0, -1.6, 0.0, 1.6, 0.785, 0.01, 0.01])
+LIFT_Q = np.array([0.0, 0.3, 0.0, -1.6, 0.0, 1.6, 0.785, 0.01, 0.01])
 
 
 def interpolate_q(q_start, q_end, t, duration):
@@ -310,7 +312,6 @@ def run():
     panel.add_slider("Damping", 50, 1000, 200)
     panel.add_slider("Friction", 0.1, 1.5, 0.6)
     panel.add_checkbox("Show Forces", False)
-    panel.add_checkbox("Track Hand", True)
 
     force_overlay = ContactForceOverlay(
         viewer, scale=0.0003, max_arrows=20,
@@ -450,16 +451,10 @@ def run():
         # Force overlay
         force_overlay.update(contact.last_forces)
 
-        # Camera hand tracking: smoothly follow the hand position
+        # Status info via UI panel
         q_des, phase_name = get_target_q(sim_time)
         fk_now = robot.forward_kinematics()
         hand_now = fk_now[hand_idx].translation
-        if panel.get_bool("Track Hand"):
-            # Smooth interpolation toward hand position
-            alpha = 0.05  # smoothing factor
-            viewer._cam_target += alpha * (hand_now - viewer._cam_target)
-
-        # Status info via UI panel
         finger_q = robot.q[7]
         box_z = target_box.q[2]
         n_contacts = len(contact.last_forces)
