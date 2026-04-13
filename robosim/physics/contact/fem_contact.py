@@ -180,6 +180,7 @@ class RBDFEMContactPoint:
     penetration: float
     rbd_contact_point: np.ndarray  # (3,) contact point on RBD surface
     fem_body_idx: int = 0
+    gap: float = 0.0        # 0 = true overlap; >0 = proximity distance
 
 
 def detect_rbd_fem(
@@ -248,8 +249,13 @@ def detect_rbd_fem(
             if not (np.all(p >= geom_min) and np.all(p <= geom_max)):
                 continue
 
-            cp = _point_vs_geometry(p, geom, center, R)
+            cp = _point_vs_geometry(p, geom, center, R, d_hat=d_hat)
             if cp is not None and cp.penetration > 0:
+                # Determine gap: 0 for actual overlap, >0 for proximity
+                # _point_vs_geometry sets pen=d_hat-gap for outside points
+                # and pen=face_depth for inside points (which can be > d_hat).
+                # When pen <= d_hat the node is outside (proximity).
+                gap = max(0.0, d_hat - cp.penetration)
                 contacts.append(RBDFEMContactPoint(
                     fem_node_idx=int(node_idx),
                     link_idx=link_idx,
@@ -257,98 +263,138 @@ def detect_rbd_fem(
                     penetration=cp.penetration,
                     rbd_contact_point=cp.point_b.copy(),
                     fem_body_idx=fem_collider.body_idx,
+                    gap=gap,
                 ))
 
     return contacts
 
 
-def _point_vs_geometry(point, geom, center, R) -> ContactPoint | None:
+def _point_vs_geometry(point, geom, center, R, d_hat: float = 0.0) -> ContactPoint | None:
     """Test a point against a primitive geometry (sphere, box, cylinder).
 
-    Returns ContactPoint if point is inside or within contact margin.
-    Normal points from geometry surface toward the point.
+    Returns ContactPoint if point is inside the geometry, **or** within
+    *d_hat* of its surface (proximity detection).
+
+    When *d_hat* == 0, only penetration (point-inside) contacts are
+    reported — backward-compatible with the original behaviour.
+
+    Normal always points from the geometry surface toward the point.
+    Penetration is positive both for true overlaps and for proximity
+    contacts (for proximity: ``penetration = d_hat - gap``).
     """
     from robosim.model.geometry import GeometryType
 
     if geom.geometry_type == GeometryType.SPHERE:
         diff = point - center
         dist = np.linalg.norm(diff)
-        pen = geom.radius - dist
-        if pen <= 0:
+        gap = dist - geom.radius          # >0 outside, <0 inside
+
+        if gap > d_hat:
             return None
+
         if dist < 1e-12:
             n = np.array([0.0, 0.0, 1.0])
         else:
             n = diff / dist
+
         surface_pt = center + geom.radius * n
+        pen = -gap if gap <= 0 else d_hat - gap
         return ContactPoint(
             point_a=point.copy(), point_b=surface_pt,
             normal=n, penetration=pen,
         )
 
     elif geom.geometry_type == GeometryType.BOX:
-        # Transform point to local frame
         p_local = R.T @ (point - center)
         he = geom.size / 2.0
 
-        # Check if inside box
         inside = np.all(np.abs(p_local) <= he)
-        if not inside:
-            return None
 
-        # Find closest face and penetration
-        dists = he - np.abs(p_local)  # distance to each face
-        axis = np.argmin(dists)
-        pen = dists[axis]
-        n_local = np.zeros(3)
-        n_local[axis] = np.sign(p_local[axis])
+        if inside:
+            # Point inside box — standard penetration
+            face_dists = he - np.abs(p_local)
+            axis = int(np.argmin(face_dists))
+            pen = face_dists[axis]
+            n_local = np.zeros(3)
+            n_local[axis] = np.sign(p_local[axis]) if abs(p_local[axis]) > 1e-12 else 1.0
+            surface_local = p_local.copy()
+            surface_local[axis] = np.sign(p_local[axis]) * he[axis]
+        else:
+            # Point outside — compute closest point on box surface
+            clamped = np.clip(p_local, -he, he)
+            diff = p_local - clamped
+            gap = np.linalg.norm(diff)
+
+            if gap > d_hat:
+                return None
+
+            pen = d_hat - gap
+            if gap < 1e-12:
+                # Degenerate (on a face/edge/corner): pick closest face
+                face_dists = he - np.abs(p_local)
+                axis = int(np.argmin(np.abs(face_dists)))
+                n_local = np.zeros(3)
+                n_local[axis] = np.sign(p_local[axis]) if abs(p_local[axis]) > 1e-12 else 1.0
+            else:
+                n_local = diff / gap
+            surface_local = clamped
 
         n_world = R @ n_local
-        surface_local = p_local.copy()
-        surface_local[axis] = np.sign(p_local[axis]) * he[axis]
         surface_pt = R @ surface_local + center
-
         return ContactPoint(
             point_a=point.copy(), point_b=surface_pt,
             normal=n_world, penetration=pen,
         )
 
     elif geom.geometry_type == GeometryType.CYLINDER:
-        # Cylinder along Z in local frame
         p_local = R.T @ (point - center)
         hl = geom.length / 2.0
         r = geom.radius
-
-        # Radial distance in XY plane
         r_xy = np.sqrt(p_local[0]**2 + p_local[1]**2)
 
-        # Check if inside cylinder
         inside_radial = r_xy <= r
         inside_axial = abs(p_local[2]) <= hl
-        if not (inside_radial and inside_axial):
-            return None
 
-        # Closest surface: radial or cap
-        pen_radial = r - r_xy
-        pen_axial = hl - abs(p_local[2])
+        if inside_radial and inside_axial:
+            # Inside cylinder — standard penetration
+            pen_radial = r - r_xy
+            pen_axial = hl - abs(p_local[2])
 
-        if pen_radial < pen_axial:
-            # Push radially
+            if pen_radial < pen_axial:
+                if r_xy < 1e-12:
+                    n_local = np.array([1.0, 0.0, 0.0])
+                else:
+                    n_local = np.array([p_local[0], p_local[1], 0.0]) / r_xy
+                pen = pen_radial
+                surface_local = np.array([r * n_local[0], r * n_local[1], p_local[2]])
+            else:
+                n_local = np.array([0.0, 0.0, np.sign(p_local[2])])
+                pen = pen_axial
+                surface_local = np.array([p_local[0], p_local[1], np.sign(p_local[2]) * hl])
+        else:
+            # Outside cylinder — closest point on surface
+            clamped_z = np.clip(p_local[2], -hl, hl)
             if r_xy < 1e-12:
+                clamped_xy = np.array([0.0, 0.0])
+            else:
+                clamped_xy = np.array([p_local[0], p_local[1]]) * min(r / r_xy, 1.0)
+
+            closest_local = np.array([clamped_xy[0], clamped_xy[1], clamped_z])
+            diff = p_local - closest_local
+            gap = np.linalg.norm(diff)
+
+            if gap > d_hat:
+                return None
+
+            pen = d_hat - gap
+            if gap < 1e-12:
                 n_local = np.array([1.0, 0.0, 0.0])
             else:
-                n_local = np.array([p_local[0], p_local[1], 0.0]) / r_xy
-            pen = pen_radial
-            surface_local = np.array([r * n_local[0], r * n_local[1], p_local[2]])
-        else:
-            # Push axially
-            n_local = np.array([0.0, 0.0, np.sign(p_local[2])])
-            pen = pen_axial
-            surface_local = np.array([p_local[0], p_local[1], np.sign(p_local[2]) * hl])
+                n_local = diff / gap
+            surface_local = closest_local
 
         n_world = R @ n_local
         surface_pt = R @ surface_local + center
-
         return ContactPoint(
             point_a=point.copy(), point_b=surface_pt,
             normal=n_world, penetration=pen,
@@ -466,6 +512,13 @@ def resolve_rbd_fem_contacts(
     The RBD is treated as infinite mass (already stepped). The FEM node
     absorbs the full correction.
 
+    For **true penetrations** (gap == 0): full position correction +
+    velocity impulse + Coulomb friction.
+    For **proximity contacts** (gap > 0): drag-based friction that
+    matches the node's tangential velocity to the RBD surface.
+    Closer proximity → stronger coupling.  This enables grasping
+    and lifting of FEM bodies by RBD grippers.
+
     Parameters
     ----------
     contacts : detected RBD-FEM contacts
@@ -488,31 +541,44 @@ def resolve_rbd_fem_contacts(
         if c.penetration <= 0:
             continue
 
-        # --- Position correction: push FEM node out ---
-        body.x[node_idx] += c.penetration * normal
-
-        # --- Velocity: reflect relative to RBD surface velocity ---
         v_fem = body.v[node_idx]
-        v_rbd = _link_point_velocity(robot, c.link_idx, c.rbd_contact_point)
-
+        v_rbd = _link_point_velocity(robot, c.link_idx, c.rbd_contact_point,
+                                      fk=fk)
         v_rel = v_fem - v_rbd
         v_n = float(np.dot(v_rel, normal))
 
-        if v_n >= 0:
-            n_resolved += 1
-            continue
+        if c.gap <= 0:
+            # ── True penetration: standard impulse response ──
+            body.x[node_idx] += c.penetration * normal
 
-        # Normal impulse: reflect
-        dv_n = -(1.0 + restitution) * v_n
-        body.v[node_idx] += dv_n * normal
+            if v_n >= 0:
+                n_resolved += 1
+                continue
 
-        # Coulomb friction
-        v_t = v_rel - v_n * normal
-        v_t_mag = np.linalg.norm(v_t)
-        if v_t_mag > 1e-10:
-            max_dv_t = friction_mu * (1.0 + restitution) * abs(v_n)
-            scale = min(1.0, max_dv_t / v_t_mag)
-            body.v[node_idx] -= scale * v_t
+            # Normal impulse: reflect
+            dv_n = -(1.0 + restitution) * v_n
+            body.v[node_idx] += dv_n * normal
+
+            # Coulomb friction
+            v_t = v_rel - v_n * normal
+            v_t_mag = np.linalg.norm(v_t)
+            if v_t_mag > 1e-10:
+                max_dv_t = friction_mu * (1.0 + restitution) * abs(v_n)
+                scale = min(1.0, max_dv_t / v_t_mag)
+                body.v[node_idx] -= scale * v_t
+        else:
+            # ── Proximity contact: kinematic coupling ──
+            # Strength ramps from 0 at d_hat distance to 1 at surface.
+            alpha = c.penetration / (c.penetration + c.gap)
+
+            # Prevent approach (normal direction)
+            if v_n < 0:
+                body.v[node_idx] -= v_n * normal
+
+            # Kinematic coupling: directly blend node velocity toward
+            # the RBD surface velocity.  This acts as a "grab"
+            # constraint that enables grasping and lifting.
+            body.v[node_idx] = (1.0 - alpha) * body.v[node_idx] + alpha * v_rbd
 
         n_resolved += 1
 

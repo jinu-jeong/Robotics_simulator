@@ -527,6 +527,100 @@ class ContactSolver:
     # RBD-FEM contact
     # ------------------------------------------------------------------
 
+    def compute_rbd_fem_forces(
+        self,
+        rbd_solver,
+        fem_solver,
+        d_hat: float = 0.005,
+        stiffness: float = 1e4,
+        friction_mu: float = 0.5,
+        damping_ratio: float = 0.5,
+    ) -> dict[int, np.ndarray]:
+        """Compute penalty-based contact forces from RBD onto FEM bodies.
+
+        Returns forces suitable for passing as ``extra_forces`` to
+        :meth:`FEMSolver.step`.  Call **before** the FEM step so the
+        implicit integrator incorporates the contact.
+
+        For each FEM surface node within *d_hat* of an RBD collision
+        geometry, a spring-damper penalty force (normal) and a friction
+        drag force (tangential) are computed.
+
+        Parameters
+        ----------
+        stiffness : penalty spring stiffness (N/m)
+        friction_mu : Coulomb friction coefficient (tangential drag)
+        damping_ratio : fraction of critical damping for penalty
+
+        Returns ``{body_idx: (n_dof,) force_array}``.
+        """
+        if not self._fem_colliders:
+            return {}
+
+        robot = rbd_solver.robot
+        fk = robot.forward_kinematics()
+        bodies = fem_solver.bodies
+
+        # Update FEM AABBs
+        for collider in self._fem_colliders:
+            collider.update_aabb(bodies[collider.body_idx].x)
+
+        result: dict[int, np.ndarray] = {}
+
+        for collider in self._fem_colliders:
+            contacts = detect_rbd_fem(
+                robot, fk, collider,
+                bodies[collider.body_idx].x, d_hat,
+            )
+            if not contacts:
+                continue
+
+            body = bodies[collider.body_idx]
+            n_dof = body.mesh.n_nodes * 3
+            f = result.get(collider.body_idx)
+            if f is None:
+                f = np.zeros(n_dof)
+                result[collider.body_idx] = f
+
+            M_diag = body._M.diagonal()
+
+            for c in contacts:
+                node = c.fem_node_idx
+                normal = c.normal
+
+                node_mass = float(M_diag[node * 3])
+                if node_mass < 1e-12:
+                    continue
+
+                # ── Normal penalty force ──
+                pen = c.penetration           # d_hat-gap for proximity
+                c_damp = damping_ratio * 2.0 * np.sqrt(stiffness * node_mass)
+
+                v_fem = body.v[node]
+                v_rbd = _link_point_velocity(
+                    robot, c.link_idx, c.rbd_contact_point, fk=fk)
+                v_rel = v_fem - v_rbd
+                v_n = float(np.dot(v_rel, normal))
+
+                f_n_mag = stiffness * pen - c_damp * v_n
+                if f_n_mag < 0:
+                    f_n_mag = 0.0
+
+                f_node = f_n_mag * normal
+
+                # ── Tangential friction (drag toward RBD velocity) ──
+                v_t = v_rel - v_n * normal
+                v_t_mag = np.linalg.norm(v_t)
+                if v_t_mag > 1e-10:
+                    f_t_max = friction_mu * f_n_mag
+                    f_t_drag = c_damp * v_t_mag  # viscous drag
+                    f_t_mag = min(f_t_max, f_t_drag)
+                    f_node -= f_t_mag * (v_t / v_t_mag)
+
+                f[node * 3: node * 3 + 3] += f_node
+
+        return result
+
     def resolve_rbd_fem_all(
         self,
         rbd_solver,
