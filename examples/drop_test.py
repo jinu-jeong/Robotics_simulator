@@ -1,13 +1,16 @@
-"""낙하 충돌 테스트 — 다중 박스 / 솔버 FPS 비교.
+"""낙하 충돌 테스트 — 다중 박스 / Stanford Bunny / 솔버 FPS 비교.
 
-rbd / fem / cb 모드에서 N개 박스를 공중에서 낙하시켜 FPS를 비교합니다.
---num-boxes > 1 이면 각 박스의 tilt 각도는 랜덤.  단일 박스일 때만 --tilt 사용 가능.
+rbd / fem / cb 모드에서 N개 오브젝트를 공중에서 낙하시켜 FPS를 비교합니다.
+--shape bunny 옵션으로 Stanford Bunny를 낙하시킬 수 있습니다 (RBD/FEM/CB 모두 지원).
 
 실행:
   python examples/drop_test.py                              # RBD 박스 1개
   python examples/drop_test.py --num-boxes 4                # RBD 박스 4개
+  python examples/drop_test.py --shape bunny                # RBD Bunny 1마리
+  python examples/drop_test.py --shape bunny --num-boxes 3  # RBD Bunny 3마리
+  python examples/drop_test.py --shape bunny --mode fem     # FEM Bunny
+  python examples/drop_test.py --shape bunny --mode cb      # C-B Bunny
   python examples/drop_test.py --mode fem --num-boxes 4     # FEM 박스 4개
-  python examples/drop_test.py --mode cb  --num-boxes 4     # C-B 박스 4개
   python examples/drop_test.py --mode fem --tilt 30         # FEM 단일 박스 30° 기울임
 
 조작: 좌클릭 드래그(카메라 회전), 스크롤(줌), ESC(종료)
@@ -296,6 +299,208 @@ def _resolve_rbd_pair(
 
 
 # ─────────────────────────────────────────────
+# Mesh ground contact (RBD 강체 메시용)
+# ─────────────────────────────────────────────
+
+def _resolve_mesh_ground(
+    robot,
+    mesh_verts_local: np.ndarray,
+    restitution: float = 0.15,
+    friction_mu: float = 0.4,
+) -> None:
+    """Impulse-based ground contact for a rigid body with arbitrary mesh geometry.
+
+    Identical physics to _resolve_box_ground but iterates over the mesh's
+    world-space vertices instead of 8 box corners.
+
+    Parameters
+    ----------
+    robot            : free-floating Robot created by create_free_mesh_body
+    mesh_verts_local : (N, 3) mesh vertices in body-local frame (CoM at origin)
+    """
+    fk = robot.forward_kinematics()
+    T  = fk[-1]
+    R  = T.rotation
+    p0 = T.translation
+
+    # Transform to world frame
+    world_verts = (R @ mesh_verts_local.T).T + p0  # (N, 3)
+
+    pens = np.maximum(0.0, -world_verts[:, 2])
+    max_pen = float(pens.max())
+    if max_pen < 1e-12:
+        return
+
+    # ── 1. Position projection ──
+    robot.q[2] += max_pen
+    p0 = p0.copy(); p0[2] += max_pen
+    world_verts[:, 2] += max_pen
+
+    # ── 2. Velocity impulse per penetrating vertex ──
+    link   = robot.links[-1]
+    m      = float(link.inertial.mass)
+    if m < 1e-12:
+        return
+    I_body  = link.inertial.inertia
+    I_world = R @ I_body @ R.T
+    I_inv   = np.linalg.inv(I_world)
+
+    v_com = robot.qd[0:3].copy()
+    J_w   = _angular_velocity_jacobian(float(robot.q[3]), float(robot.q[4]))
+    omega = J_w @ robot.qd[3:6]
+
+    n_vec = np.array([0.0, 0.0, 1.0])
+
+    for vi in np.where(pens > 1e-4)[0]:
+        r   = world_verts[vi] - p0
+        v_c = v_com + np.cross(omega, r)
+        v_n = float(np.dot(v_c, n_vec))
+        if v_n >= 0.0:
+            continue
+
+        rxn   = np.cross(r, n_vec)
+        denom = 1.0 / m + float(rxn @ I_inv @ rxn)
+        j_n   = -(1.0 + restitution) * v_n / denom
+
+        v_com += j_n * n_vec / m
+        omega += I_inv @ (j_n * rxn)
+
+        v_c2    = v_com + np.cross(omega, r)
+        v_t_vec = v_c2 - float(np.dot(v_c2, n_vec)) * n_vec
+        v_t_mag = float(np.linalg.norm(v_t_vec))
+        if v_t_mag > 1e-6:
+            t_hat   = v_t_vec / v_t_mag
+            rxt     = np.cross(r, t_hat)
+            denom_t = 1.0 / m + float(rxt @ I_inv @ rxt)
+            j_t     = min(v_t_mag / denom_t, friction_mu * abs(j_n))
+            v_com  -= j_t * t_hat / m
+            omega  -= I_inv @ (j_t * rxt)
+
+    # ── 3. Write back ──
+    robot.qd[0:3] = v_com
+    try:
+        robot.qd[3:6] = np.linalg.solve(J_w, omega)
+    except np.linalg.LinAlgError:
+        robot.qd[3:6] = omega
+
+
+# ─────────────────────────────────────────────
+# Stanford Bunny 메시 로드 + FEM tet 메시 생성
+# ─────────────────────────────────────────────
+
+_BUNNY_ASSET = Path(__file__).parent / "assets" / "bunny.obj"
+
+# Cached results (built once per process)
+_bunny_surface_cache: tuple[np.ndarray, np.ndarray] | None = None
+_bunny_tet_cache: tuple[np.ndarray, np.ndarray] | None = None   # (nodes, elements)
+
+
+def _load_bunny(size: float = 0.18) -> tuple[np.ndarray, np.ndarray]:
+    """Load and normalise the Stanford Bunny surface mesh.
+
+    Returns (vertices, faces) centred at the origin and scaled so the longest
+    bounding-box dimension equals *size* metres.
+    """
+    global _bunny_surface_cache
+    if _bunny_surface_cache is not None:
+        return _bunny_surface_cache
+
+    import trimesh
+    mesh = trimesh.load(str(_BUNNY_ASSET), force="mesh")
+    bounds = mesh.bounds
+    center = (bounds[0] + bounds[1]) * 0.5
+    scale  = size / float(np.max(bounds[1] - bounds[0]))
+    verts  = (np.asarray(mesh.vertices, dtype=np.float64) - center) * scale
+    faces  = np.asarray(mesh.faces, dtype=np.int32)
+
+    # Bunny faces down (-Y) in the original OBJ; rotate 90° about X so it
+    # faces upright (+Z is up).
+    R_up = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64)
+    verts = (R_up @ verts.T).T
+
+    _bunny_surface_cache = (verts, faces)
+    return verts, faces
+
+
+def _build_tet_mesh_from_surface(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    resolution: int = 12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a volumetric tet mesh from a closed or nearly-closed surface mesh.
+
+    Algorithm
+    ---------
+    1. Create a regular grid of interior candidate points (``resolution³``).
+    2. Test each candidate using the nearest-face-normal sign
+       (fast but approximate — good enough for the bunny's quasi-convex body).
+    3. Combine surviving interior points with a downsampled set of surface
+       vertices.
+    4. Run ``scipy.spatial.Delaunay`` 3-D tetrahedralisation.
+    5. Keep only tets whose centroid passes the same inside-test.
+
+    Returns
+    -------
+    (nodes, elements) where nodes is (N, 3) float64 and elements is (M, 4) int64.
+    """
+    global _bunny_tet_cache
+    if _bunny_tet_cache is not None:
+        return _bunny_tet_cache
+
+    from scipy.spatial import Delaunay, cKDTree
+    from robosim.physics.fem.mesh import TetMesh
+
+    # Precompute face centroids and outward normals for the inside-test
+    fv = verts[faces]                                  # (F, 3, 3)
+    face_cen = fv.mean(axis=1)                         # (F, 3)
+    e1 = fv[:, 1] - fv[:, 0]
+    e2 = fv[:, 2] - fv[:, 0]
+    face_norm = np.cross(e1, e2)
+    face_norm /= np.linalg.norm(face_norm, axis=1, keepdims=True) + 1e-12
+
+    tree = cKDTree(face_cen)
+
+    def _is_inside(pts: np.ndarray) -> np.ndarray:
+        """Return boolean array: True if each pt is inside the surface."""
+        _, idx = tree.query(pts)
+        vecs = pts - face_cen[idx]
+        dots = np.einsum("ij,ij->i", vecs, face_norm[idx])
+        return dots < 0.0
+
+    # ── Step 1: sample interior grid ──
+    lo, hi = verts.min(axis=0), verts.max(axis=0)
+    xs = np.linspace(lo[0], hi[0], resolution)
+    ys = np.linspace(lo[1], hi[1], resolution)
+    zs = np.linspace(lo[2], hi[2], resolution)
+    gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
+    grid_pts = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
+    interior = grid_pts[_is_inside(grid_pts)]
+
+    # ── Step 2: downsample surface vertices ──
+    stride = max(1, len(verts) // 400)
+    surf_sample = verts[::stride]
+
+    all_pts = np.vstack([surf_sample, interior])
+
+    # ── Step 3: 3-D Delaunay + filter ──
+    print(f"  Bunny tet-mesh: {len(all_pts)} pts → Delaunay … ", end="", flush=True)
+    tri3d    = Delaunay(all_pts)
+    tets_raw = tri3d.simplices                          # (T, 4)
+    centroids = all_pts[tets_raw].mean(axis=1)          # (T, 3)
+    keep      = _is_inside(centroids)
+    tets_in   = tets_raw[keep]
+    print(f"{keep.sum()} / {len(tets_raw)} tets kept")
+
+    # Re-index to remove unused nodes
+    used, inv = np.unique(tets_in.ravel(), return_inverse=True)
+    nodes    = all_pts[used].astype(np.float64)
+    elements = inv.reshape(tets_in.shape).astype(np.int64)
+
+    _bunny_tet_cache = (nodes, elements)
+    return nodes, elements
+
+
+# ─────────────────────────────────────────────
 # von Mises stress → 색상 (FEM/CB 공용)
 # ─────────────────────────────────────────────
 def _stress_color(vm: np.ndarray, vmax: float) -> np.ndarray:
@@ -559,20 +764,313 @@ def run_deformable_drop(mode: str, num_boxes: int,
 
 
 # ═══════════════════════════════════════════════════════
+# RBD Stanford Bunny
+# ═══════════════════════════════════════════════════════
+
+def run_rbd_bunny_drop(num_bunnies: int, tilt_deg: float, seed: int) -> None:
+    """Drop N Stanford Bunnies as rigid bodies."""
+    from robosim.model.factory import create_free_mesh_body
+    from robosim.physics.rbd.solver import RBDSolver
+    from robosim.viz.viewer import SimViewer
+    from scipy.spatial.transform import Rotation
+
+    rng = np.random.default_rng(seed)
+
+    print("Loading Stanford Bunny … ", end="", flush=True)
+    verts, faces = _load_bunny(size=0.18)
+    print(f"{len(verts)} vertices, {len(faces)} faces")
+
+    # Compute inertia tensor from surface mesh (uniform solid approximation)
+    # Use volume-weighted tetrahedral decomposition w.r.t. the centroid
+    com = verts.mean(axis=0)
+    v0  = verts[faces[:, 0]] - com
+    v1  = verts[faces[:, 1]] - com
+    v2  = verts[faces[:, 2]] - com
+    signed_vol = np.einsum("ij,ij->i", v0, np.cross(v1, v2)) / 6.0
+    total_vol  = float(signed_vol.sum())
+    density    = MASS / max(abs(total_vol), 1e-10)
+
+    Ixx = Iyy = Izz = 0.0
+    for k in range(len(faces)):
+        a, b, c = v0[k], v1[k], v2[k]
+        sv = signed_vol[k]
+        pts = np.array([a, b, c, np.zeros(3)])  # tetra with apex at CoM
+        Ixx += sv * (np.sum(pts[:, 1]**2 + pts[:, 2]**2)) / 10.0
+        Iyy += sv * (np.sum(pts[:, 0]**2 + pts[:, 2]**2)) / 10.0
+        Izz += sv * (np.sum(pts[:, 0]**2 + pts[:, 1]**2)) / 10.0
+    inertia = density * np.diag([abs(Ixx), abs(Iyy), abs(Izz)])
+
+    # Spacing based on bunny bounding box
+    bsize = float(np.max(verts.max(axis=0) - verts.min(axis=0)))
+    spacing = bsize * 1.5
+
+    # Bunny instance positions
+    n_side = max(1, int(np.ceil(np.sqrt(num_bunnies))))
+    positions = []
+    for i in range(num_bunnies):
+        row = i // n_side; col = i % n_side
+        x = (col - (n_side - 1) / 2.0) * spacing
+        y = (row - (n_side - 1) / 2.0) * spacing
+        positions.append(np.array([x, y, DROP_H]))
+
+    robots, solvers = [], []
+    for i in range(num_bunnies):
+        col = np.append(_color(i), 1.0)
+        robot = create_free_mesh_body(
+            name=f"bunny_{i}", vertices=verts, faces=faces,
+            mass=MASS, inertia=inertia, position=positions[i], color=col,
+        )
+        if num_bunnies == 1 and tilt_deg != 0.0:
+            ea = np.deg2rad([0.0, tilt_deg, 0.0])
+        else:
+            ea = np.deg2rad(rng.uniform(-30, 30, size=3))
+        robot.q[3:6] = ea
+        robot.qd = np.zeros(robot.n_dof)
+
+        solvers.append(RBDSolver(robot=robot))
+        solvers[-1].initialize(dt=DT)
+        robots.append(robot)
+
+    title = (f"RoboSim — Drop Test [RBD-Bunny]  "
+             f"{num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'}")
+    viewer = SimViewer(title=title, window_size=(1280, 800))
+    viewer.initialize()
+
+    # Ground
+    gv = np.array([[-2,-2,0],[2,-2,0],[2,2,0],[-2,2,0]], dtype=np.float32)
+    gf = np.array([[0,1,2],[0,2,3]], dtype=np.int32)
+    viewer.add_mesh("ground", gv, gf, color=np.array([0.45, 0.45, 0.45]))
+
+    # Register bunny meshes
+    for i, robot in enumerate(robots):
+        fk  = robot.forward_kinematics()
+        mat = fk[-1].to_matrix()
+        R_i, t_i = mat[:3, :3], mat[:3, 3]
+        w_verts = (R_i @ verts.T).T + t_i
+        viewer.add_mesh(f"bunny_{i}", w_verts.astype(np.float32), faces,
+                        color=_color(i))
+
+    frame_times: list[float] = []
+    sim_time = [0.0]
+
+    def step_callback(_step):
+        t0 = time.perf_counter()
+
+        for _ in range(SUBSTEPS):
+            for sol in solvers:
+                sol.step()
+            for robot in robots:
+                _resolve_mesh_ground(robot, verts,
+                                     restitution=0.20, friction_mu=0.4)
+            sim_time[0] += DT
+
+        phys_ms = (time.perf_counter() - t0) * 1000
+
+        for i, robot in enumerate(robots):
+            fk  = robot.forward_kinematics()
+            mat = fk[-1].to_matrix()
+            R_i, t_i = mat[:3, :3], mat[:3, 3]
+            viewer.update_mesh_vertices(
+                f"bunny_{i}", ((R_i @ verts.T).T + t_i).astype(np.float32))
+
+        frame_ms = (time.perf_counter() - t0) * 1000
+        frame_times.append(frame_ms)
+        fps = 1000 / np.mean(frame_times[-30:]) if frame_times else 0
+
+        zs = [r.q[2] for r in robots]
+        info = (
+            f"[RBD-Bunny]  {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'}\n"
+            f"t = {sim_time[0]:.3f}s\n"
+            f"FPS: {fps:.1f}  phys: {phys_ms:.1f}ms\n"
+            f"Z min: {min(zs):.4f}m"
+        )
+        viewer.add_text(info)
+
+    viewer.add_callback(step_callback)
+    print(f"RBD-Bunny drop — {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'} — ESC to quit")
+    viewer.show()
+
+    avg_fps = 1000 / np.mean(frame_times) if frame_times else 0
+    print(f"\n[RBD-Bunny] {num_bunnies}  Avg FPS: {avg_fps:.1f}  "
+          f"({np.mean(frame_times):.1f} ms/frame)")
+
+
+# ═══════════════════════════════════════════════════════
+# FEM / C-B Stanford Bunny
+# ═══════════════════════════════════════════════════════
+
+def run_fem_bunny_drop(mode: str, num_bunnies: int,
+                       tilt_deg: float, seed: int) -> None:
+    """Drop N Stanford Bunnies as deformable FEM/CB bodies."""
+    from robosim.physics.fem.mesh import TetMesh
+    from robosim.physics.fem.materials import CorotationalElastic
+    from robosim.physics.fem.assembly import batch_von_mises
+    from robosim.physics.contact.detection import GroundPlane
+    from robosim.physics.contact.solver import ContactSolver
+    from robosim.viz.viewer import SimViewer
+    from scipy.spatial.transform import Rotation
+
+    use_cb = (mode == "cb")
+    if use_cb:
+        from robosim.physics.fem.reduced import CraigBamptonBody, CraigBamptonSolver
+    else:
+        from robosim.physics.fem.solver import DeformableBody, FEMSolver
+
+    rng = np.random.default_rng(seed)
+
+    print("Loading Stanford Bunny surface … ", end="", flush=True)
+    surf_verts, surf_faces = _load_bunny(size=0.18)
+    print(f"{len(surf_verts)} verts, {len(surf_faces)} faces")
+
+    # Build volumetric tet mesh (cached after first call)
+    nodes_ref, elements = _build_tet_mesh_from_surface(surf_verts, surf_faces, resolution=12)
+
+    bsize   = float(np.max(surf_verts.max(axis=0) - surf_verts.min(axis=0)))
+    spacing = bsize * 1.5
+    n_side  = max(1, int(np.ceil(np.sqrt(num_bunnies))))
+
+    mat = CorotationalElastic(young=5e5, poisson=0.3)
+
+    bodies: list   = []
+    disp_tris: list = []   # (body_idx, surface_faces_mapped_to_tet_nodes)
+
+    for i in range(num_bunnies):
+        row = i // n_side; col = i % n_side
+        pos = np.array([
+            (col - (n_side - 1) / 2.0) * spacing,
+            (row - (n_side - 1) / 2.0) * spacing,
+            DROP_H,
+        ])
+
+        # Place nodes at drop position (translate by pos)
+        nodes_i = nodes_ref.copy() + pos
+
+        # Random tilt
+        if num_bunnies == 1 and tilt_deg != 0.0:
+            ea = [0.0, tilt_deg, 0.0]
+        else:
+            ea = rng.uniform(-30, 30, size=3).tolist()
+        R_tilt = Rotation.from_euler("xyz", ea, degrees=True).as_matrix()
+        com_i  = nodes_i.mean(axis=0)
+        nodes_i = (R_tilt @ (nodes_i - com_i).T).T + com_i
+
+        mesh_i = TetMesh(nodes=nodes_i, elements=elements.copy())
+
+        if use_cb:
+            body = CraigBamptonBody(
+                mesh=mesh_i, material=mat, density=1000.0,
+                n_modes=6, gravity=np.array([0., 0., -9.81]),
+                damping=0.02, name=f"cb_bunny_{i}",
+            )
+        else:
+            body = DeformableBody(
+                name=f"fem_bunny_{i}", mesh=mesh_i,
+                material=mat, density=1000.0,
+            )
+
+        bodies.append(body)
+        disp_tris.append(mesh_i.extract_surface())
+
+        if use_cb and i < num_bunnies - 1:
+            print()
+
+    # ── Solver ──
+    if use_cb:
+        solver = CraigBamptonSolver(bodies=bodies)
+    else:
+        solver = FEMSolver(
+            bodies=bodies,
+            gravity=np.array([0., 0., -9.81]),
+            damping=0.02,
+        )
+    solver.initialize(dt=DT)
+
+    contact = ContactSolver(ground=GroundPlane(height=0.0))
+    contact.register_fem(solver)
+
+    mode_str = "C-B Bunny" if use_cb else "FEM Bunny"
+    title = (f"RoboSim — Drop Test [{mode_str}]  "
+             f"{num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'}")
+    viewer = SimViewer(title=title, window_size=(1280, 800))
+    viewer.initialize()
+
+    # Ground
+    gv = np.array([[-2,-2,0],[2,-2,0],[2,2,0],[-2,2,0]], dtype=np.float32)
+    gf = np.array([[0,1,2],[0,2,3]], dtype=np.int32)
+    viewer.add_mesh("ground", gv, gf, color=np.array([0.45, 0.45, 0.45]))
+
+    for i, (body, stri) in enumerate(zip(bodies, disp_tris)):
+        viewer.add_mesh(f"bunny_{i}", body.x.copy(), stri, color=_color(i))
+
+    frame_times: list[float] = []
+
+    def step_callback(_step):
+        t0 = time.perf_counter()
+
+        for _ in range(SUBSTEPS):
+            solver.step()
+            for body in bodies:
+                contact.resolve_fem_contact(body, restitution=0.25, friction_mu=0.5)
+            if num_bunnies > 1:
+                contact.resolve_fem_fem_all(solver,
+                                            restitution=0.1, friction_mu=0.5,
+                                            d_hat=0.005)
+
+        phys_ms = (time.perf_counter() - t0) * 1000
+
+        vm_max_all = 1.0
+        for i, (body, stri) in enumerate(zip(bodies, disp_tris)):
+            viewer.update_mesh_vertices(f"bunny_{i}", body.x.copy())
+            vm = batch_von_mises(body.mesh, body.x, body.material,
+                                 body._dN_list, body._volumes)
+            vm_max = max(float(vm.max()), 1.0)
+            vm_max_all = max(vm_max_all, vm_max)
+            viewer.update_mesh_color(f"bunny_{i}", _stress_color(vm, vm_max))
+
+        frame_ms = (time.perf_counter() - t0) * 1000
+        frame_times.append(frame_ms)
+        fps = 1000 / np.mean(frame_times[-30:]) if frame_times else 0
+
+        z_mins  = [body.x[:, 2].min() for body in bodies]
+        extra = ""
+        if use_cb:
+            b0 = bodies[0]
+            extra = f"\nn_r={b0._n_r} ({b0._n_b}b+{b0._n_modes_actual}m)"
+        info = (
+            f"[{mode_str}]  {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'}\n"
+            f"t = {solver.time:.3f}s\n"
+            f"FPS: {fps:.1f}  phys: {phys_ms:.1f}ms\n"
+            f"Z min: {min(z_mins):.4f}m  stress: {vm_max_all:.0f}Pa"
+            + extra
+        )
+        viewer.add_text(info)
+
+    viewer.add_callback(step_callback)
+    print(f"{mode_str} drop — {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'} — ESC to quit")
+    viewer.show()
+
+    avg_fps = 1000 / np.mean(frame_times) if frame_times else 0
+    print(f"\n[{mode_str}] {num_bunnies}  Avg FPS: {avg_fps:.1f}  "
+          f"({np.mean(frame_times):.1f} ms/frame)")
+
+
+# ═══════════════════════════════════════════════════════
 # main
 # ═══════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(
-        description="다중 박스 낙하 테스트 — rbd/fem/cb FPS 비교")
+        description="낙하 테스트 — rbd/fem/cb FPS 비교  (box or Stanford Bunny)")
     parser.add_argument("--mode", choices=["rbd", "fem", "cb"], default="rbd",
                         help="솔버 모드 (기본: rbd)")
+    parser.add_argument("--shape", choices=["box", "bunny"], default="box",
+                        help="낙하 오브젝트 형태 — box (기본) 또는 bunny (Stanford Bunny)")
     parser.add_argument("--num-boxes", "-n", type=int, default=1,
                         metavar="N",
-                        help="낙하 박스 수 (기본: 1).  N>1 이면 tilt 랜덤.")
+                        help="낙하 오브젝트 수 (기본: 1).  N>1 이면 tilt 랜덤.")
     parser.add_argument("--tilt", type=float, default=0.0,
                         metavar="DEG",
-                        help="단일 박스 Y축 기울기 (degrees).  --num-boxes>1 이면 무시됨.")
+                        help="단일 오브젝트 Y축 기울기 (degrees).  --num-boxes>1 이면 무시됨.")
     parser.add_argument("--seed", type=int, default=42,
                         help="랜덤 시드 (기본: 42)")
     args = parser.parse_args()
@@ -585,17 +1083,24 @@ def main():
 
     ti.init(arch=ti.metal)
 
+    shape_str = "Bunny" if args.shape == "bunny" else "Box"
     print("=" * 60)
     print(f"  RoboSim: Drop Test")
-    print(f"  mode={args.mode.upper()}  boxes={args.num_boxes}"
+    print(f"  mode={args.mode.upper()}  shape={shape_str}  n={args.num_boxes}"
           f"  tilt={'random' if args.num_boxes > 1 else args.tilt}°"
           f"  seed={args.seed}")
     print("=" * 60)
 
-    if args.mode == "rbd":
-        run_rbd_drop(args.num_boxes, args.tilt, args.seed)
+    if args.shape == "bunny":
+        if args.mode == "rbd":
+            run_rbd_bunny_drop(args.num_boxes, args.tilt, args.seed)
+        else:
+            run_fem_bunny_drop(args.mode, args.num_boxes, args.tilt, args.seed)
     else:
-        run_deformable_drop(args.mode, args.num_boxes, args.tilt, args.seed)
+        if args.mode == "rbd":
+            run_rbd_drop(args.num_boxes, args.tilt, args.seed)
+        else:
+            run_deformable_drop(args.mode, args.num_boxes, args.tilt, args.seed)
 
 
 if __name__ == "__main__":

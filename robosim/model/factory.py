@@ -119,6 +119,112 @@ def create_free_box(
     return robot
 
 
+def create_free_mesh_body(
+    name: str = "free_mesh",
+    vertices: np.ndarray | None = None,
+    faces: np.ndarray | None = None,
+    mass: float = 0.5,
+    com: np.ndarray | None = None,
+    inertia: np.ndarray | None = None,
+    position: np.ndarray | None = None,
+    color: np.ndarray | None = None,
+) -> Robot:
+    """Create a 6-DOF free-floating rigid body with arbitrary triangle mesh geometry.
+
+    The mesh vertices/faces are stored directly (no file I/O at runtime).
+    Kinematic structure is identical to ``create_free_box`` (3 prismatic +
+    3 revolute joints) so all existing solvers work without modification.
+
+    Parameters
+    ----------
+    name     : Robot name
+    vertices : (N, 3) mesh vertex positions in body frame (CoM at origin)
+    faces    : (F, 3) triangle face indices
+    mass     : Total mass in kg
+    com      : (3,) centre-of-mass in body frame (default: zero)
+    inertia  : (3, 3) body-frame inertia tensor (default: sphere approximation)
+    position : (3,) initial world-frame position
+    color    : (4,) RGBA colour
+
+    Returns
+    -------
+    Robot with 6 DOF; mesh geometry is embedded in the terminal link.
+    """
+    if position is None:
+        position = np.array([0.0, 0.0, 0.1])
+    if color is None:
+        color = np.array([0.9, 0.7, 0.2, 1.0])
+    if com is None:
+        com = np.zeros(3)
+    if vertices is None:
+        vertices = np.zeros((0, 3))
+    if faces is None:
+        faces = np.zeros((0, 3), dtype=np.int32)
+
+    if inertia is None:
+        # Sphere approximation: I = 2/5 * m * r²
+        r_eff = float(np.max(np.linalg.norm(vertices, axis=1))) if len(vertices) else 0.05
+        i_val = 2.0 / 5.0 * mass * r_eff ** 2
+        inertia = np.diag([i_val, i_val, i_val])
+
+    # Build mesh geometry with pre-loaded vertices/faces (no file I/O)
+    from robosim.model.geometry import GeometryType
+    geom = Geometry(geometry_type=GeometryType.MESH)
+    geom.mesh_vertices = np.asarray(vertices, dtype=np.float64)
+    geom.mesh_faces    = np.asarray(faces, dtype=np.int32)
+
+    zero_inertia = SpatialInertia(mass=0, com=np.zeros(3), inertia=np.zeros((3, 3)))
+
+    base    = Link(name=f"{name}_base",  inertial=zero_inertia)
+    tx_link = Link(name=f"{name}_tx",    inertial=zero_inertia)
+    ty_link = Link(name=f"{name}_ty",    inertial=zero_inertia)
+    tz_link = Link(name=f"{name}_tz",    inertial=zero_inertia)
+    rx_link = Link(name=f"{name}_rx",    inertial=zero_inertia)
+    ry_link = Link(name=f"{name}_ry",    inertial=zero_inertia)
+
+    body_link = Link(
+        name=f"{name}_body",
+        inertial=SpatialInertia(mass=mass, com=com, inertia=inertia),
+        visuals=[Visual(geometry=geom, origin=Transform.identity(), color=color)],
+        collisions=[Collision(geometry=geom, origin=Transform.identity())],
+    )
+
+    links  = [base, tx_link, ty_link, tz_link, rx_link, ry_link, body_link]
+    t_lim  = JointLimits(lower=-10.0, upper=10.0, velocity=10.0, effort=1000.0)
+    r_lim  = JointLimits(lower=-2 * np.pi, upper=2 * np.pi, velocity=20.0, effort=100.0)
+
+    joints = [
+        Joint(name=f"{name}_tx", joint_type=JointType.PRISMATIC,
+              parent_link=base.name, child_link=tx_link.name,
+              axis=np.array([1, 0, 0]), origin=Transform.identity(), limits=t_lim),
+        Joint(name=f"{name}_ty", joint_type=JointType.PRISMATIC,
+              parent_link=tx_link.name, child_link=ty_link.name,
+              axis=np.array([0, 1, 0]), origin=Transform.identity(), limits=t_lim),
+        Joint(name=f"{name}_tz", joint_type=JointType.PRISMATIC,
+              parent_link=ty_link.name, child_link=tz_link.name,
+              axis=np.array([0, 0, 1]), origin=Transform.identity(), limits=t_lim),
+        Joint(name=f"{name}_rx", joint_type=JointType.REVOLUTE,
+              parent_link=tz_link.name, child_link=rx_link.name,
+              axis=np.array([1, 0, 0]), origin=Transform.identity(), limits=r_lim),
+        Joint(name=f"{name}_ry", joint_type=JointType.REVOLUTE,
+              parent_link=rx_link.name, child_link=ry_link.name,
+              axis=np.array([0, 1, 0]), origin=Transform.identity(), limits=r_lim),
+        Joint(name=f"{name}_rz", joint_type=JointType.REVOLUTE,
+              parent_link=ry_link.name, child_link=body_link.name,
+              axis=np.array([0, 0, 1]), origin=Transform.identity(), limits=r_lim),
+    ]
+
+    robot = Robot(name=name, links=links, joints=joints)
+    robot.gravity = np.array([0.0, 0.0, -9.81])
+    robot.build()
+
+    robot.q[0] = position[0]
+    robot.q[1] = position[1]
+    robot.q[2] = position[2]
+
+    return robot
+
+
 def create_free_sphere(
     name: str = "free_sphere",
     radius: float = 0.05,
