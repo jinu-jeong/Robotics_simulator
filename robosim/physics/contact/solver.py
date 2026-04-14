@@ -21,10 +21,13 @@ from robosim.physics.contact.response import (
 from robosim.physics.contact.fem_contact import (
     FEMSurfaceCollider,
     FEMContactPoint,
+    FEMEdgeContactPoint,
     RBDFEMContactPoint,
     detect_fem_fem,
+    detect_fem_edge_edge,
     detect_rbd_fem,
     resolve_fem_fem_contacts,
+    resolve_fem_edge_contacts,
     resolve_rbd_fem_contacts,
 )
 
@@ -507,18 +510,20 @@ class ContactSolver:
         # All pairs
         for i in range(n):
             for j in range(i + 1, n):
-                # A nodes vs B faces
-                contacts_ab = detect_fem_fem(
-                    self._fem_colliders[i], self._fem_colliders[j],
-                    bodies[i].x, bodies[j].x, d_hat,
-                )
-                # B nodes vs A faces
-                contacts_ba = detect_fem_fem(
-                    self._fem_colliders[j], self._fem_colliders[i],
-                    bodies[j].x, bodies[i].x, d_hat,
-                )
+                ci, cj = self._fem_colliders[i], self._fem_colliders[j]
+                xi, xj = bodies[i].x, bodies[j].x
+
+                # ── Vertex-face (both directions) ──
+                contacts_vf = detect_fem_fem(ci, cj, xi, xj, d_hat)
+                contacts_vf += detect_fem_fem(cj, ci, xj, xi, d_hat)
                 total += resolve_fem_fem_contacts(
-                    contacts_ab + contacts_ba, bodies, restitution, friction_mu,
+                    contacts_vf, bodies, restitution, friction_mu,
+                )
+
+                # ── Edge-edge ──
+                contacts_ee = detect_fem_edge_edge(ci, cj, xi, xj, d_hat)
+                total += resolve_fem_edge_contacts(
+                    contacts_ee, bodies, restitution, friction_mu,
                 )
 
         return total
