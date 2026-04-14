@@ -128,114 +128,165 @@ def sphere_sphere(
 
 # ── Box–Box (SAT) & Box–Sphere contacts ─────────────────────────
 
+def _clip_polygon_against_plane(
+    polygon: list[np.ndarray],
+    plane_normal: np.ndarray,
+    plane_d: float,
+) -> list[np.ndarray]:
+    """Sutherland-Hodgman half-space clip: keep vertices where dot(v, n) ≤ d.
+
+    Walks the polygon edges.  When an edge crosses the plane, a new vertex
+    is inserted at the intersection (lerp by the signed-distance ratio).
+    """
+    if not polygon:
+        return []
+    result: list[np.ndarray] = []
+    n_verts = len(polygon)
+    for i in range(n_verts):
+        curr = polygon[i]
+        nxt  = polygon[(i + 1) % n_verts]
+        d_curr = float(np.dot(curr, plane_normal)) - plane_d
+        d_nxt  = float(np.dot(nxt,  plane_normal)) - plane_d
+        if d_curr <= 0.0:               # curr is inside — keep it
+            result.append(curr)
+        if (d_curr > 0.0) != (d_nxt > 0.0):   # edge crosses plane
+            t = d_curr / (d_curr - d_nxt)      # guaranteed non-zero denom
+            result.append(curr + t * (nxt - curr))
+    return result
+
+
 def box_box(
     center_a: np.ndarray, rot_a: np.ndarray, half_a: np.ndarray,
     center_b: np.ndarray, rot_b: np.ndarray, half_b: np.ndarray,
 ) -> list[ContactPoint]:
-    """OBB vs OBB using Separating Axis Theorem (SAT).
+    """OBB vs OBB — SAT detection + Sutherland-Hodgman contact manifold.
 
-    Tests 15 potential separating axes (3+3 face normals + 9 edge-edge).
-    Returns contact points at the penetrating vertices of the incident face.
+    Phase 1 (SAT): test 15 axes (3+3 face normals + 9 edge-edge cross
+    products) to find the minimum-penetration axis (contact normal).
+
+    Phase 2 (manifold): clip the 4-vertex *incident face* of B against the
+    4 side planes of the *reference face* of A, then keep vertices that
+    penetrate the reference face plane.  Returns up to 4 contact points —
+    a full contact manifold instead of the single fall-back point.
+
+    Why this matters
+    ----------------
+    A single contact point for a flat-resting box creates asymmetric torque
+    → the box tips.  4 symmetric contacts distribute the normal force
+    evenly and produce stable resting.
     """
-    # Axes of each box in world frame
-    ax_a = rot_a.T  # (3, 3) — rows are the 3 local axes of A in world
+    ax_a = rot_a.T   # rows = local axes of A in world frame
     ax_b = rot_b.T
+    d = center_b - center_a
 
-    d = center_b - center_a  # vector from A center to B center
-
-    # --- Collect all 15 candidate separating axes ---
+    # ── Phase 1: SAT — find minimum-penetration axis ─────────────────
     axes: list[np.ndarray] = []
-
-    # Face normals of A (3)
     for i in range(3):
         axes.append(ax_a[i])
-
-    # Face normals of B (3)
     for i in range(3):
         axes.append(ax_b[i])
-
-    # Edge-edge cross products (9)
-    # Use a generous threshold to filter near-parallel edge pairs —
-    # their cross products are numerically unreliable and create
-    # ghost contacts between nearly-aligned OBBs.
     for i in range(3):
         for j in range(3):
             c = np.cross(ax_a[i], ax_b[j])
-            n = np.linalg.norm(c)
-            if n > 0.01:
-                axes.append(c / n)
+            nm = np.linalg.norm(c)
+            if nm > 0.01:           # skip near-parallel edge pairs
+                axes.append(c / nm)
 
-    # --- Find axis of minimum penetration ---
     min_pen = np.inf
     min_axis = None
-
     for axis in axes:
-        # Project half-extents onto axis
         proj_a = sum(half_a[i] * abs(np.dot(ax_a[i], axis)) for i in range(3))
         proj_b = sum(half_b[i] * abs(np.dot(ax_b[i], axis)) for i in range(3))
         dist = abs(np.dot(d, axis))
-        pen = proj_a + proj_b - dist
-
+        pen  = proj_a + proj_b - dist
         if pen <= 0:
-            return []  # separating axis found — no collision
-
+            return []               # separating axis found — no collision
         if pen < min_pen:
             min_pen = pen
-            # Ensure normal points from B to A
-            min_axis = axis if np.dot(d, axis) < 0 else -axis
+            min_axis = axis if np.dot(d, axis) < 0 else -axis  # B → A
 
     if min_axis is None:
         return []
 
-    normal = min_axis
+    normal      = min_axis   # unit normal, points B → A
     penetration = min_pen
 
-    # --- Generate contact points (vertex-based) ---
-    # Find vertices of B that are most penetrating into A
-    contacts = []
-    signs = np.array([
-        [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
-        [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],
-    ], dtype=np.float64)
+    # ── Phase 2: contact manifold via face clipping ───────────────────
+    #
+    # Reference face (on A): the face of A whose outward normal is most
+    # anti-aligned with `normal` — i.e., the face of A closest to B.
+    #
+    dots_a  = [float(np.dot(ax_a[i], normal)) for i in range(3)]
+    ref_idx = int(np.argmax(np.abs(dots_a)))
+    # Outward normal of ref face points TOWARD B (opposite to `normal`)
+    ref_fn     = -ax_a[ref_idx] if dots_a[ref_idx] > 0 else ax_a[ref_idx]
+    ref_center = center_a + half_a[ref_idx] * ref_fn
 
-    # Test vertices of B against A
-    verts_b = (rot_b @ (signs * half_b).T).T + center_b
-    for v in verts_b:
-        # Check if vertex is inside A (using local coordinates)
-        v_local_a = rot_a.T @ (v - center_a)
-        if (np.abs(v_local_a) <= half_a + 1e-6).all():
-            # Penetrating vertex — project onto contact plane
-            pen_depth = np.dot(v - center_a, normal) + _support_dist(half_a, ax_a, normal)
-            if pen_depth > 0:
-                point_b = v.copy()
-                point_a = v + pen_depth * normal
-                contacts.append(ContactPoint(
-                    point_a=point_a, point_b=point_b,
-                    normal=normal, penetration=pen_depth,
-                ))
+    # Incident face (on B): face of B most aligned with `normal` — i.e.,
+    # the face of B pointing toward A.
+    dots_b  = [float(np.dot(ax_b[i], normal)) for i in range(3)]
+    inc_idx = int(np.argmax(np.abs(dots_b)))
+    inc_fn     = ax_b[inc_idx] if dots_b[inc_idx] > 0 else -ax_b[inc_idx]
+    inc_center = center_b + half_b[inc_idx] * inc_fn
 
-    # Also test vertices of A against B
-    verts_a = (rot_a @ (signs * half_a).T).T + center_a
-    for v in verts_a:
-        v_local_b = rot_b.T @ (v - center_b)
-        if (np.abs(v_local_b) <= half_b + 1e-6).all():
-            pen_depth = -np.dot(v - center_b, normal) + _support_dist(half_b, ax_b, -normal)
-            if pen_depth > 0:
-                point_a = v.copy()
-                point_b = v - pen_depth * normal
-                contacts.append(ContactPoint(
-                    point_a=point_a, point_b=point_b,
-                    normal=normal, penetration=pen_depth,
-                ))
+    # Build 4-vertex incident face polygon (wound counter-clockwise)
+    other_b       = [i for i in range(3) if i != inc_idx]
+    ub, vb        = ax_b[other_b[0]], ax_b[other_b[1]]
+    hub, hvb      = half_b[other_b[0]], half_b[other_b[1]]
+    polygon: list[np.ndarray] = [
+        inc_center + hub * ub + hvb * vb,
+        inc_center - hub * ub + hvb * vb,
+        inc_center - hub * ub - hvb * vb,
+        inc_center + hub * ub - hvb * vb,
+    ]
 
-    # If no vertex contacts found, generate a single contact at midpoint
+    # Clip polygon against 4 side planes of the reference face.
+    # Each side plane keeps vertices on the interior side of the edge.
+    other_a  = [i for i in range(3) if i != ref_idx]
+    ua, va   = ax_a[other_a[0]], ax_a[other_a[1]]
+    hua, hva = half_a[other_a[0]], half_a[other_a[1]]
+    side_planes = [
+        ( ua,  float(np.dot(ref_center,  ua)) + hua),
+        (-ua,  float(np.dot(ref_center, -ua)) + hua),
+        ( va,  float(np.dot(ref_center,  va)) + hva),
+        (-va,  float(np.dot(ref_center, -va)) + hva),
+    ]
+    for sn, sd in side_planes:
+        polygon = _clip_polygon_against_plane(polygon, sn, sd)
+        if not polygon:
+            return []
+
+    # Keep vertices that penetrate (are on the A-interior side of) the
+    # reference face plane.  Compute per-vertex depth and project each
+    # kept vertex back onto the reference face surface for point_a.
+    ref_plane_d = float(np.dot(ref_center, ref_fn))
+    TOL = 5e-4       # accept grazing contacts within 0.5 mm
+    contacts: list[ContactPoint] = []
+    for p in polygon:
+        # signed_dist > 0  ⟹  p is outside A (beyond the ref face)
+        # signed_dist < 0  ⟹  p is inside  A (penetrating)
+        signed_dist = float(np.dot(p, ref_fn)) - ref_plane_d
+        depth = -signed_dist
+        if depth >= -TOL:
+            point_on_a = p - signed_dist * ref_fn   # project onto ref face
+            contacts.append(ContactPoint(
+                point_a=point_on_a,
+                point_b=p.copy(),
+                normal=normal.copy(),
+                penetration=max(0.0, depth),
+            ))
+
+    # Fallback (degenerate geometry): single centre-point contact
     if not contacts:
-        mid = (center_a + center_b) / 2.0
-        contacts.append(ContactPoint(
-            point_a=mid + normal * penetration / 2,
-            point_b=mid - normal * penetration / 2,
-            normal=normal, penetration=penetration,
-        ))
+        pt_a = center_a - _support_dist(half_a, ax_a, normal) * normal
+        pt_b = center_b + _support_dist(half_b, ax_b, -normal) * (-normal)
+        return [ContactPoint(point_a=pt_a, point_b=pt_b,
+                             normal=normal, penetration=penetration)]
+
+    # Manifold reduction: keep at most 4 deepest contacts
+    if len(contacts) > 4:
+        contacts.sort(key=lambda c: -c.penetration)
+        contacts = contacts[:4]
 
     return contacts
 
