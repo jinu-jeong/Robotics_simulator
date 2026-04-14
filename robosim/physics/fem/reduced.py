@@ -1,0 +1,491 @@
+"""Craig-Bampton reduced-order model with body-level corotational rotation.
+
+Two operating modes
+-------------------
+**Free body** (fixed_nodes=[] — default)
+    Large rigid-body rotation handled by Kabsch best-fit R each step
+    (Floating Frame of Reference / stiffness warping).  Good for grasping,
+    drop tests, flying objects.
+
+**Anchored body** (fixed_nodes=<array>)
+    Some nodes are clamped in place (Dirichlet BCs).  Corotational disabled
+    (R=I), centroid held fixed.  Good for cantilevers, structural members.
+
+Theory
+------
+Component Mode Synthesis (Craig & Bampton 1968) splits free DOFs into
+boundary (b) and interior (i):
+
+  Φ_CB = [ I      0   ]   ← free boundary DOFs
+          [ Ψ_c   Φ_k ]   ← free interior DOFs
+
+  Ψ_c  = -K_ii⁻¹ K_ib          (constraint modes)
+  Φ_k  : k smallest eigenvectors of (K_ii, M_ii)   (fixed-interface modes)
+
+Reduced constant matrices:  K_r = Φ_CB^T K_free Φ_CB
+                             M_r = Φ_CB^T M_free Φ_CB
+
+One LU factorisation of A_r = M_r/dt² + β M_r/dt + K_r gives a single
+back-solve per timestep — no assembly, no Newton iterations.
+
+References
+----------
+Craig R.R. & Bampton M.C.C. (1968).  AIAA Journal, 6(7), 1313-1319.
+Shabana A.A. (2005). Dynamics of Multibody Systems.  Cambridge Univ. Press.
+Müller M. et al. (2002). Stable real-time deformations.  ACM SCA 2002.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import scipy.sparse.linalg as spla
+from scipy.linalg import lu_factor, lu_solve
+
+from robosim.physics.fem.mesh import TetMesh, FEMesh
+from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
+from robosim.physics.fem.assembly import (
+    precompute_element_data,
+    assemble_stiffness,
+    assemble_mass_matrix,
+)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Craig-Bampton Body
+# ═══════════════════════════════════════════════════════════════
+
+class CraigBamptonBody:
+    """Reduced deformable body: Craig-Bampton CMS + optional body-level corotational.
+
+    Parameters
+    ----------
+    mesh : TetMesh or FEMesh  reference mesh
+    material : constitutive model  (default CorotationalElastic)
+    density : kg/m³
+    n_modes : fixed-interface normal modes to keep  (0 = pure static condensation)
+    fixed_nodes : node indices with Dirichlet BCs (clamped, zero displacement).
+                  If non-empty: corotational disabled (R=I), centroid fixed.
+                  If empty (default): body-level Kabsch corotational enabled.
+    gravity : (3,) gravity vector  [default 0,0,-9.81]
+    damping : Rayleigh mass-proportional β
+    name : label
+
+    Attributes
+    ----------
+    x : (n_nodes, 3)  current world positions  ← directly readable/writable
+    v : (n_nodes, 3)  current world velocities ← directly readable/writable
+    mesh : unchanged reference mesh
+    """
+
+    def __init__(
+        self,
+        mesh: TetMesh | FEMesh,
+        material: CorotationalElastic | NeoHookean | None = None,
+        density: float = 1000.0,
+        n_modes: int = 6,
+        fixed_nodes: np.ndarray | None = None,
+        gravity: np.ndarray | None = None,
+        damping: float = 0.01,
+        name: str = "cb_body",
+    ) -> None:
+        if material is None:
+            material = CorotationalElastic()
+
+        self.mesh = mesh
+        self.material = material
+        self.density = density
+        self.n_modes = n_modes
+        self.fixed_nodes = (np.asarray(fixed_nodes, dtype=np.int64)
+                            if fixed_nodes is not None and len(fixed_nodes) > 0
+                            else np.array([], dtype=np.int64))
+        self.gravity = np.asarray(gravity if gravity is not None
+                                  else [0.0, 0.0, -9.81], dtype=np.float64)
+        self.damping = damping
+        self.name = name
+
+        # Primary state
+        self.x: np.ndarray | None = None
+        self.v: np.ndarray | None = None
+
+        # Precomputed (set by _build_cb_basis)
+        self._Phi_CB: np.ndarray | None = None    # (n_dof, n_r)
+        self._K_r: np.ndarray | None = None
+        self._M_r: np.ndarray | None = None
+        self._C_q: np.ndarray | None = None       # (n_r, n_free_dof) projection
+        self._M_diag: np.ndarray | None = None    # (n_dof,) full mass diagonal
+        self._m_total: float = 0.0
+        self._free_dofs: np.ndarray | None = None  # global free DOF indices
+        self._fixed_dofs: np.ndarray | None = None
+        self._x_ref_body: np.ndarray | None = None
+        self._t_ref: np.ndarray | None = None
+        self._n_r: int = 0
+        self._n_b: int = 0
+        self._n_modes_actual: int = 0
+
+        # Whether this is an anchored body (fixed nodes present)
+        self._anchored: bool = len(self.fixed_nodes) > 0
+
+        # Integration data for post-processing (von Mises etc.)
+        self._dN_list = None
+        self._volumes = None
+
+        # LU (set by initialize)
+        self._A_r_lu = None
+        self._dt_cached: float = 0.0
+
+        self._build_cb_basis()
+
+    # ------------------------------------------------------------------
+    # CB basis construction
+    # ------------------------------------------------------------------
+
+    def _build_cb_basis(self) -> None:
+        mesh = self.mesh
+        n_nodes = mesh.n_nodes
+        n_dof = n_nodes * 3
+
+        print(f"[C-B '{self.name}'] Assembling K₀, M₀ ({n_dof} DOF)...")
+        dN_data, volumes = precompute_element_data(mesh)
+        K0 = assemble_stiffness(mesh, mesh.nodes, self.material, dN_data, volumes)
+        M0 = assemble_mass_matrix(mesh, self.density, volumes)
+
+        # ── Fixed / free DOF split ───────────────────────────────────
+        if self._anchored:
+            fixed_dofs = np.sort(np.concatenate(
+                [np.arange(n * 3, n * 3 + 3) for n in self.fixed_nodes]
+            ))
+        else:
+            fixed_dofs = np.array([], dtype=np.int64)
+
+        free_mask = np.ones(n_dof, dtype=bool)
+        free_mask[fixed_dofs] = False
+        free_dofs = np.where(free_mask)[0]
+
+        # ── Boundary / interior partition within free DOFs ───────────
+        surf_faces = mesh.extract_surface()
+        surf_nodes = np.unique(surf_faces.ravel())
+        all_nodes = np.arange(n_nodes)
+        int_nodes = np.setdiff1d(all_nodes, surf_nodes)
+
+        # Surface / interior nodes that are FREE (not fixed)
+        b_nodes = np.setdiff1d(surf_nodes, self.fixed_nodes)
+        i_nodes = np.setdiff1d(int_nodes, self.fixed_nodes)
+
+        b_dofs_global = np.sort(np.concatenate(
+            [np.arange(n * 3, n * 3 + 3) for n in b_nodes]
+        )) if len(b_nodes) > 0 else np.array([], dtype=np.int64)
+        i_dofs_global = np.sort(np.concatenate(
+            [np.arange(n * 3, n * 3 + 3) for n in i_nodes]
+        )) if len(i_nodes) > 0 else np.array([], dtype=np.int64)
+
+        n_b = len(b_dofs_global)
+        n_i = len(i_dofs_global)
+        print(f"[C-B '{self.name}']   fixed: {len(fixed_dofs)}  "
+              f"boundary: {n_b}  interior: {n_i}")
+
+        # ── Constraint modes  Ψ_c = -K_ii⁻¹ K_ib ───────────────────
+        if n_i > 0 and n_b > 0:
+            K_ii = K0[np.ix_(i_dofs_global, i_dofs_global)].toarray()
+            K_ib = K0[np.ix_(i_dofs_global, b_dofs_global)].toarray()
+            print(f"[C-B '{self.name}']   constraint modes ({n_i}×{n_b})...")
+            K_ii_reg = K_ii + 1e-12 * np.eye(n_i)
+            Psi_c = np.linalg.solve(K_ii_reg, -K_ib)   # (n_i, n_b)
+        else:
+            Psi_c = np.zeros((n_i, n_b))
+
+        # ── Fixed-interface normal modes ─────────────────────────────
+        n_modes_req = min(self.n_modes, max(0, n_i - 1))
+        Phi_k = np.zeros((n_i, 0))
+
+        if n_modes_req > 0 and n_i > 0:
+            print(f"[C-B '{self.name}']   {n_modes_req} fixed-interface modes...")
+            M_ii = M0[np.ix_(i_dofs_global, i_dofs_global)]
+            K_ii_sp = K0[np.ix_(i_dofs_global, i_dofs_global)]
+            eigenvalues, evecs = spla.eigsh(
+                K_ii_sp, M=M_ii, k=n_modes_req, which="LM", sigma=0.0,
+                tol=1e-10, maxiter=5000,
+            )
+            Phi_k = evecs[:, np.argsort(eigenvalues)]
+        else:
+            n_modes_req = 0
+
+        # ── Φ_CB in full n_dof space ─────────────────────────────────
+        n_r = n_b + n_modes_req
+        Phi_CB = np.zeros((n_dof, n_r))
+
+        if n_b > 0:
+            Phi_CB[b_dofs_global, np.arange(n_b)] = 1.0
+        if n_i > 0:
+            Phi_CB[np.ix_(i_dofs_global, np.arange(n_b))] = Psi_c
+            if n_modes_req > 0:
+                Phi_CB[np.ix_(i_dofs_global, np.arange(n_b, n_r))] = Phi_k
+
+        print(f"[C-B '{self.name}']   reducing: {n_dof} → {n_r} "
+              f"({n_b} boundary + {n_modes_req} modes)...")
+
+        # ── Reduced matrices on FREE DOFs ────────────────────────────
+        # Use free-DOF subblock of K, M for correctness with fixed BCs
+        if self._anchored and len(free_dofs) < n_dof:
+            Phi_CB_free = Phi_CB[free_dofs, :]            # (n_free, n_r)
+            K_free = K0[np.ix_(free_dofs, free_dofs)].toarray()
+            M_free = M0[np.ix_(free_dofs, free_dofs)].toarray()
+            K_r = Phi_CB_free.T @ K_free @ Phi_CB_free
+            M_r = Phi_CB_free.T @ M_free @ Phi_CB_free
+            M_diag_free = M0[np.ix_(free_dofs, free_dofs)].diagonal()
+            PhiT_M = Phi_CB_free.T * M_diag_free[np.newaxis, :]
+        else:
+            K0_dense = K0.toarray()
+            M0_dense = M0.toarray()
+            K_r = Phi_CB.T @ K0_dense @ Phi_CB
+            M_r = Phi_CB.T @ M0_dense @ Phi_CB
+            M_diag_all = M0.diagonal()
+            PhiT_M = Phi_CB.T * M_diag_all[np.newaxis, :]
+
+        M_r_inv = np.linalg.inv(M_r)
+        C_q = M_r_inv @ PhiT_M          # (n_r, n_free_or_full_dof)
+
+        M_diag = M0.diagonal()
+        m_total = np.sum([M_diag[n * 3] for n in range(n_nodes)])
+
+        # ── Store ────────────────────────────────────────────────────
+        self._Phi_CB = Phi_CB
+        self._K_r = K_r
+        self._M_r = M_r
+        self._C_q = C_q
+        self._M_diag = M_diag
+        self._m_total = m_total
+        self._free_dofs = free_dofs
+        self._fixed_dofs = fixed_dofs
+        self._n_r = n_r
+        self._n_b = n_b
+        self._n_modes_actual = n_modes_req
+        self._dN_list = dN_data
+        self._volumes = volumes
+
+        # Body-frame reference (centroid-centered)
+        self._t_ref = mesh.nodes.mean(axis=0).copy()
+        self._x_ref_body = mesh.nodes - self._t_ref
+
+        print(f"[C-B '{self.name}']   ready.  m_total={m_total:.4f} kg  "
+              f"{'anchored' if self._anchored else 'free-floating'}")
+
+    # ------------------------------------------------------------------
+    # initialize
+    # ------------------------------------------------------------------
+
+    def initialize(self, dt: float) -> None:
+        """Set initial state and LU-factorise the constant system matrix."""
+        n_nodes = self.mesh.n_nodes
+        self.x = self.mesh.nodes.copy()
+        self.v = np.zeros((n_nodes, 3))
+
+        dt2_inv = 1.0 / (dt * dt)
+        A_r = self._M_r * dt2_inv + self._K_r
+        if self.damping > 0.0:
+            A_r = A_r + self.damping * self._M_r / dt
+
+        self._A_r_lu = lu_factor(A_r)
+        self._dt_cached = dt
+        print(f"[C-B '{self.name}']   initialized  dt={dt}  "
+              f"A_r ({self._n_r}×{self._n_r}) LU-factored.")
+
+    # ------------------------------------------------------------------
+    # step
+    # ------------------------------------------------------------------
+
+    def step(
+        self,
+        dt: float | None = None,
+        extra_forces: dict[int, np.ndarray] | None = None,
+    ) -> None:
+        """Advance one implicit-Euler step.
+
+        Reads ``self.x``, ``self.v`` as current state (external modifications
+        such as impulse-based contact or kinematic coupling are absorbed
+        automatically) and writes back updated state.
+        """
+        if dt is None:
+            dt = self._dt_cached
+        elif dt != self._dt_cached:
+            self.initialize(dt)
+
+        if self._anchored:
+            self._step_anchored(dt, extra_forces)
+        else:
+            self._step_free(dt, extra_forces)
+
+    # ------------------------------------------------------------------
+    # Free-floating step  (corotational R via Kabsch)
+    # ------------------------------------------------------------------
+
+    def _step_free(self, dt: float, extra_forces) -> None:
+        n_nodes = self.mesh.n_nodes
+        n_dof = n_nodes * 3
+        dt2_inv = 1.0 / (dt * dt)
+
+        # Centroid + Kabsch rotation from current x
+        t = self.x.mean(axis=0)
+        x_centered = self.x - t
+        R = _kabsch_rotation(x_centered, self._x_ref_body)
+
+        # Body-frame deformation: u = x_centered @ R - x_ref_body
+        u_body = x_centered @ R - self._x_ref_body    # (n_nodes, 3)
+        q_r = self._C_q @ u_body.reshape(-1)
+
+        t_dot = self.v.mean(axis=0)
+        v_body = (self.v - t_dot) @ R
+        q_r_dot = self._C_q @ v_body.reshape(-1)
+
+        # External forces (world frame)
+        f_ext = np.zeros(n_dof)
+        for d in range(3):
+            f_ext[d::3] += self._M_diag[d::3] * self.gravity[d]
+        if extra_forces is not None and 0 in extra_forces:
+            f_ext += extra_forces[0]
+
+        # Body-frame force → reduced
+        f_r = self._Phi_CB.T @ (f_ext.reshape(n_nodes, 3) @ R).reshape(-1)
+
+        # Implicit Euler
+        q_r_pred = q_r + dt * q_r_dot
+        rhs = self._M_r @ q_r_pred * dt2_inv + f_r
+        if self.damping > 0.0:
+            rhs += self.damping * self._M_r @ q_r / dt
+        q_r_new = lu_solve(self._A_r_lu, rhs)
+        q_r_dot_new = (q_r_new - q_r) / dt
+
+        # Centroid dynamics (explicit)
+        f_total = f_ext.reshape(n_nodes, 3).sum(axis=0)
+        t_dot_new = t_dot + dt * f_total / self._m_total
+        t_new = t + dt * t_dot_new
+
+        # Reconstruct
+        u_new = (self._Phi_CB @ q_r_new).reshape(n_nodes, 3)
+        self.x = t_new + (self._x_ref_body + u_new) @ R.T
+        u_dot_new = (self._Phi_CB @ q_r_dot_new).reshape(n_nodes, 3)
+        self.v = t_dot_new + u_dot_new @ R.T
+
+    # ------------------------------------------------------------------
+    # Anchored step  (fixed nodes clamped, R = I, no centroid motion)
+    # ------------------------------------------------------------------
+
+    def _step_anchored(self, dt: float, extra_forces) -> None:
+        n_nodes = self.mesh.n_nodes
+        n_dof = n_nodes * 3
+        dt2_inv = 1.0 / (dt * dt)
+
+        free_dofs = self._free_dofs    # global DOF indices that are free
+
+        # Displacement of free DOFs from reference
+        x_flat = self.x.reshape(-1)
+        x_ref_flat = self.mesh.nodes.reshape(-1)
+        u_free = x_flat[free_dofs] - x_ref_flat[free_dofs]   # (n_free,)
+        q_r = self._C_q @ u_free
+
+        v_flat = self.v.reshape(-1)
+        q_r_dot = self._C_q @ v_flat[free_dofs]
+
+        # External forces on free DOFs
+        f_ext = np.zeros(n_dof)
+        for d in range(3):
+            f_ext[d::3] += self._M_diag[d::3] * self.gravity[d]
+        if extra_forces is not None and 0 in extra_forces:
+            f_ext += extra_forces[0]
+        f_ext_free = f_ext[free_dofs]    # (n_free,)
+
+        # Reduced force (no R transform since R=I)
+        f_r = self._Phi_CB[free_dofs, :].T @ f_ext_free
+
+        # Implicit Euler
+        q_r_pred = q_r + dt * q_r_dot
+        rhs = self._M_r @ q_r_pred * dt2_inv + f_r
+        if self.damping > 0.0:
+            rhs += self.damping * self._M_r @ q_r / dt
+        q_r_new = lu_solve(self._A_r_lu, rhs)
+        q_r_dot_new = (q_r_new - q_r) / dt
+
+        # Reconstruct: only free DOFs change
+        u_new = (self._Phi_CB @ q_r_new).reshape(n_nodes, 3)
+        x_new = self.mesh.nodes + u_new
+        # Re-clamp fixed nodes exactly at reference
+        x_new.reshape(-1)[self._fixed_dofs] = x_ref_flat[self._fixed_dofs]
+
+        u_dot_new = (self._Phi_CB @ q_r_dot_new).reshape(n_nodes, 3)
+        v_new = u_dot_new
+        v_new.reshape(-1)[self._fixed_dofs] = 0.0
+
+        self.x = x_new
+        self.v = v_new
+
+
+# ═══════════════════════════════════════════════════════════════
+# Craig-Bampton Solver  (FEMSolver-compatible wrapper)
+# ═══════════════════════════════════════════════════════════════
+
+class CraigBamptonSolver:
+    """Thin wrapper that gives ``CraigBamptonBody`` the same interface as
+    ``FEMSolver``.
+
+    .. code-block:: python
+
+        body   = CraigBamptonBody(mesh, material, density=1000,
+                                  fixed_nodes=fixed_nodes, n_modes=10)
+        solver = CraigBamptonSolver(bodies=[body])
+        solver.initialize(dt=0.005)
+        solver.step()          # same API as FEMSolver
+    """
+
+    def __init__(
+        self,
+        bodies: list[CraigBamptonBody],
+        gravity: np.ndarray | None = None,
+        damping: float | None = None,
+    ) -> None:
+        self.bodies = bodies
+        if gravity is not None:
+            for b in bodies:
+                b.gravity = np.asarray(gravity, dtype=np.float64)
+        if damping is not None:
+            for b in bodies:
+                b.damping = float(damping)
+        self._time: float = 0.0
+        self._dt: float = 0.0
+
+    def initialize(self, dt: float) -> None:
+        for body in self.bodies:
+            body.initialize(dt)
+        self._dt = dt
+        self._time = 0.0
+
+    def step(
+        self,
+        dt: float | None = None,
+        extra_forces: dict[int, np.ndarray] | None = None,
+    ) -> None:
+        if dt is None:
+            dt = self._dt
+        for idx, body in enumerate(self.bodies):
+            ef = ({0: extra_forces[idx]} if extra_forces and idx in extra_forces
+                  else None)
+            body.step(dt=dt, extra_forces=ef)
+        self._time += dt
+
+    @property
+    def time(self) -> float:
+        return self._time
+
+
+# ═══════════════════════════════════════════════════════════════
+# Kabsch best-fit rotation
+# ═══════════════════════════════════════════════════════════════
+
+def _kabsch_rotation(x_centered: np.ndarray, x_ref_body: np.ndarray) -> np.ndarray:
+    """Return R (3×3) minimising ||x_centered − x_ref_body @ R^T||²_F.
+
+    At reference state (x_centered == x_ref_body) returns identity.
+    """
+    H = x_ref_body.T @ x_centered
+    U, _S, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    return R

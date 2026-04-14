@@ -223,11 +223,102 @@ def run_fem_drop(tilt_deg: float = 0.0):
     print(f"Final Z_com: {body.x[:, 2].mean():.4f} m")
 
 
+def run_cb_drop(tilt_deg: float = 0.0):
+    """Craig-Bampton reduced soft cube dropping onto ground plane."""
+    from robosim.physics.fem.mesh import TetMesh
+    from robosim.physics.fem.materials import CorotationalElastic
+    from robosim.physics.fem.reduced import CraigBamptonBody, CraigBamptonSolver
+    from robosim.physics.fem.assembly import batch_von_mises
+    from robosim.physics.contact.detection import GroundPlane
+    from robosim.physics.contact.solver import ContactSolver
+    from robosim.viz.viewer import SimViewer
+    from scipy.spatial.transform import Rotation
+
+    side = 0.2
+    drop_height = 0.5
+
+    mesh = TetMesh.create_box(
+        origin=np.array([-side/2, -side/2, drop_height]),
+        size=np.array([side, side, side]),
+        divisions=(3, 3, 3),
+    )
+
+    # Apply tilt to reference mesh nodes (Kabsch R handles the rest)
+    if tilt_deg != 0.0:
+        com = mesh.nodes.mean(axis=0)
+        R_tilt = Rotation.from_euler('y', tilt_deg, degrees=True).as_matrix()
+        mesh.nodes[:] = (R_tilt @ (mesh.nodes - com).T).T + com
+        print(f"  Tilt: {tilt_deg}° about Y axis")
+
+    body = CraigBamptonBody(
+        mesh=mesh,
+        material=CorotationalElastic(young=5e5, poisson=0.3),
+        density=1000.0,
+        n_modes=6,
+        gravity=np.array([0.0, 0.0, -9.81]),
+        damping=0.02,
+        name="cb_cube",
+    )
+    solver = CraigBamptonSolver(bodies=[body])
+    solver.initialize(dt=0.001)
+
+    contact = ContactSolver(ground=GroundPlane(height=0.0))
+
+    viewer = SimViewer(title=f"RoboSim — Drop Test (C-B, tilt={tilt_deg}°)",
+                       window_size=(1200, 800))
+    viewer.initialize()
+
+    surface_tri = mesh.extract_surface()
+
+    def stress_to_color(vm, vmax):
+        t = np.clip(vm / max(vmax, 1.0), 0, 1)
+        r = np.clip(1.5 - np.abs(t - 0.75) * 4.0, 0, 1)
+        g = np.clip(1.5 - np.abs(t - 0.50) * 4.0, 0, 1)
+        b = np.clip(1.5 - np.abs(t - 0.25) * 4.0, 0, 1)
+        return np.column_stack([r, g, b]).astype(np.float32)
+
+    viewer.add_mesh("cube", body.x.copy(), surface_tri,
+                    color=np.array([0.2, 0.7, 1.0]))
+
+    substeps = 15
+
+    def step_callback(step):
+        for _ in range(substeps):
+            solver.step()
+            contact.resolve_fem_contact(body, restitution=0.3, friction_mu=0.5)
+
+        viewer.update_mesh_vertices("cube", body.x.copy())
+
+        vm = batch_von_mises(body.mesh, body.x, body.material,
+                             body._dN_list, body._volumes)
+        vm_max = max(vm.max(), 1.0)
+        viewer.update_mesh_color("cube", stress_to_color(vm, vm_max))
+
+        z_min = body.x[:, 2].min()
+        com = body.x.mean(axis=0)
+        n_contacts = len(contact.last_forces)
+        info = (
+            f"t = {solver.time:.3f}s\n"
+            f"CoM: ({com[0]:+.3f}, {com[1]:+.3f}, {com[2]:+.3f})\n"
+            f"Z_min: {z_min:.4f} m | Contacts: {n_contacts}\n"
+            f"Stress max: {vm_max:.0f} Pa\n"
+            f"n_r={body._n_r} ({body._n_b}b+{body._n_modes_actual}m)"
+        )
+        viewer.add_text(info)
+
+    viewer.add_callback(step_callback)
+    print(f"C-B cube drop test (tilt={tilt_deg}°) — ESC to quit")
+    viewer.show()
+
+    print(f"\nFinal Z_min: {body.x[:, 2].min():.4f} m")
+    print(f"Final Z_com: {body.x[:, 2].mean():.4f} m")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["rbd", "fem"], default="rbd")
+    parser.add_argument("--mode", choices=["rbd", "fem", "cb"], default="rbd")
     parser.add_argument("--tilt", type=float, default=0.0,
-                        help="FEM: tilt angle in degrees (e.g. 30)")
+                        help="FEM/CB: tilt angle in degrees (e.g. 30)")
     args = parser.parse_args()
 
     ti.init(arch=ti.metal)
@@ -238,8 +329,10 @@ def main():
 
     if args.mode == "rbd":
         run_rbd_drop()
-    else:
+    elif args.mode == "fem":
         run_fem_drop(tilt_deg=args.tilt)
+    else:
+        run_cb_drop(tilt_deg=args.tilt)
 
     print("Phase 4 Contact: OK")
 

@@ -4,9 +4,11 @@ Metal/Vulkan 네이티브 렌더링으로 PyVista 대비 훨씬 빠릅니다.
 요소 타입(Tet4/Tet10/Hex8) 비교 가능, 실시간 렌더모드 전환.
 
 실행:
-  python examples/fem_cantilever_taichi.py                  # 기본 Tet4
+  python examples/fem_cantilever_taichi.py                      # 기본 Tet4 FEM
+  python examples/fem_cantilever_taichi.py --mode cb            # C-B 축소 (Tet4)
   python examples/fem_cantilever_taichi.py --element-type hex8
   python examples/fem_cantilever_taichi.py --element-type tet10
+  python examples/fem_cantilever_taichi.py --mode cb --element-type tet4 --n-modes 20
 
 조작:
   - 마우스 좌클릭 드래그: 카메라 회전
@@ -33,6 +35,7 @@ from robosim.physics.fem.mesh import TetMesh, FEMesh
 from robosim.physics.fem.elements import ElementType
 from robosim.physics.fem.materials import CorotationalElastic
 from robosim.physics.fem.solver import FEMSolver, DeformableBody
+from robosim.physics.fem.reduced import CraigBamptonBody, CraigBamptonSolver
 from robosim.physics.fem.assembly import batch_von_mises
 from robosim.viz.colormap import (
     stress_to_color, stress_with_element_tint,
@@ -67,12 +70,16 @@ def create_mesh(element_type: str, L, W, H, divisions):
 
 def main():
     parser = argparse.ArgumentParser(description="FEM cantilever beam demo")
+    parser.add_argument("--mode", choices=["fem", "cb"], default="fem",
+                        help="솔버: 'fem' (전체 FEM) 또는 'cb' (Craig-Bampton 축소)")
     parser.add_argument(
         "--element-type", "-e",
         choices=["tet4", "tet10", "hex8"],
         default="tet4",
         help="요소 타입 선택 (기본: tet4)",
     )
+    parser.add_argument("--n-modes", type=int, default=10,
+                        help="C-B 고정 경계 고유 모드 수 (--mode cb 시 사용, 기본: 10)")
     parser.add_argument("--substeps", type=int, default=5, help="프레임당 물리 서브스텝 (기본: 5)")
     parser.add_argument("--divisions", type=str, default=None,
                         help="메시 분할 수 (예: 10,2,2). 미지정 시 요소 타입에 맞게 자동 설정")
@@ -98,29 +105,48 @@ def main():
 
     ti.init(arch=ti.metal)
 
+    solver_mode = args.mode
+    n_modes_cb = args.n_modes
+
     print("=" * 60)
-    print(f"  RoboSim FEM Cantilever — {etype_str.upper()}")
+    print(f"  RoboSim FEM Cantilever — {etype_str.upper()}  [{solver_mode.upper()}]")
     print("=" * 60)
 
     # ── Mesh & solver setup ──
     L, W, H = 1.0, 0.1, 0.1
     mesh, etype = create_mesh(etype_str, L, W, H, divisions)
     fixed_nodes = np.where(mesh.nodes[:, 0] < 1e-10)[0]
+    material = CorotationalElastic(young=1e7, poisson=0.3)
 
-    body = DeformableBody(
-        name="cantilever",
-        mesh=mesh,
-        material=CorotationalElastic(young=1e7, poisson=0.3),
-        density=1000.0,
-        fixed_nodes=fixed_nodes,
-    )
-    solver = FEMSolver(
-        bodies=[body],
-        gravity=np.array([0.0, 0.0, -9.81]),
-        damping=0.5,
-    )
+    if solver_mode == "cb":
+        body = CraigBamptonBody(
+            mesh=mesh,
+            material=material,
+            density=1000.0,
+            n_modes=n_modes_cb,
+            fixed_nodes=fixed_nodes,
+            gravity=np.array([0.0, 0.0, -9.81]),
+            damping=0.5,
+            name="cantilever",
+        )
+        solver = CraigBamptonSolver(bodies=[body])
+    else:
+        body = DeformableBody(
+            name="cantilever",
+            mesh=mesh,
+            material=material,
+            density=1000.0,
+            fixed_nodes=fixed_nodes,
+        )
+        solver = FEMSolver(
+            bodies=[body],
+            gravity=np.array([0.0, 0.0, -9.81]),
+            damping=0.5,
+        )
     solver.initialize(dt=0.005)
 
+    print(f"Solver: {solver_mode.upper()}"
+          + (f"  n_modes={n_modes_cb}  n_r={body._n_r}" if solver_mode == "cb" else ""))
     print(f"Element type: {etype_str.upper()}")
     print(f"Mesh: {mesh.n_nodes} nodes, {mesh.n_elements} elements")
     print(f"DOFs: {mesh.n_nodes * 3}")
@@ -251,8 +277,8 @@ def main():
         fps = 1000.0 / avg_ms if avg_ms > 0 else 0
 
         gui = window.get_gui()
-        with gui.sub_window("Info", x=0.01, y=0.01, width=0.45, height=0.33):
-            gui.text(f"t={solver.time:.3f}s  FPS:{fps:.0f}")
+        with gui.sub_window("Info", x=0.01, y=0.01, width=0.45, height=0.38):
+            gui.text(f"Solver: {solver_mode.upper()}  t={solver.time:.3f}s  FPS:{fps:.0f}")
             gui.text(f"Tip: {tip_dz*1000:.2f}mm (analytical: {delta_analytical*1000:.1f}mm)")
             if need_stress:
                 gui.text(f"Stress: 0 ~ {vm_max:.0f} Pa")

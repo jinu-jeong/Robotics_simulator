@@ -6,8 +6,10 @@ URDF 메시 렌더링, mimic 관절, mesh-box 충돌, 다중 강체 접촉을 �
 실행:
   python examples/grasp_demo.py                       # GUI primitive
   python examples/grasp_demo.py --mode fem             # GUI FEM (변형 박스)
+  python examples/grasp_demo.py --mode cb              # GUI C-B reduced FEM
   python examples/grasp_demo.py --headless             # headless primitive
   python examples/grasp_demo.py --headless --mode fem  # headless FEM
+  python examples/grasp_demo.py --headless --mode cb   # headless C-B reduced FEM
 
 조작 (GUI): 좌클릭 드래그(회전), W/S(줌), ESC(종료)
 """
@@ -49,101 +51,134 @@ def interpolate_q(q_start, q_end, t, duration):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Analytical finger-box forces (primitive mode only)
+# Position-projection finger-box contact (primitive mode)
 # ═══════════════════════════════════════════════════════════════════
 
-def compute_finger_box_forces(
-    robot, fk, target_box, box_solver,
-    stiffness=5e3, damping=200, friction_mu=0.6,
-    box_fk=None,
-):
-    """Analytical parallel-jaw grasp forces (primitive mode)."""
-    from robosim.physics.contact.solver import _link_point_velocity
+def _project_finger_generic(robot, fk, box_center, box_rot, box_half, on_push_box):
+    """Core position-projection engine shared by rigid-box and FEM modes.
 
-    if box_fk is None:
-        box_fk = target_box.forward_kinematics()
+    Parameters
+    ----------
+    box_center  : (3,) world-frame centre of the effective contact box
+    box_rot     : (3,3) box orientation (identity for axis-aligned FEM AABB)
+    box_half    : (3,) half-extents of the contact box
+    on_push_box : callable(shift: float, grip_axis: ndarray)
+                  Translates the box by ``shift * grip_axis`` and clamps
+                  its re-penetrating velocity.  Called only when |shift|>0.
+
+    Returns
+    -------
+    (left_c, right_c, b_ext_grip, grip_axis)
+    """
+    hand_idx = robot.link_index("panda_hand")
+    hand_R = fk[hand_idx].rotation
+    grip_axis = hand_R[:, 1]
+    side_axes = [hand_R[:, 0], hand_R[:, 2]]
+
+    b_ext_grip = sum(box_half[k] * abs(np.dot(box_rot[:, k], grip_axis))
+                     for k in range(3))
+    TOUCH = 0.0
+
+    def _overlap(fname):
+        link_idx = robot.link_index(fname)
+        col = robot.links[link_idx].collisions[0]
+        T_col = fk[link_idx].compose(col.origin)
+        fc, fR = T_col.translation, T_col.rotation
+
+        verts = col.geometry.mesh_vertices
+        if verts is not None:
+            v_min = verts.min(axis=0)
+            v_max = verts.max(axis=0)
+            mesh_center_local = (v_min + v_max) * 0.5
+            fh = (v_max - v_min) * 0.5
+        else:
+            mesh_center_local = np.array([7.68e-6, 0.01314, 0.02699])
+            fh = np.array([0.01049, 0.01327, 0.02686])
+        fc = fc + fR @ mesh_center_local  # shift to actual mesh centre
+
+        d_to_box = fc - box_center
+        d_grip = np.dot(d_to_box, grip_axis)
+        f_ext = sum(abs(np.dot(fR[:, k], grip_axis)) * fh[k] for k in range(3))
+        for ax in side_axes:
+            d_ax = abs(np.dot(d_to_box, ax))
+            fe = sum(abs(np.dot(fR[:, k], ax)) * fh[k] for k in range(3))
+            be = sum(box_half[k] * abs(np.dot(box_rot[:, k], ax)) for k in range(3))
+            if d_ax > fe + be:
+                return -np.inf, 1.0
+        return f_ext + b_ext_grip - abs(d_grip), (1.0 if d_grip >= 0 else -1.0)
+
+    ov_l, sl = _overlap("panda_leftfinger")
+    ov_r, sr = _overlap("panda_rightfinger")
+
+    box_shift = 0.0
+    q7_corr   = 0.0
+
+    if ov_l >= 0 and ov_r >= 0 and (ov_l > 0 or ov_r > 0):
+        box_shift = (ov_r - ov_l) * 0.5
+        q7_corr   = (ov_l + ov_r) * 0.5
+    elif ov_r > 0:
+        push_cap  = -ov_l
+        box_shift = min(ov_r, push_cap)
+        q7_corr   = max(0.0, ov_r - push_cap)
+    elif ov_l > 0:
+        push_cap  = -ov_r
+        box_shift = -min(ov_l, push_cap)
+        q7_corr   = max(0.0, ov_l - push_cap)
+
+    if abs(box_shift) > 1e-9:
+        on_push_box(box_shift, grip_axis)
+
+    if q7_corr > 1e-9:
+        robot.q[7] += q7_corr
+        robot.qd[7] = 0.0
+    robot.enforce_mimic()
+
+    ov_l_f = ov_l + box_shift - q7_corr
+    ov_r_f = ov_r - box_shift - q7_corr
+    return (ov_l_f >= -TOUCH), (ov_r_f >= -TOUCH), b_ext_grip, grip_axis
+
+
+def _project_finger_box(robot, fk, target_box, box_fk):
+    """Position projection against a rigid free-body box."""
     box_body_idx = len(target_box.links) - 1
     T_box = box_fk[box_body_idx]
-    box_center = T_box.translation
-    box_half = np.array(BOX_SIZE) / 2.0
-    fh = np.array([0.021, 0.026, 0.054]) / 2.0
 
-    finger_data = {}
-    for fname, sign in [("panda_leftfinger", -1), ("panda_rightfinger", +1)]:
-        idx = robot.link_index(fname)
-        col = robot.links[idx].collisions[0]
-        T_col = fk[idx].compose(col.origin)
-        fc = T_col.translation
-        fR = T_col.rotation
+    def on_push(shift, grip_ax):
+        target_box.q[:3] += shift * grip_ax
+        v_n = float(np.dot(target_box.qd[:3], grip_ax))
+        if (shift > 0 and v_n < 0) or (shift < 0 and v_n > 0):
+            target_box.qd[:3] -= v_n * grip_ax
 
-        y_ext = sum(abs(fR[:, k][1]) * fh[k] for k in range(3))
-        f_y_min = fc[1] - y_ext
-        f_y_max = fc[1] + y_ext
-        b_y_min = box_center[1] - box_half[1]
-        b_y_max = box_center[1] + box_half[1]
-        overlap_y = min(f_y_max, b_y_max) - max(f_y_min, b_y_min)
-        if overlap_y <= 0:
-            continue
+    return _project_finger_generic(
+        robot, fk,
+        T_box.translation, T_box.rotation, np.array(BOX_SIZE) / 2.0,
+        on_push,
+    )
 
-        ok = True
-        for ax in [0, 2]:
-            f_ext = sum(abs(fR[:, k][ax]) * fh[k] for k in range(3))
-            if abs(fc[ax] - box_center[ax]) > f_ext + box_half[ax]:
-                ok = False
-                break
-        if not ok:
-            continue
-        finger_data[fname] = (idx, fc, fR, overlap_y, sign)
 
-    if len(finger_data) < 2:
-        return {}, np.zeros(6)
+def _project_finger_fem(robot, fk, fem_body):
+    """Position projection against a FEM deformable mesh.
 
-    finger_wrenches = {}
-    box_wrench = np.zeros(6)
+    Uses the mesh's current AABB as the effective contact box, so it works
+    even when the box has deformed under gripping forces.
+    Asymmetric corrections rigidly translate all nodes (no strain introduced).
+    """
+    nodes = fem_body.x   # (n_nodes, 3) — current node world positions
+    box_center = (nodes.min(axis=0) + nodes.max(axis=0)) * 0.5
 
-    for fname, (idx, fc, fR, overlap_y, sign) in finger_data.items():
-        pen = min(overlap_y, 0.01)
-        contact_y = (box_center[1] + box_half[1]) if sign > 0 else (box_center[1] - box_half[1])
-        contact_pt = np.array([box_center[0], contact_y, box_center[2]])
-        normal = np.array([0.0, float(sign), 0.0])
+    def on_push(shift, grip_ax):
+        fem_body.x += shift * grip_ax          # rigid translation of all nodes
+        v_mean_n = float(np.mean(fem_body.v @ grip_ax))
+        if (shift > 0 and v_mean_n < 0) or (shift < 0 and v_mean_n > 0):
+            fem_body.v -= v_mean_n * grip_ax   # clamp mean re-penetrating velocity
 
-        v_finger = _link_point_velocity(robot, idx, contact_pt, fk=fk)
-        v_box = _link_point_velocity(target_box, box_body_idx, contact_pt, fk=box_fk)
-        v_rel = v_finger - v_box
-        v_n = float(np.dot(v_rel, normal))
+    return _project_finger_generic(
+        robot, fk,
+        box_center, np.eye(3), np.array(BOX_SIZE) / 2.0,
+        on_push,
+    )
 
-        eff_mass = min(robot.links[idx].mass,
-                       target_box.links[box_body_idx].mass)
-        c = min(damping, 2.0 * np.sqrt(stiffness * eff_mass))
 
-        fn_mag = stiffness * pen - c * v_n
-        if fn_mag <= 0:
-            continue
-        f_normal = fn_mag * normal
-
-        friction_ramp = min(1.0, pen / 0.005)
-        effective_mu = friction_mu * friction_ramp
-        v_t = v_rel - v_n * normal
-        v_t_norm = np.linalg.norm(v_t)
-        f_friction = np.zeros(3)
-        if v_t_norm > 1e-12:
-            scale = min(1.0, v_t_norm / 1e-3)
-            f_friction = -effective_mu * fn_mag * scale * (v_t / v_t_norm)
-
-        f_on_finger = f_normal + f_friction
-        f_on_box = -f_on_finger
-
-        T_inv = fk[idx].inverse()
-        fl = T_inv.apply_vector(f_on_finger)
-        pl = T_inv.apply_point(contact_pt)
-        finger_wrenches[idx] = np.concatenate([np.cross(pl, fl), fl])
-
-        T_inv_b = box_fk[box_body_idx].inverse()
-        fb = T_inv_b.apply_vector(f_on_box)
-        pb = T_inv_b.apply_point(contact_pt)
-        box_wrench += np.concatenate([np.cross(pb, fb), fb])
-
-    return finger_wrenches, box_wrench
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -159,27 +194,6 @@ def setup_physics(mode="primitive"):
     robot = parse_urdf(str(PANDA_URDF))
     robot.gravity = np.array([0.0, 0.0, -9.81])
     hand_idx = robot.link_index("panda_hand")
-
-    from robosim.model.geometry import Geometry
-    from robosim.model.link import Collision
-    from robosim.math.transforms import Transform
-    finger_box_size = (0.021, 0.026, 0.054)
-    finger_origins = {
-        "panda_leftfinger": Transform(
-            translation=np.array([0.0, 0.013, 0.027]),
-            rotation=np.eye(3),
-        ),
-        "panda_rightfinger": Transform(
-            translation=np.array([0.0, -0.013, 0.027]),
-            rotation=np.eye(3),
-        ),
-    }
-    for finger_name, origin in finger_origins.items():
-        idx = robot.link_index(finger_name)
-        robot.links[idx].collisions = [Collision(
-            geometry=Geometry.box(*finger_box_size),
-            origin=origin,
-        )]
 
     robot.q = GRASP_Q.copy()
     robot.enforce_mimic()
@@ -237,6 +251,7 @@ def setup_physics(mode="primitive"):
         kp=kp, kd=kd, max_tau=max_tau,
         hand_idx=hand_idx, box_pos=box_pos, table_pos=table_pos,
         get_target_q=get_target_q,
+        _finger_contacts=(False, False),
     )
 
     # ── Mode-specific box setup ──
@@ -248,17 +263,8 @@ def setup_physics(mode="primitive"):
         box_solver = RBDSolver(robot=target_box)
         box_solver.initialize(dt=dt)
 
-        box_table_params = ContactParams(stiffness=5e3, damping=200, friction_mu=0.6)
-        box_table_contact = ContactSolver(
-            ground=GroundPlane(height=TABLE_HEIGHT),
-            params=box_table_params,
-        )
-        box_table_contact.register_rbd(box_solver, robot_id="target_box")
-
         ctx.update(
             target_box=target_box, box_solver=box_solver,
-            box_table_contact=box_table_contact,
-            box_table_params=box_table_params,
         )
         print(f"Table: static at z={TABLE_HEIGHT}m, Box: rigid 0.2 kg")
 
@@ -276,13 +282,13 @@ def setup_physics(mode="primitive"):
         fem_body = DeformableBody(
             name="fem_box",
             mesh=mesh,
-            material=CorotationalElastic(young=5e4, poisson=0.3),
+            material=CorotationalElastic(young=1e4, poisson=0.3),
             density=1000.0,
         )
         fem_solver = FEMSolver(
             bodies=[fem_body],
             gravity=np.array([0.0, 0.0, -9.81]),
-            damping=0.05,
+            damping=20.0,   # heavy Rayleigh damping — damps rigid-body rotation in ~2s
             max_newton_iters=3,
         )
         fem_solver.initialize(dt=dt)
@@ -298,14 +304,60 @@ def setup_physics(mode="primitive"):
 
         surface_tri = mesh.extract_surface()
 
+        surface_nodes = np.unique(surface_tri)   # indices of surface nodes
         ctx.update(
             fem_solver=fem_solver, fem_body=fem_body,
             fem_ground_contact=fem_ground_contact,
             surface_tri=surface_tri,
+            surface_nodes=surface_nodes,
         )
         print(f"Table: static at z={TABLE_HEIGHT}m, "
               f"Box: FEM {mesh.n_nodes} nodes, {mesh.n_elements} tets, "
-              f"E=5e4")
+              f"E=1e4")
+
+    elif mode == "cb":
+        from robosim.physics.fem.mesh import TetMesh
+        from robosim.physics.fem.materials import CorotationalElastic
+        from robosim.physics.fem.reduced import CraigBamptonBody, CraigBamptonSolver
+
+        fem_origin = box_pos - np.array(BOX_SIZE) / 2.0
+        mesh = TetMesh.create_box(
+            origin=fem_origin,
+            size=np.array(BOX_SIZE),
+            divisions=(3, 3, 3),
+        )
+        fem_body = CraigBamptonBody(
+            mesh=mesh,
+            material=CorotationalElastic(young=1e4, poisson=0.3),
+            density=1000.0,
+            n_modes=6,
+            gravity=np.array([0.0, 0.0, -9.81]),
+            damping=20.0,
+            name="cb_box",
+        )
+        fem_solver = CraigBamptonSolver(bodies=[fem_body])
+        fem_solver.initialize(dt=dt)
+
+        # Register with robot contact solver (duck-types as FEMSolver)
+        contact.register_fem(fem_solver)
+
+        # Separate ground contact for FEM at table height
+        fem_ground_contact = ContactSolver(
+            ground=GroundPlane(height=TABLE_HEIGHT),
+            params=ContactParams(),
+        )
+
+        surface_tri = mesh.extract_surface()
+        surface_nodes = np.unique(surface_tri)   # indices of surface nodes
+        ctx.update(
+            fem_solver=fem_solver, fem_body=fem_body,
+            fem_ground_contact=fem_ground_contact,
+            surface_tri=surface_tri,
+            surface_nodes=surface_nodes,
+        )
+        print(f"Table: static at z={TABLE_HEIGHT}m, "
+              f"Box: C-B {mesh.n_nodes} nodes, {mesh.n_elements} tets, "
+              f"n_r={fem_body._n_r} ({fem_body._n_b} bdry + {fem_body._n_modes_actual} modes)")
 
     return ctx
 
@@ -314,8 +366,8 @@ def setup_physics(mode="primitive"):
 # Physics step — primitive (rigid body box)
 # ═══════════════════════════════════════════════════════════════════
 
-def step_physics_primitive(ctx, sim_time, grasp_k=5e3, grasp_c=200, grasp_mu=0.6):
-    """One frame of primitive (rigid box) physics."""
+def step_physics_primitive(ctx, sim_time):
+    """One frame of primitive (rigid box) physics — position-projection contact."""
     from robosim.physics.contact.solver import _link_point_velocity
 
     robot = ctx["robot"]
@@ -323,75 +375,89 @@ def step_physics_primitive(ctx, sim_time, grasp_k=5e3, grasp_c=200, grasp_mu=0.6
     arm_solver = ctx["arm_solver"]
     box_solver = ctx["box_solver"]
     contact = ctx["contact"]
-    box_table_contact = ctx["box_table_contact"]
     kp, kd, max_tau = ctx["kp"], ctx["kd"], ctx["max_tau"]
     dt = ctx["dt"]
     get_target_q = ctx["get_target_q"]
-    finger_dof = [7, 8]
     box_body_idx = len(target_box.links) - 1
-
-    ctx["contact_params"].stiffness = grasp_k
-    ctx["contact_params"].damping = grasp_c
-    ctx["contact_params"].friction_mu = grasp_mu
-    ctx["box_table_params"].stiffness = grasp_k
-    ctx["box_table_params"].damping = grasp_c
+    hand_idx = ctx["hand_idx"]
+    l_idx = robot.link_index("panda_leftfinger")
+    r_idx = robot.link_index("panda_rightfinger")
+    table_min_z = TABLE_HEIGHT + BOX_SIZE[2] / 2.0
 
     phase_name = "home"
     for _ in range(ctx["substeps"]):
         q_des, phase_name = get_target_q(sim_time)
 
+        # 1. PD control + gravity compensation
         tau = kp * (q_des - robot.q) + kd * (-robot.qd)
         tau += arm_solver.compute_gravity_torques()
         tau = np.clip(tau, -max_tau, max_tau)
         arm_solver.tau = tau
 
+        # 2. Ground contact forces + arm dynamics step
         panda_ground = contact.compute_rbd_contact_forces(arm_solver)
-        box_table_forces = box_table_contact.compute_rbd_contact_forces(box_solver)
-
-        fk_now = robot.forward_kinematics()
-        box_fk_now = target_box.forward_kinematics()
-        if phase_name in ("close", "lift", "hold", "done"):
-            finger_wrenches, box_grasp_wrench = compute_finger_box_forces(
-                robot, fk_now, target_box, box_solver,
-                stiffness=grasp_k, damping=grasp_c, friction_mu=grasp_mu,
-                box_fk=box_fk_now,
-            )
-        else:
-            finger_wrenches, box_grasp_wrench = {}, np.zeros(6)
-
         arm_solver.clear_external_forces()
-        panda_forces = dict(panda_ground)
-        for li, w in finger_wrenches.items():
-            panda_forces[li] = panda_forces.get(li, np.zeros(6)) + w
-        for li, w in panda_forces.items():
+        for li, w in panda_ground.items():
             arm_solver.set_external_force(li, w)
         arm_solver.step()
 
-        for fi in finger_dof:
-            robot.q[fi] = q_des[fi]
-            robot.qd[fi] = 0.0
-        robot.enforce_mimic()
+        # 3. Position projection: push master finger joint outward to eliminate
+        #    any box penetration. enforce_mimic() inside _project_finger_box
+        #    keeps the follower joint consistent.
+        #    Active from "reach" onward so any accidental contact during approach
+        #    is also resolved (fingers are wide open then, so no false triggers).
+        fk_now = robot.forward_kinematics()
+        box_fk_now = target_box.forward_kinematics()
 
-        if len(finger_wrenches) == 2:
-            _l_idx = robot.link_index("panda_leftfinger")
-            _r_idx = robot.link_index("panda_rightfinger")
+        if phase_name not in ("home", "pre_grasp"):
+            left_c, right_c, b_ext_grip, grip_ax = _project_finger_box(
+                robot, fk_now, target_box, box_fk_now)
+            if left_c or right_c:
+                fk_now = robot.forward_kinematics()        # refresh after q correction
+                box_fk_now = target_box.forward_kinematics()  # refresh after box push
+        else:
+            left_c = right_c = False
+            b_ext_grip = float(np.array(BOX_SIZE)[1]) / 2.0   # fallback, unused
+            grip_ax = fk_now[hand_idx].rotation[:, 1]          # fallback, unused
+
+        ctx["_finger_contacts"] = (left_c, right_c)
+
+        # 4. Box dynamics
+        if left_c and right_c:
+            # Both fingers in contact: kinematic coupling — box tracks fingers.
+            # Velocity is evaluated at the actual contact points (box edges along
+            # the grip axis) rather than the box centre, which is more accurate
+            # when the wrist rotates during the lift.
             box_c = box_fk_now[box_body_idx].translation
-            vl = _link_point_velocity(robot, _l_idx, box_c, fk=fk_now)
-            vr = _link_point_velocity(robot, _r_idx, box_c, fk=fk_now)
+            cp_l = box_c + b_ext_grip * grip_ax   # left-finger contact point
+            cp_r = box_c - b_ext_grip * grip_ax   # right-finger contact point
+            vl = _link_point_velocity(robot, l_idx, cp_l, fk=fk_now)
+            vr = _link_point_velocity(robot, r_idx, cp_r, fk=fk_now)
             avg_v = 0.5 * (vl + vr)
             target_box.q[:3] += avg_v * dt
             target_box.qd[:3] = avg_v
             target_box.qd[3:] = 0.0
+
+            # Re-project after kinematic move to keep contact tight within the
+            # same substep (corrects any asymmetric drift between the two fingers).
+            box_fk_post = target_box.forward_kinematics()
+            _project_finger_box(robot, fk_now, target_box, box_fk_post)
         else:
+            # No full grip: free fall + table
             box_solver.clear_external_forces()
             box_solver.tau = np.zeros(6)
-            combined = np.zeros(6)
-            for li, w in box_table_forces.items():
-                combined += w
-            combined += box_grasp_wrench
-            if np.any(combined != 0):
-                box_solver.set_external_force(box_body_idx, combined)
             box_solver.step()
+
+        # 5. Table constraint — inelastic, no bounce
+        if target_box.q[2] < table_min_z:
+            target_box.q[2] = table_min_z
+            if target_box.qd[2] < 0:
+                target_box.qd[2] = 0.0
+            v_xy = target_box.qd[:2]
+            v_mag = float(np.linalg.norm(v_xy))
+            if v_mag > 1e-6:
+                decel = min(0.5 * 9.81, v_mag / dt)
+                target_box.qd[:2] -= decel * (v_xy / v_mag) * dt
 
         sim_time += dt
 
@@ -402,72 +468,127 @@ def step_physics_primitive(ctx, sim_time, grasp_k=5e3, grasp_c=200, grasp_mu=0.6
 # Physics step — FEM (deformable box)
 # ═══════════════════════════════════════════════════════════════════
 
-def step_physics_fem(ctx, sim_time, d_hat=0.008, penalty_k=30.0, friction_mu=0.5):
-    """One frame of FEM (deformable box) physics."""
+def step_physics_fem(ctx, sim_time):
+    """One frame of FEM (deformable box) physics.
+
+    Finger contact uses the same position-projection + kinematic-coupling
+    strategy as primitive mode:
+      • Position projection (_project_finger_fem) prevents gross penetration
+        by clamping q[7] outward and rigidly translating FEM nodes.
+      • When both fingers contact, kinematic coupling translates all FEM nodes
+        with the average finger velocity (same rigid-body transport used for
+        the primitive box).  The FEM integrator is skipped during full contact
+        to avoid double-counting the transport displacement.
+      • When only one finger (or no finger) contacts, the FEM integrator runs
+        freely (gravity + elasticity + table ground contact).
+
+    Note: detect_rbd_fem skips MESH collision geometry, so the penalty-based
+    FEM contact path is not used for the finger STLs.  Position projection
+    handles all finger-box non-penetration.
+    """
+    from robosim.physics.contact.solver import _link_point_velocity
+
     robot = ctx["robot"]
     arm_solver = ctx["arm_solver"]
     contact = ctx["contact"]
     fem_solver = ctx["fem_solver"]
     fem_body = ctx["fem_body"]
     fem_ground_contact = ctx["fem_ground_contact"]
+    surface_nodes = ctx["surface_nodes"]
+    hand_idx = ctx["hand_idx"]
     kp, kd, max_tau = ctx["kp"], ctx["kd"], ctx["max_tau"]
     dt = ctx["dt"]
     get_target_q = ctx["get_target_q"]
-    finger_dof = [7, 8]
+    l_idx = robot.link_index("panda_leftfinger")
+    r_idx = robot.link_index("panda_rightfinger")
 
-    n_fem_contacts = 0
     phase_name = "home"
     for _ in range(ctx["substeps"]):
         q_des, phase_name = get_target_q(sim_time)
 
-        # 1. Robot PD + gravity comp
+        # 1. Robot PD + gravity comp (fingers PD-controlled, no kinematic override)
         tau = kp * (q_des - robot.q) + kd * (-robot.qd)
         tau += arm_solver.compute_gravity_torques()
         tau = np.clip(tau, -max_tau, max_tau)
         arm_solver.tau = tau
 
-        # 2. Robot ground contact
+        # 2. Robot ground contact + arm dynamics step
         panda_ground = contact.compute_rbd_contact_forces(arm_solver)
         arm_solver.clear_external_forces()
         for li, w in panda_ground.items():
             arm_solver.set_external_force(li, w)
         arm_solver.step()
 
-        # 3. Kinematic fingers
-        for fi in finger_dof:
-            robot.q[fi] = q_des[fi]
-            robot.qd[fi] = 0.0
-        robot.enforce_mimic()
+        # 3. Coarse AABB projection: keeps fingers from grossly penetrating the
+        #    FEM mesh and detects left/right contact state.
+        fk_now = robot.forward_kinematics()
+        if phase_name not in ("home", "pre_grasp"):
+            left_c, right_c, b_ext_grip, grip_ax = _project_finger_fem(
+                robot, fk_now, fem_body)
+            if left_c or right_c:
+                fk_now = robot.forward_kinematics()
+        else:
+            left_c = right_c = False
+            b_ext_grip = float(np.array(BOX_SIZE)[1]) / 2.0
+            grip_ax = fk_now[hand_idx].rotation[:, 1]
 
-        # 4. RBD-FEM contact forces (compute BEFORE FEM step)
-        fem_forces = contact.compute_rbd_fem_forces(
-            arm_solver, fem_solver,
-            d_hat=d_hat,
-            stiffness=penalty_k,
-            friction_mu=friction_mu,
-            damping_ratio=1.0,
-        )
-        n_fem_contacts = sum(
-            int(np.count_nonzero(f)) // 3
-            for f in fem_forces.values()
-        )
+        ctx["_finger_contacts"] = (left_c, right_c)
 
-        # 5. FEM step (implicit Euler with contact forces)
-        fem_solver.step(extra_forces=fem_forces if fem_forces else None)
+        # 4. Penalty contact forces: apply inward force to surface nodes on each
+        #    finger contact face, proportional to how much the PD controller
+        #    wants to close further (robot.q[7] − q_des[7]).  This drives
+        #    elastic deformation through the FEM integrator rather than hard
+        #    position snapping, so the elastic response is physically consistent.
+        #    k_press = 30 N/m per node gives ~3 mm squeeze for E=5e4.
+        f_contact = None
+        if left_c and right_c:
+            box_c_pre = fem_body.x.mean(axis=0)   # centroid — stable under deformation
+            cp_l = box_c_pre + b_ext_grip * grip_ax
+            cp_r = box_c_pre - b_ext_grip * grip_ax
+            vl = _link_point_velocity(robot, l_idx, cp_l, fk=fk_now)
+            vr = _link_point_velocity(robot, r_idx, cp_r, fk=fk_now)
+            avg_v = 0.5 * (vl + vr)
 
-        # 6. FEM ground contact at table height (post-step projection)
+            # Kinematic coupling: shift mean node velocity to arm transport.
+            v_mean = fem_body.v.mean(axis=0)
+            fem_body.v += (avg_v - v_mean)
+
+            press = max(0.0, float(robot.q[7] - q_des[7]))
+            if press > 1e-4:
+                k_press = 6.0           # N/(m·node) — tuned for E=1e4 (~3mm squeeze)
+                threshold = b_ext_grip * 0.5  # outer-half filter along grip axis
+                n_nodes = len(fem_body.x)
+                f_arr = np.zeros(n_nodes * 3)
+                for ni in surface_nodes:
+                    d = float(np.dot(fem_body.x[ni] - box_c_pre, grip_ax))
+                    if d > threshold:   # left-finger contact face
+                        f_arr[ni*3:ni*3+3] -= k_press * press * grip_ax
+                    elif d < -threshold:  # right-finger contact face
+                        f_arr[ni*3:ni*3+3] += k_press * press * grip_ax
+                f_contact = {0: f_arr}
+
+        # 5. FEM step: elastic + gravity (+ optional contact forces).
+        fem_solver.step(extra_forces=f_contact)
+
+        if left_c and right_c:
+            # Correct transport drift so the box centroid follows the arm precisely.
+            box_c_post = fem_body.x.mean(axis=0)
+            box_c_target = box_c_pre + avg_v * dt
+            fem_body.x += box_c_target - box_c_post
+
+        # 6. FEM ground contact at table height (restitution=0 → no bounce)
         fem_ground_contact.resolve_fem_contact(
-            fem_body, restitution=0.3, friction_mu=0.5)
+            fem_body, restitution=0.0, friction_mu=0.5)
 
         sim_time += dt
 
-    ctx["_n_fem_contacts"] = n_fem_contacts
+    ctx["_n_fem_contacts"] = int(left_c) + int(right_c)
     return sim_time, phase_name
 
 
 def step_physics(ctx, sim_time, **kwargs):
-    """Dispatch to primitive or FEM step."""
-    if ctx["mode"] == "fem":
+    """Dispatch to primitive or FEM/CB step."""
+    if ctx["mode"] in ("fem", "cb"):
         return step_physics_fem(ctx, sim_time, **kwargs)
     else:
         return step_physics_primitive(ctx, sim_time, **kwargs)
@@ -512,7 +633,7 @@ def run_headless(mode: str, n_frames: int = 1500):
                 box_z = ctx["fem_body"].x.mean(axis=0)[2]
 
             extra = ""
-            if mode == "fem":
+            if mode in ("fem", "cb"):
                 extra = f"  fem_contacts={ctx.get('_n_fem_contacts', 0)}"
 
             print(f"  frame {frame+1:5d}/{n_frames}  "
@@ -542,7 +663,7 @@ def run_headless(mode: str, n_frames: int = 1500):
     print(f"  Real-time:     {total_sim_time/wall_total:.2f}x")
     print(f"  Final box Z:   {box_z:.4f}m")
     finite_ok = np.all(np.isfinite(robot.q))
-    if mode == "fem":
+    if mode in ("fem", "cb"):
         finite_ok = finite_ok and np.all(np.isfinite(ctx["fem_body"].x))
     else:
         finite_ok = finite_ok and np.all(np.isfinite(ctx["target_box"].q))
@@ -580,6 +701,9 @@ def run_gui(mode: str):
 
     renderer = RobotRenderer(robot, viewer)
     renderer.setup()
+    # Only show finger collision meshes — the only links that directly
+    # contact the box (arm links only hit the ground plane).
+    renderer.set_contact_links(["panda_leftfinger", "panda_rightfinger"])
 
     # Table
     _table_geo = _Geo.box(0.30, 0.30, TABLE_HEIGHT)
@@ -594,6 +718,15 @@ def run_gui(mode: str):
         bv, bf = geometry_to_trimesh(box_body.visuals[0].geometry)
         viewer.add_mesh("target_box", bv + box_pos, bf,
                         color=np.array([0.9, 0.3, 0.2]))
+        # Collision mesh for target box (wireframe, hidden by default)
+        col = box_body.collisions[0]
+        cv, cf = geometry_to_trimesh(col.geometry)
+        col_mat = col.origin.to_matrix()
+        cv = (col_mat[:3, :3] @ cv.T).T + col_mat[:3, 3]
+        viewer.add_mesh("target_box_col", cv + box_pos, cf,
+                        color=np.array([0.2, 0.8, 0.3]))
+        viewer.set_meshes_wireframe_by_prefix("target_box_col", True)
+        viewer.set_mesh_visible("target_box_col", False)
     else:
         fem_body = ctx["fem_body"]
         surface_tri = ctx["surface_tri"]
@@ -602,14 +735,6 @@ def run_gui(mode: str):
 
     # UI
     panel = UIPanel("Grasp Controls")
-    if mode == "primitive":
-        panel.add_slider("Stiffness", 1e3, 2e4, 5e3)
-        panel.add_slider("Damping", 50, 1000, 200)
-        panel.add_slider("Friction", 0.1, 1.5, 0.6)
-    else:
-        panel.add_slider("Contact d_hat", 0.002, 0.02, 0.008)
-        panel.add_slider("Penalty K", 5.0, 200.0, 30.0)
-        panel.add_slider("Friction", 0.1, 1.5, 0.5)
     panel.add_checkbox("Show Forces", False)
     panel.add_checkbox("Show Collision", False)
 
@@ -625,23 +750,13 @@ def run_gui(mode: str):
         nonlocal sim_time, frame_count
 
         force_overlay.active = panel.get_bool("Show Forces")
-        renderer.show_collision(panel.get_bool("Show Collision"))
+        show_col = panel.get_bool("Show Collision")
+        renderer.show_collision(show_col)
 
         import time as _t
         panel.playback.update_fps(_t.time())
 
-        if mode == "primitive":
-            kwargs = dict(
-                grasp_k=panel.get("Stiffness"),
-                grasp_c=panel.get("Damping"),
-                grasp_mu=panel.get("Friction"),
-            )
-        else:
-            kwargs = dict(
-                d_hat=panel.get("Contact d_hat"),
-                penalty_k=panel.get("Penalty K"),
-                friction_mu=panel.get("Friction"),
-            )
+        kwargs = {}
 
         sim_time_new, phase_name = step_physics(ctx, sim_time, **kwargs)
         sim_time = sim_time_new
@@ -655,10 +770,15 @@ def run_gui(mode: str):
             fk_b = target_box.forward_kinematics()
             T_box = fk_b[len(target_box.links) - 1]
             mat = T_box.to_matrix()
-            viewer.update_mesh_vertices("target_box",
-                                        (mat[:3, :3] @ bv.T).T + mat[:3, 3])
+            R, t = mat[:3, :3], mat[:3, 3]
+            viewer.update_mesh_vertices("target_box", (R @ bv.T).T + t)
+            viewer.set_mesh_visible("target_box", not show_col)
+            viewer.update_mesh_vertices("target_box_col", (R @ cv.T).T + t)
+            viewer.set_mesh_visible("target_box_col", show_col)
             box_z = target_box.q[2]
-            extra_info = f"Contacts: {len(contact.last_forces)}"
+            left_c, right_c = ctx.get("_finger_contacts", (False, False))
+            grip_str = ("L" if left_c else "-") + ("R" if right_c else "-")
+            extra_info = f"Grip: {grip_str}  Ground: {len(contact.last_forces)}"
         else:
             viewer.update_mesh_vertices("fem_box", ctx["fem_body"].x)
             box_z = ctx["fem_body"].x.mean(axis=0)[2]
@@ -692,12 +812,14 @@ def run_gui(mode: str):
     print(f"Simulated {sim_time:.2f}s in {frame_count} frames")
 
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Panda gripper grasp demo")
     parser.add_argument(
-        "--mode", choices=["primitive", "fem"], default="primitive",
-        help="Box type: 'primitive' (rigid) or 'fem' (deformable)")
+        "--mode", choices=["primitive", "fem", "cb"], default="primitive",
+        help="Box type: 'primitive' (rigid), 'fem' (full deformable), "
+             "or 'cb' (Craig-Bampton reduced deformable)")
     parser.add_argument(
         "--headless", action="store_true",
         help="Run without visualization (physics only)")
