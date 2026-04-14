@@ -181,6 +181,120 @@ def _resolve_box_ground(
         robot.qd[3:6] = omega                 # fallback (near gimbal-lock)
 
 
+def _resolve_rbd_pair(
+    robot_a,
+    robot_b,
+    box_half: float,
+    restitution: float = 0.3,
+    friction_mu: float = 0.4,
+) -> bool:
+    """SAT OBB-OBB contact detection + per-contact impulse response.
+
+    Uses the existing box_box() SAT function in robosim.physics.contact.sdf.
+    Both boxes get equal-and-opposite impulses (Newton's 3rd law).
+    Position correction split by inverse-mass ratio.
+
+    Returns True if at least one contact was resolved.
+    """
+    from robosim.physics.contact.sdf import box_box as _box_box
+
+    fk_a = robot_a.forward_kinematics()
+    fk_b = robot_b.forward_kinematics()
+    T_a, T_b = fk_a[-1], fk_b[-1]
+
+    c_a, R_a = T_a.translation.copy(), T_a.rotation
+    c_b, R_b = T_b.translation.copy(), T_b.rotation
+    hs = np.full(3, box_half)
+
+    contacts = _box_box(c_a, R_a, hs, c_b, R_b, hs)
+    if not contacts:
+        return False
+
+    link_a, link_b = robot_a.links[-1], robot_b.links[-1]
+    m_a, m_b = float(link_a.inertial.mass), float(link_b.inertial.mass)
+
+    I_w_a = R_a @ link_a.inertial.inertia @ R_a.T
+    I_w_b = R_b @ link_b.inertial.inertia @ R_b.T
+    I_inv_a = np.linalg.inv(I_w_a)
+    I_inv_b = np.linalg.inv(I_w_b)
+
+    J_a = _angular_velocity_jacobian(float(robot_a.q[3]), float(robot_a.q[4]))
+    J_b = _angular_velocity_jacobian(float(robot_b.q[3]), float(robot_b.q[4]))
+
+    v_a = robot_a.qd[0:3].copy()
+    v_b = robot_b.qd[0:3].copy()
+    w_a = J_a @ robot_a.qd[3:6]
+    w_b = J_b @ robot_b.qd[3:6]
+
+    # mass-ratio weights for position projection
+    alpha = m_b / (m_a + m_b)   # A moves this fraction along normal
+    beta  = m_a / (m_a + m_b)   # B moves this fraction against normal
+
+    resolved = False
+    for cp in contacts:
+        pen = float(cp.penetration)
+        if pen <= 0.0:
+            continue
+
+        n = cp.normal          # points from B → A
+        pt = 0.5 * (cp.point_a + cp.point_b)
+
+        # ── Position projection ───────────────────────────────────────
+        robot_a.q[0:3] += alpha * pen * n
+        robot_b.q[0:3] -= beta  * pen * n
+        c_a += alpha * pen * n
+        c_b -= beta  * pen * n
+
+        r_a = pt - c_a         # update lever arms
+        r_b = pt - c_b
+
+        # ── Velocity impulse ──────────────────────────────────────────
+        v_contact_a = v_a + np.cross(w_a, r_a)
+        v_contact_b = v_b + np.cross(w_b, r_b)
+        v_rel = v_contact_a - v_contact_b
+        v_rel_n = float(np.dot(v_rel, n))
+
+        if v_rel_n < 0.0:      # approaching — apply impulse
+            r_axn = np.cross(r_a, n)
+            r_bxn = np.cross(r_b, n)
+            denom = (1.0/m_a + float(r_axn @ I_inv_a @ r_axn) +
+                     1.0/m_b + float(r_bxn @ I_inv_b @ r_bxn))
+            j_n = -(1.0 + restitution) * v_rel_n / denom
+
+            v_a  += j_n * n / m_a;  w_a += I_inv_a @ (j_n * r_axn)
+            v_b  -= j_n * n / m_b;  w_b -= I_inv_b @ (j_n * r_bxn)
+
+            # Friction
+            v_rel2   = (v_a + np.cross(w_a, r_a)) - (v_b + np.cross(w_b, r_b))
+            v_t      = v_rel2 - float(np.dot(v_rel2, n)) * n
+            v_t_mag  = float(np.linalg.norm(v_t))
+            if v_t_mag > 1e-6:
+                t_hat  = v_t / v_t_mag
+                r_axt  = np.cross(r_a, t_hat)
+                r_bxt  = np.cross(r_b, t_hat)
+                denom_t = (1.0/m_a + float(r_axt @ I_inv_a @ r_axt) +
+                           1.0/m_b + float(r_bxt @ I_inv_b @ r_bxt))
+                j_t = min(v_t_mag / denom_t, friction_mu * abs(j_n))
+                v_a -= j_t * t_hat / m_a;  w_a -= I_inv_a @ (j_t * r_axt)
+                v_b += j_t * t_hat / m_b;  w_b += I_inv_b @ (j_t * r_bxt)
+
+        resolved = True
+
+    # ── Write back ────────────────────────────────────────────────────
+    robot_a.qd[0:3] = v_a
+    robot_b.qd[0:3] = v_b
+    try:
+        robot_a.qd[3:6] = np.linalg.solve(J_a, w_a)
+    except np.linalg.LinAlgError:
+        robot_a.qd[3:6] = w_a
+    try:
+        robot_b.qd[3:6] = np.linalg.solve(J_b, w_b)
+    except np.linalg.LinAlgError:
+        robot_b.qd[3:6] = w_b
+
+    return resolved
+
+
 # ─────────────────────────────────────────────
 # von Mises stress → 색상 (FEM/CB 공용)
 # ─────────────────────────────────────────────
@@ -255,10 +369,15 @@ def run_rbd_drop(num_boxes: int, tilt_deg: float, seed: int) -> None:
             # 1. RBD dynamics (gravity handled internally by ABA)
             for solver_i in solvers:
                 solver_i.step()
-            # 2. Impulse-based ground contact (position projection + velocity impulse)
+            # 2. Ground contact (impulse-based, no energy injection)
             for robot in robots:
                 _resolve_box_ground(robot, SIDE / 2,
                                     restitution=0.15, friction_mu=0.4)
+            # 3. Box-box collision (SAT OBB + impulse)
+            for ia in range(num_boxes):
+                for ib in range(ia + 1, num_boxes):
+                    _resolve_rbd_pair(robots[ia], robots[ib], SIDE / 2,
+                                      restitution=0.25, friction_mu=0.4)
             sim_time[0] += DT
 
         phys_ms = (time.perf_counter() - t0) * 1000
@@ -365,6 +484,8 @@ def run_deformable_drop(mode: str, num_boxes: int,
     solver.initialize(dt=DT)
 
     contact = ContactSolver(ground=GroundPlane(height=0.0))
+    # Register FEM surface colliders for body-body collision
+    contact.register_fem(solver)
 
     mode_str = "C-B" if use_cb else "FEM"
     title = (f"RoboSim — Drop Test [{mode_str}]  "
@@ -388,8 +509,14 @@ def run_deformable_drop(mode: str, num_boxes: int,
 
         for _ in range(SUBSTEPS):
             solver.step()
+            # Ground contact (per body, impulse-based)
             for body in bodies:
                 contact.resolve_fem_contact(body, restitution=0.3, friction_mu=0.5)
+            # Body-body contact (node-face proximity, impulse-based)
+            if num_boxes > 1:
+                contact.resolve_fem_fem_all(solver,
+                                            restitution=0.1, friction_mu=0.5,
+                                            d_hat=0.005)
 
         phys_ms = (time.perf_counter() - t0) * 1000
 

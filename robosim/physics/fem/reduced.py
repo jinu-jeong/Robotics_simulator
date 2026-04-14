@@ -248,6 +248,7 @@ class CraigBamptonBody:
         m_total = np.sum([M_diag[n * 3] for n in range(n_nodes)])
 
         # ── Store ────────────────────────────────────────────────────
+        self._M = M0          # sparse mass matrix — needed by FEM-FEM contact
         self._Phi_CB = Phi_CB
         self._K_r = K_r
         self._M_r = M_r
