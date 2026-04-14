@@ -73,6 +73,115 @@ def _color(i: int) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────
+# RBD impulse-based ground contact helpers
+# ─────────────────────────────────────────────
+
+def _angular_velocity_jacobian(q3: float, q4: float) -> np.ndarray:
+    """3×3 Jacobian J_ω: ω_world = J_ω @ qd[3:6].
+
+    For the x-y-z Euler chain used by create_free_box (rx → ry → rz joints):
+      col 0: joint_rx world axis = [1, 0, 0]
+      col 1: joint_ry world axis = Rx(q3) @ [0, 1, 0]
+      col 2: joint_rz world axis = Rx(q3) @ Ry(q4) @ [0, 0, 1]
+    """
+    c3, s3 = np.cos(q3), np.sin(q3)
+    c4, s4 = np.cos(q4), np.sin(q4)
+    return np.array([
+        [1.0,  0.0,    s4],
+        [0.0,  c3,  -s3 * c4],
+        [0.0,  s3,   c3 * c4],
+    ])
+
+
+def _resolve_box_ground(
+    robot,
+    box_half: float,
+    restitution: float = 0.15,
+    friction_mu: float = 0.4,
+) -> None:
+    """Position projection + per-corner rigid-body impulse for ground contact.
+
+    Ground plane at z = 0.  Replaces penalty-spring ContactSolver which
+    injects energy at high impact velocities.
+    """
+    fk = robot.forward_kinematics()
+    T  = fk[-1]
+    R  = T.rotation      # (3,3) body → world
+    p0 = T.translation   # (3,) CoM world position
+
+    hs = box_half
+    # 8 corners in body frame, vectorised
+    sgn = np.array([-1.0, 1.0])
+    sx, sy, sz = np.meshgrid(sgn, sgn, sgn, indexing="ij")
+    corners_body = np.column_stack([
+        sx.ravel() * hs, sy.ravel() * hs, sz.ravel() * hs
+    ])                                            # (8, 3)
+    corners_world = corners_body @ R.T + p0       # (8, 3)
+
+    pens = np.maximum(0.0, -corners_world[:, 2])  # penetration depth ≥ 0
+    max_pen = float(pens.max())
+    if max_pen < 1e-12:
+        return
+
+    # ── 1. Position projection ────────────────────────────────────────
+    robot.q[2] += max_pen
+    p0 = p0.copy()
+    p0[2] += max_pen
+    corners_world[:, 2] += max_pen   # update for lever-arm calc
+
+    # ── 2. Velocity impulse at each penetrating corner ────────────────
+    link   = robot.links[-1]
+    m      = float(link.inertial.mass)
+    if m < 1e-12:
+        return
+    I_body  = link.inertial.inertia           # (3,3) body-frame (diagonal)
+    I_world = R @ I_body @ R.T               # world-frame inertia tensor
+    I_inv   = np.linalg.inv(I_world)
+
+    # Current velocities
+    v_com = robot.qd[0:3].copy()
+    J_w   = _angular_velocity_jacobian(float(robot.q[3]), float(robot.q[4]))
+    omega = J_w @ robot.qd[3:6]              # world-frame angular velocity
+
+    n = np.array([0.0, 0.0, 1.0])            # ground normal (upward)
+
+    for ci in np.where(pens > 1e-4)[0]:
+        r   = corners_world[ci] - p0         # lever arm (post-projection)
+        v_c = v_com + np.cross(omega, r)
+        v_n = float(np.dot(v_c, n))
+        if v_n >= 0.0:
+            continue                          # corner already separating
+
+        # Normal impulse magnitude
+        rxn   = np.cross(r, n)
+        denom = 1.0 / m + float(rxn @ I_inv @ rxn)
+        j_n   = -(1.0 + restitution) * v_n / denom
+
+        v_com += j_n * n / m
+        omega += I_inv @ (j_n * rxn)
+
+        # Coulomb friction impulse (clamped by μ·j_n)
+        v_c2    = v_com + np.cross(omega, r)
+        v_t_vec = v_c2 - float(np.dot(v_c2, n)) * n
+        v_t_mag = float(np.linalg.norm(v_t_vec))
+        if v_t_mag > 1e-6:
+            t_hat   = v_t_vec / v_t_mag
+            rxt     = np.cross(r, t_hat)
+            denom_t = 1.0 / m + float(rxt @ I_inv @ rxt)
+            j_t     = min(v_t_mag / denom_t, friction_mu * abs(j_n))
+            v_com  -= j_t * t_hat / m
+            omega  -= I_inv @ (j_t * rxt)
+
+    # ── 3. Write back ─────────────────────────────────────────────────
+    robot.qd[0:3] = v_com
+    # Convert world-frame ω back to Euler-angle rates
+    try:
+        robot.qd[3:6] = np.linalg.solve(J_w, omega)
+    except np.linalg.LinAlgError:
+        robot.qd[3:6] = omega                 # fallback (near gimbal-lock)
+
+
+# ─────────────────────────────────────────────
 # von Mises stress → 색상 (FEM/CB 공용)
 # ─────────────────────────────────────────────
 def _stress_color(vm: np.ndarray, vmax: float) -> np.ndarray:
@@ -90,19 +199,11 @@ def _stress_color(vm: np.ndarray, vmax: float) -> np.ndarray:
 def run_rbd_drop(num_boxes: int, tilt_deg: float, seed: int) -> None:
     from robosim.model.factory import create_free_box
     from robosim.physics.rbd.solver import RBDSolver
-    from robosim.physics.contact.detection import GroundPlane
-    from robosim.physics.contact.response import ContactParams
-    from robosim.physics.contact.solver import ContactSolver
     from robosim.viz.viewer import SimViewer, geometry_to_trimesh
 
     rng = np.random.default_rng(seed)
     positions = _box_positions(num_boxes)
     euler_angles = _box_euler_angles(num_boxes, tilt_deg, rng)
-
-    contact = ContactSolver(
-        ground=GroundPlane(height=0.0),
-        params=ContactParams(stiffness=5e4, damping=500, friction_mu=0.5),
-    )
 
     robots, solvers, box_verts_list = [], [], []
     for i in range(num_boxes):
@@ -118,7 +219,6 @@ def run_rbd_drop(num_boxes: int, tilt_deg: float, seed: int) -> None:
 
         solver_i = RBDSolver(robot=robot)
         solver_i.initialize(dt=DT)
-        contact.register_rbd(solver_i, robot_id=f"box_{i}")
 
         # 박스 기준 메시 버텍스 (local)
         box_body = robot.links[-1]
@@ -152,12 +252,13 @@ def run_rbd_drop(num_boxes: int, tilt_deg: float, seed: int) -> None:
         t0 = time.perf_counter()
 
         for _ in range(SUBSTEPS):
+            # 1. RBD dynamics (gravity handled internally by ABA)
             for solver_i in solvers:
-                wrenches = contact.compute_rbd_contact_forces(solver_i)
-                solver_i.clear_external_forces()
-                for li, w in wrenches.items():
-                    solver_i.set_external_force(li, w)
                 solver_i.step()
+            # 2. Impulse-based ground contact (position projection + velocity impulse)
+            for robot in robots:
+                _resolve_box_ground(robot, SIDE / 2,
+                                    restitution=0.15, friction_mu=0.4)
             sim_time[0] += DT
 
         phys_ms = (time.perf_counter() - t0) * 1000
