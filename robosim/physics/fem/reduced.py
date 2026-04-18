@@ -131,6 +131,9 @@ class CraigBamptonBody:
         self._dN_list = None
         self._volumes = None
 
+        # Current reduced modal coordinates (updated each step)
+        self.q_r: np.ndarray | None = None
+
         # LU (set by initialize)
         self._A_r_lu = None
         self._dt_cached: float = 0.0
@@ -372,6 +375,7 @@ class CraigBamptonBody:
         self.x = t_new + (self._x_ref_body + u_new) @ R.T
         u_dot_new = (self._Phi_CB @ q_r_dot_new).reshape(n_nodes, 3)
         self.v = t_dot_new + u_dot_new @ R.T
+        self.q_r = q_r_new   # store for external access (e.g. CBBodyHandle.modal_coords)
 
     # ------------------------------------------------------------------
     # Anchored step  (fixed nodes clamped, R = I, no centroid motion)
@@ -424,6 +428,7 @@ class CraigBamptonBody:
 
         self.x = x_new
         self.v = v_new
+        self.q_r = q_r_new   # store for external access (e.g. CBBodyHandle.modal_coords)
 
 
 # ═══════════════════════════════════════════════════════════════
