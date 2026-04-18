@@ -156,6 +156,9 @@ class _MeshEntry:
     # Current world-space vertices (updated each frame)
     world_verts: np.ndarray | None = None
     visible: bool = True
+    wireframe: bool = False
+    # Cached edge index array for wireframe rendering (computed once from faces)
+    _cached_edges: np.ndarray | None = field(default=None, repr=False)
 
 
 # ── SimViewer ────────────────────────────────────────────────────
@@ -186,6 +189,10 @@ class SimViewer:
         self._ti_verts: ti.VectorField | None = None
         self._ti_indices: ti.ScalarField | None = None
         self._ti_colors: ti.VectorField | None = None
+        # Wireframe line fields
+        self._ti_wire_verts: ti.VectorField | None = None
+        self._ti_wire_indices: ti.ScalarField | None = None
+        self._ti_wire_colors: ti.VectorField | None = None
         self._dirty = True  # needs field rebuild
 
         self._hud_lines: list[str] = []
@@ -363,6 +370,12 @@ class SimViewer:
             if name.startswith(prefix):
                 entry.visible = visible
 
+    def set_meshes_wireframe_by_prefix(self, prefix: str, wireframe: bool):
+        """Enable or disable wireframe rendering for meshes by prefix."""
+        for name, entry in self._meshes.items():
+            if name.startswith(prefix):
+                entry.wireframe = wireframe
+
     def add_robot_meshes(
         self,
         robot_name: str,
@@ -444,39 +457,82 @@ class SimViewer:
 
     def _upload_fields(self):
         """Upload current vertex positions + colors to Taichi fields."""
-        all_verts = []
-        all_colors = []
-        all_indices = []
-        offset = 0
+        solid_verts = []
+        solid_colors = []
+        solid_indices = []
+        s_offset = 0
+
+        wire_verts = []
+        wire_colors = []
+        wire_indices = []
+        w_offset = 0
 
         for entry in self._meshes.values():
             if not entry.visible:
                 continue
             nv = entry.world_verts.shape[0]
-            all_verts.append(entry.world_verts)
 
             if entry.per_vertex_color is not None:
-                all_colors.append(entry.per_vertex_color[:nv])
+                colors = entry.per_vertex_color[:nv]
             else:
-                all_colors.append(np.broadcast_to(entry.color, (nv, 3)).copy())
+                colors = np.broadcast_to(entry.color, (nv, 3)).copy()
 
-            all_indices.append(entry.faces.ravel() + offset)
-            offset += nv
+            if entry.wireframe:
+                wire_verts.append(entry.world_verts)
+                wire_colors.append(colors)
+                # Extract unique edges from triangle faces (cached after first call)
+                if entry._cached_edges is None:
+                    edges = set()
+                    for f in entry.faces:
+                        for i in range(3):
+                            e = (min(int(f[i]), int(f[(i+1) % 3])),
+                                 max(int(f[i]), int(f[(i+1) % 3])))
+                            edges.add(e)
+                    # Store as flat 1D array: [e0_a, e0_b, e1_a, e1_b, ...]
+                    entry._cached_edges = np.array(sorted(edges), dtype=np.int32).ravel()
+                wire_indices.append(entry._cached_edges + w_offset)
+                w_offset += nv
+            else:
+                solid_verts.append(entry.world_verts)
+                solid_colors.append(colors)
+                solid_indices.append(entry.faces.ravel() + s_offset)
+                s_offset += nv
 
-        verts_np = np.concatenate(all_verts).astype(np.float32)
-        colors_np = np.concatenate(all_colors).astype(np.float32)
-        indices_np = np.concatenate(all_indices).astype(np.int32)
+        # ── Solid meshes ──
+        if solid_verts:
+            verts_np = np.concatenate(solid_verts).astype(np.float32)
+            colors_np = np.concatenate(solid_colors).astype(np.float32)
+            indices_np = np.concatenate(solid_indices).astype(np.int32)
 
-        # Resize fields if needed
-        if self._ti_verts is None or self._ti_verts.shape[0] != verts_np.shape[0]:
-            self._ti_verts = ti.Vector.field(3, dtype=ti.f32, shape=verts_np.shape[0])
-            self._ti_colors = ti.Vector.field(3, dtype=ti.f32, shape=verts_np.shape[0])
-        if self._ti_indices is None or self._ti_indices.shape[0] != indices_np.shape[0]:
-            self._ti_indices = ti.field(dtype=ti.i32, shape=indices_np.shape[0])
+            if self._ti_verts is None or self._ti_verts.shape[0] != verts_np.shape[0]:
+                self._ti_verts = ti.Vector.field(3, dtype=ti.f32, shape=verts_np.shape[0])
+                self._ti_colors = ti.Vector.field(3, dtype=ti.f32, shape=verts_np.shape[0])
+            if self._ti_indices is None or self._ti_indices.shape[0] != indices_np.shape[0]:
+                self._ti_indices = ti.field(dtype=ti.i32, shape=indices_np.shape[0])
 
-        self._ti_verts.from_numpy(verts_np)
-        self._ti_colors.from_numpy(colors_np)
-        self._ti_indices.from_numpy(indices_np)
+            self._ti_verts.from_numpy(verts_np)
+            self._ti_colors.from_numpy(colors_np)
+            self._ti_indices.from_numpy(indices_np)
+        else:
+            self._ti_verts = None
+
+        # ── Wireframe lines ──
+        if wire_verts:
+            wv_np = np.concatenate(wire_verts).astype(np.float32)
+            wc_np = np.concatenate(wire_colors).astype(np.float32)
+            wi_np = np.concatenate(wire_indices).astype(np.int32)
+
+            if self._ti_wire_verts is None or self._ti_wire_verts.shape[0] != wv_np.shape[0]:
+                self._ti_wire_verts = ti.Vector.field(3, dtype=ti.f32, shape=wv_np.shape[0])
+                self._ti_wire_colors = ti.Vector.field(3, dtype=ti.f32, shape=wv_np.shape[0])
+            if self._ti_wire_indices is None or self._ti_wire_indices.shape[0] != wi_np.shape[0]:
+                self._ti_wire_indices = ti.field(dtype=ti.i32, shape=wi_np.shape[0])
+
+            self._ti_wire_verts.from_numpy(wv_np)
+            self._ti_wire_colors.from_numpy(wc_np)
+            self._ti_wire_indices.from_numpy(wi_np)
+        else:
+            self._ti_wire_verts = None
 
     def _render_frame(self):
         """Render one frame."""
@@ -494,6 +550,13 @@ class SimViewer:
             self._scene.mesh(
                 self._ti_verts, self._ti_indices,
                 per_vertex_color=self._ti_colors, two_sided=True,
+            )
+
+        if self._ti_wire_verts is not None:
+            self._scene.lines(
+                self._ti_wire_verts, width=2.0,
+                indices=self._ti_wire_indices,
+                per_vertex_color=self._ti_wire_colors,
             )
 
         self._canvas.set_background_color(self.background)

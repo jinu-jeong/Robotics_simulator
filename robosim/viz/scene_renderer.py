@@ -33,6 +33,7 @@ class RobotRenderer:
         self._collision_colors: list[np.ndarray | None] = []
 
         self._show_collision = False
+        self._contact_links: list[str] | None = None  # None = show all
 
     # ── Visual mesh prefix ──
     def _vis_prefix(self) -> str:
@@ -50,11 +51,9 @@ class RobotRenderer:
                 self._visual_link_names.append(link.name)
                 self._visual_geoms.append((vis.geometry, vis.origin))
                 self._visual_colors.append(vis.color)
-            else:
-                default_geom = Geometry.sphere(0.015)
-                self._visual_link_names.append(link.name)
-                self._visual_geoms.append((default_geom, Transform.identity()))
-                self._visual_colors.append(np.array([0.5, 0.5, 0.5, 0.3]))
+            # Links without explicit visual geometry are skipped entirely
+            # (no fallback sphere) to avoid cluttering the scene with
+            # virtual/massless intermediate links (e.g. free-body chains).
 
         self.viewer.add_robot_meshes(
             self.robot.name,
@@ -79,13 +78,24 @@ class RobotRenderer:
                 self._collision_geoms,
                 self._collision_colors,
             )
-            # Hide collision meshes by default
+            # Hide collision meshes by default, render as wireframe
             self.viewer.set_meshes_visible_by_prefix(
                 self._col_prefix(), False)
+            self.viewer.set_meshes_wireframe_by_prefix(
+                self._col_prefix(), True)
 
     @property
     def collision_visible(self) -> bool:
         return self._show_collision
+
+    def set_contact_links(self, link_names: list[str]):
+        """Limit which links' collision meshes are shown in collision mode.
+
+        Only the specified links will be visible when :meth:`show_collision`
+        is called with ``show=True``.  Pass ``None`` to restore the default
+        (show all links with collision geometry).
+        """
+        self._contact_links = list(link_names) if link_names is not None else None
 
     def show_collision(self, show: bool):
         """Toggle collision mesh visibility (hides visual meshes when on)."""
@@ -94,8 +104,20 @@ class RobotRenderer:
         self._show_collision = show
         self.viewer.set_meshes_visible_by_prefix(
             self._vis_prefix(), not show)
-        self.viewer.set_meshes_visible_by_prefix(
-            self._col_prefix(), show)
+
+        if self._contact_links is None:
+            # No filter: show/hide all collision meshes
+            self.viewer.set_meshes_visible_by_prefix(
+                self._col_prefix(), show)
+        else:
+            # Filter: hide all first, then reveal only contact-relevant links
+            self.viewer.set_meshes_visible_by_prefix(
+                self._col_prefix(), False)
+            if show:
+                for link_name in self._contact_links:
+                    if link_name in self._collision_link_names:
+                        self.viewer.set_mesh_visible(
+                            f"{self._col_prefix()}{link_name}", True)
 
     def update(self, fk: list | None = None):
         """Update all link transforms from current robot state.
