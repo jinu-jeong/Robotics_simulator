@@ -1,0 +1,308 @@
+<?xml version="1.0"?>
+<!--
+  arm6_gripper — Custom 6-DOF robotic arm with parallel gripper.
+
+  All collision geometry uses box/cylinder primitives (no STL meshes)
+  so the SAT box-box contact detector works reliably for grasping.
+
+  Kinematic chain (6 actuated DOF + 1 fixed + 2 finger):
+    base_link
+      joint_pan  (revolute Z)  → link_1   (shoulder column)
+        joint_shoulder (revolute Y)  → link_2  (upper arm  0.42 m)
+          joint_elbow    (revolute Y)  → link_3  (forearm    0.38 m)
+            joint_wrist    (revolute Y)  → link_4  (tool flange 0.12 m)
+              joint_palm     (fixed)        → palm_link  (gripper base)
+                joint_left   (prismatic +Y) → left_finger  (box 40×14×40 mm)
+                joint_right  (prismatic +Y, mimic joint_left×-1)
+                              → right_finger (box 40×14×40 mm)
+
+  Shoulder frame (joint_shoulder) is at world z = 0.25 m.
+  Upper arm extends along local +X, elbow/wrist in the XZ plane.
+
+  GRASP GEOMETRY (side-approach, box 8×8×8 cm cube at (0.60, 0, 0.04)):
+    q_pan=0, q_shoulder=-0.370, q_elbow=1.909, q_wrist=-1.539
+      → palm centre  ≈ (0.524, 0, 0.022)
+      → fingers extend 60 mm forward from palm centre in X; box front face at 0.560 m
+      → front 30 % of finger (24 mm) overlaps box; 70 % root stays outside box
+      → inner faces straddle box in Y; 2 mm penetration when closed
+
+  Wrist compensation: q_wrist = -(q_shoulder + q_elbow)  →  total Y-rotation = 0
+  This keeps palm local-X = world X throughout the motion (fingers always point in X).
+    HOME:     -(−π/2 + 0)     = +π/2 = +1.571
+    APPROACH: -(−0.365+2.047) = −1.682
+    NEAR:     -(−0.370+1.909) = −1.539
+    LIFT:     -(−0.878+2.080) = −1.202
+
+  Finger inner-face position vs q_left (joint_left origin at y=0.043 m):
+    q_left = 0.040  → inner face at +0.078 m  (open, 38 mm gap past 40 mm box half)
+    q_left = 0.000  → inner face at +0.038 m  (closed, 2 mm penetration in box)
+
+  ── Mass / Inertia design  (UR5e-class, ~22.6 kg total) ────────────────
+  Target: comparable to UR5e (20.6 kg) or ABB IRB 120 (25 kg).
+  Motor reflected inertia is folded into each link's mass (gearbox ratio ~50:1
+  adds ~2-3× mechanical link inertia; represented by heavier link_1/link_2).
+
+  Inertia tensors computed analytically from solid uniform geometry:
+    Cylinder (r, h) : Ixx=Iyy = m(3r²+h²)/12,  Izz = mr²/2
+    Box (a×b×c)     : Ixx = m(b²+c²)/12,  Iyy = m(a²+c²)/12,  Izz = m(a²+b²)/12
+  Parallel-axis offset applied where inertial origin ≠ joint origin.
+-->
+<robot name="arm6_gripper">
+
+  <!-- ══════════════════════════════ LINKS ══════════════════════════════ -->
+
+  <!-- Base: fixed cylinder on ground  (r=0.08 m, h=0.10 m)
+       mass=6.0 kg  — heavy cast base plate + pan-joint gearbox housing
+       Ixx=Iyy = 6(3×0.08²+0.10²)/12 = 0.0292  Izz = 6×0.08²/2 = 0.0192 -->
+  <link name="base_link">
+    <inertial>
+      <mass value="6.0"/>
+      <inertia ixx="0.0292" ixy="0" ixz="0" iyy="0.0292" iyz="0" izz="0.0192"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.08" length="0.10"/></geometry>
+      <material name="dark"><color rgba="0.25 0.25 0.25 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.08" length="0.10"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Link 1: shoulder column  (cylinder r=0.05, h=0.15)
+       mass=6.5 kg  — shoulder-pan motor + gearbox (reflected inertia included)
+       Ixx=Iyy = 6.5(3×0.05²+0.15²)/12 = 0.01625
+       Izz     = 6.5×0.05²/2            = 0.00813 -->
+  <link name="link_1">
+    <inertial>
+      <mass value="6.5"/>
+      <inertia ixx="0.01625" ixy="0" ixz="0" iyy="0.01625" iyz="0" izz="0.00813"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.075" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.05" length="0.15"/></geometry>
+      <material name="blue"><color rgba="0.2 0.4 0.8 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.075" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.05" length="0.15"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Link 2: upper arm  (box 0.42×0.06×0.06 m, CoM at x=0.21 m)
+       mass=4.5 kg  — shoulder-lift motor + arm structure
+       Ixx = 4.5(0.06²+0.06²)/12              = 0.00270
+       Iyy = Izz = 4.5(0.42²+0.06²)/12        = 0.06750
+       Parallel-axis to joint origin already implicit (CoM tag used). -->
+  <link name="link_2">
+    <inertial>
+      <origin xyz="0.21 0 0"/>
+      <mass value="4.5"/>
+      <inertia ixx="0.00270" ixy="0" ixz="0" iyy="0.06750" iyz="0" izz="0.06750"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.21 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.42 0.06 0.06"/></geometry>
+      <material name="blue"><color rgba="0.2 0.4 0.8 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.21 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.42 0.06 0.06"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Link 3: forearm  (box 0.38×0.055×0.055 m, CoM at x=0.19 m)
+       mass=3.0 kg  — elbow motor + forearm tube
+       Ixx = 3.0(0.055²+0.055²)/12            = 0.00151
+       Iyy = Izz = 3.0(0.38²+0.055²)/12       = 0.03686 -->
+  <link name="link_3">
+    <inertial>
+      <origin xyz="0.19 0 0"/>
+      <mass value="3.0"/>
+      <inertia ixx="0.00151" ixy="0" ixz="0" iyy="0.03686" iyz="0" izz="0.03686"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.19 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.38 0.055 0.055"/></geometry>
+      <material name="silver"><color rgba="0.70 0.70 0.75 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.19 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.38 0.055 0.055"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Link 4: wrist / tool flange  (box 0.12×0.05×0.05 m, CoM at x=0.06 m)
+       mass=1.5 kg  — wrist motor + tool-side housing
+       Ixx = 1.5(0.05²+0.05²)/12              = 0.000625
+       Iyy = Izz = 1.5(0.12²+0.05²)/12        = 0.002113
+       Collision Z-height 36 mm (not 50 mm) to keep wrist above ground
+       at the NEAR/CLOSE grasp pose (palm z ≈ 0.022 m). -->
+  <link name="link_4">
+    <inertial>
+      <origin xyz="0.06 0 0"/>
+      <mass value="1.5"/>
+      <inertia ixx="0.000625" ixy="0" ixz="0" iyy="0.002113" iyz="0" izz="0.002113"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.06 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.12 0.05 0.05"/></geometry>
+      <material name="blue"><color rgba="0.2 0.4 0.8 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.06 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.12 0.05 0.036"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Palm: gripper base plate  (box 0.050×0.150×0.040 m)
+       X (50 mm) depth along arm axis.
+       Y (150 mm) = 100 mm × 1.5 — wider block visually connects both finger prongs.
+       Z (40 mm) unchanged to keep bottom ≥ 2 mm above ground at NEAR pose.
+       mass=0.8 kg  — gripper body + mounting hardware
+       Ixx = 0.8(0.150²+0.040²)/12 = 0.001607
+       Iyy = 0.8(0.050²+0.040²)/12 = 0.000273
+       Izz = 0.8(0.050²+0.150²)/12 = 0.001667 -->
+  <link name="palm_link">
+    <inertial>
+      <mass value="0.8"/>
+      <inertia ixx="0.001607" ixy="0" ixz="0" iyy="0.000273" iyz="0" izz="0.001667"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.050 0.150 0.040"/></geometry>
+      <material name="orange"><color rgba="0.9 0.50 0.10 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.050 0.150 0.040"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Left finger  — approach-aligned prong (box 0.080×0.010×0.020 m)
+       Long in X (80 mm, approach direction / red axis), thin in Y (10 mm),
+       shallow in Z (20 mm).  Wrist compensation keeps palm local-X = world X
+       throughout all phases, so fingers always point along world X.
+       Geometry/inertia origin at (+0.020, 0, +0.020) in joint frame so the
+       prong extends 60 mm forward and 20 mm backward in X, and sits centred
+       on the box mid-height (world z ≈ 0.022 + 0.020 = 0.042 m ≈ box centre).
+       mass=0.12 kg
+       About COM at (0.020, 0, 0.020):
+         Ixx = 0.12(0.010²+0.020²)/12 = 5.00e-6
+         Iyy = 0.12(0.080²+0.020²)/12 = 6.80e-5
+         Izz = 0.12(0.080²+0.010²)/12 = 6.50e-5 -->
+  <link name="left_finger">
+    <inertial>
+      <origin xyz="0.020 0 0.020"/>
+      <mass value="0.12"/>
+      <inertia ixx="0.0000050" ixy="0" ixz="0" iyy="0.0000680" iyz="0" izz="0.0000650"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <geometry><box size="0.080 0.010 0.020"/></geometry>
+      <material name="orange"><color rgba="0.9 0.50 0.10 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <geometry><box size="0.080 0.010 0.020"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Right finger (mirror of left) -->
+  <link name="right_finger">
+    <inertial>
+      <origin xyz="0.020 0 0.020"/>
+      <mass value="0.12"/>
+      <inertia ixx="0.0000050" ixy="0" ixz="0" iyy="0.0000680" iyz="0" izz="0.0000650"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <geometry><box size="0.080 0.010 0.020"/></geometry>
+      <material name="orange"><color rgba="0.9 0.50 0.10 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <geometry><box size="0.080 0.010 0.020"/></geometry>
+    </collision>
+  </link>
+
+  <!-- ══════════════════════════════ JOINTS ══════════════════════════════ -->
+
+  <!-- Shoulder pan: Z rotation at the top of the base cylinder
+       damping raised to 15 N·m·s/rad (real gearbox viscous friction) -->
+  <joint name="joint_pan" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_1"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" velocity="2.0" effort="500"/>
+    <dynamics damping="15.0"/>
+  </joint>
+
+  <!-- Shoulder lift: Y rotation
+       damping raised to 20 N·m·s/rad -->
+  <joint name="joint_shoulder" type="revolute">
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <origin xyz="0 0 0.15" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.5" upper="2.5" velocity="2.0" effort="500"/>
+    <dynamics damping="20.0"/>
+  </joint>
+
+  <!-- Elbow: Y rotation relative to upper arm
+       damping raised to 15 N·m·s/rad -->
+  <joint name="joint_elbow" type="revolute">
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <origin xyz="0.42 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.8" upper="2.8" velocity="2.0" effort="400"/>
+    <dynamics damping="15.0"/>
+  </joint>
+
+  <!-- Wrist pitch: Y rotation
+       damping raised to 8 N·m·s/rad -->
+  <joint name="joint_wrist" type="revolute">
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <origin xyz="0.38 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.14159" upper="3.14159" velocity="2.0" effort="100"/>
+    <dynamics damping="8.0"/>
+  </joint>
+
+  <!-- Palm mount: fixed, 0.12 m along local X of the wrist -->
+  <joint name="joint_palm" type="fixed">
+    <parent link="link_4"/>
+    <child link="palm_link"/>
+    <origin xyz="0.12 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Left finger: prismatic along +Y
+       Origin at y=0.043 m (wider base to straddle 8 cm cube, half-Y=40 mm).
+       At q= 0.000: inner face at +0.038 m →  2 mm into 40 mm half-box  ✓
+       At q=-0.020: inner face at +0.018 m → 22 mm into 40 mm half-box  ✓ (50 % more close)
+       At q=+0.040: inner face at +0.078 m → 38 mm clearance for approach ✓ -->
+  <joint name="joint_left" type="prismatic">
+    <parent link="palm_link"/>
+    <child link="left_finger"/>
+    <origin xyz="0 0.043 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.020" upper="0.050" velocity="0.3" effort="60"/>
+    <dynamics damping="8.0"/>
+  </joint>
+
+  <!-- Right finger: prismatic along +Y (mirrors left via mimic multiplier=-1) -->
+  <joint name="joint_right" type="prismatic">
+    <parent link="palm_link"/>
+    <child link="right_finger"/>
+    <origin xyz="0 -0.043 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.050" upper="0.020" velocity="0.3" effort="60"/>
+    <dynamics damping="8.0"/>
+    <mimic joint="joint_left" multiplier="-1" offset="0"/>
+  </joint>
+
+</robot>

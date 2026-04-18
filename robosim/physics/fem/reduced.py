@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import numpy as np
 import scipy.sparse.linalg as spla
-from scipy.linalg import lu_factor, lu_solve
+from scipy.linalg import lu_factor, lu_solve  # kept for fallback
 
 from robosim.physics.fem.mesh import TetMesh, FEMesh
 from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
@@ -47,6 +47,8 @@ from robosim.physics.fem.assembly import (
     precompute_element_data,
     assemble_stiffness,
     assemble_mass_matrix,
+    ElementIntegrationData,
+    CompositeIntegrationData,
 )
 
 
@@ -145,7 +147,12 @@ class CraigBamptonBody:
         n_dof = n_nodes * 3
 
         print(f"[C-B '{self.name}'] Assembling K₀, M₀ ({n_dof} DOF)...")
-        dN_data, volumes = precompute_element_data(mesh)
+        _edata = precompute_element_data(mesh)
+        if isinstance(_edata, (ElementIntegrationData, CompositeIntegrationData)):
+            dN_data = _edata
+            volumes = _edata
+        else:
+            dN_data, volumes = _edata
         K0 = assemble_stiffness(mesh, mesh.nodes, self.material, dN_data, volumes)
         M0 = assemble_mass_matrix(mesh, self.density, volumes)
 
@@ -285,10 +292,10 @@ class CraigBamptonBody:
         if self.damping > 0.0:
             A_r = A_r + self.damping * self._M_r / dt
 
-        self._A_r_lu = lu_factor(A_r)
+        self._A_r_inv = np.linalg.inv(A_r)   # dense DGEMV per step, faster than lu_solve
         self._dt_cached = dt
         print(f"[C-B '{self.name}']   initialized  dt={dt}  "
-              f"A_r ({self._n_r}×{self._n_r}) LU-factored.")
+              f"A_r ({self._n_r}×{self._n_r}) inverted.")
 
     # ------------------------------------------------------------------
     # step
@@ -352,7 +359,7 @@ class CraigBamptonBody:
         rhs = self._M_r @ q_r_pred * dt2_inv + f_r
         if self.damping > 0.0:
             rhs += self.damping * self._M_r @ q_r / dt
-        q_r_new = lu_solve(self._A_r_lu, rhs)
+        q_r_new = self._A_r_inv @ rhs
         q_r_dot_new = (q_r_new - q_r) / dt
 
         # Centroid dynamics (explicit)
@@ -402,7 +409,7 @@ class CraigBamptonBody:
         rhs = self._M_r @ q_r_pred * dt2_inv + f_r
         if self.damping > 0.0:
             rhs += self.damping * self._M_r @ q_r / dt
-        q_r_new = lu_solve(self._A_r_lu, rhs)
+        q_r_new = self._A_r_inv @ rhs
         q_r_dot_new = (q_r_new - q_r) / dt
 
         # Reconstruct: only free DOFs change
