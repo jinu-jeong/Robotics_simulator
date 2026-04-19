@@ -1,60 +1,97 @@
-"""Milestone 4 demo — scripted rigid box dropped onto an MPM clay pile.
+"""MPM grasp-drop — robot picks a rigid box and drops it on a clay pile.
 
-Standalone demo (full Scene-API integration of MPM is a later milestone).
-A kinematic rigid box is scripted through four phases — settle, lift,
-translate, release — and then falls ballistically onto a VM-clay
-(default) / DP-sand / metal / elastic pile sitting on the opposite
-corner. Coupling is one-way via :class:`KinematicBoxCollider`.
+Same arm + grasp sequence as ``examples/grasp_demo.py --mode rigid``, but
+with two additions:
 
-Rendering via :class:`SimViewer` (same Taichi GGUI style as grasp_demo)
-with the kinematic box drawn as a wireframe cube and the pile as a
-particle cloud coloured by height.
+  1. An MPM clay pile placed off to one side on the floor.
+  2. Two extra trajectory phases after ``LIFT``:
+     * ``MOVE``   — rotates the pan joint so the palm ends up directly
+                    above the pile.
+     * ``RELEASE`` — opens the fingers; the rigid box falls under
+                    gravity, collides with the clay (one-way via
+                    :class:`KinematicBoxCollider`), and the pile deforms.
 
-Usage
------
-    python examples/mpm_grasp_drop.py                  # clay
-    python examples/mpm_grasp_drop.py --material sand
-    python examples/mpm_grasp_drop.py --material metal --headless
+The Taichi GGUI view uses :class:`SimViewer` (same style as
+grasp_demo) with URDF meshes for the arm + box, and an MPM particle
+cloud for the pile.
+
+Usage:
+  python examples/mpm_grasp_drop.py
+  python examples/mpm_grasp_drop.py --material clay   # default
+  python examples/mpm_grasp_drop.py --material sand
+  python examples/mpm_grasp_drop.py --material metal
+  python examples/mpm_grasp_drop.py --headless
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from robosim.physics.mpm.boundary import KinematicBoxCollider                # noqa: E402
-from robosim.physics.mpm.grid import Grid                                     # noqa: E402
-from robosim.physics.mpm.materials import (                                   # noqa: E402
+from robosim.model.factory import create_free_box
+from robosim.model.urdf_parser import parse_urdf
+from robosim.physics.contact.detection import GroundPlane
+from robosim.physics.contact.response import ContactParams
+from robosim.physics.contact.solver import ContactSolver
+from robosim.physics.mpm.boundary import KinematicBoxCollider
+from robosim.physics.mpm.grid import Grid
+from robosim.physics.mpm.materials import (
     DruckerPragerPlastic, NeoHookean, VonMisesPlastic,
 )
-from robosim.physics.mpm.solver import BoxBC, MPMSolver, sample_box_particles  # noqa: E402
+from robosim.physics.mpm.solver import BoxBC, MPMSolver, sample_box_particles
+from robosim.physics.rbd.algorithms import gravity_torques
+from robosim.physics.rbd.solver import RBDSolver
 
 
-DOMAIN_LOWER = np.array([0.0, 0.0, 0.0])
-DOMAIN_UPPER = np.array([1.0, 1.0, 0.8])
-DX           = 0.025
+_URDF = Path(__file__).parent / "urdf" / "arm6_gripper" / "arm6_gripper.urdf"
 
-PILE_LOWER = np.array([0.58, 0.58, 0.0])
-PILE_UPPER = np.array([0.82, 0.82, 0.15])
-PILE_N     = 10
-PILE_DENSITY = 1400.0
+# ── Grasp poses (same q layout as grasp_demo) ────────────────────────────────
+HOME_Q     = np.array([ 0.0, -1.571,  0.000, +1.571,  0.040, -0.040])
+FOLD_Q     = np.array([ 0.0, -1.400,  2.000, -0.600,  0.040, -0.040])
+APPROACH_Q = np.array([ 0.0, -0.365,  2.047, -1.682,  0.040, -0.040])
+NEAR_Q     = np.array([ 0.0, -0.370,  1.909, -1.539,  0.040, -0.040])
+CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.020,  0.020])
+LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.020,  0.020])
+# New: swing over to the clay pile (pan = −1.0 rad ≈ −57°).
+MOVE_Q     = np.array([-1.0, -0.878,  2.080, -1.202, -0.020,  0.020])
+# New: open fingers at the drop location (release grip).
+RELEASE_Q  = np.array([-1.0, -0.878,  2.080, -1.202,  0.040, -0.040])
 
-BOX_HALF   = np.array([0.05, 0.05, 0.05])
-BOX_START  = np.array([0.15, 0.15, BOX_HALF[2]])
-BOX_LIFT   = np.array([0.15, 0.15, 0.45])
-BOX_OVER   = np.array([0.70, 0.70, 0.45])
+_PHASES = [
+    (HOME_Q,     1.5),
+    (FOLD_Q,     1.2),
+    (APPROACH_Q, 2.5),
+    (NEAR_Q,     1.5),
+    (CLOSE_Q,    1.5),
+    (LIFT_Q,     3.0),
+    (MOVE_Q,     2.5),
+    (RELEASE_Q,  1.0),
+]
+_PHASE_NAMES = ["HOME", "FOLD", "APPROACH", "NEAR", "CLOSE", "LIFT",
+                "MOVE", "RELEASE", "SETTLE"]
 
-PHASES = [(0.30, BOX_START), (0.40, BOX_LIFT), (0.60, BOX_OVER)]
-RELEASE_AT = sum(d for d, _ in PHASES)
-TOTAL_T    = RELEASE_AT + 0.60
-DT         = 4e-4
-SUBSTEPS_PER_FRAME = 4
-GRAVITY = np.array([0.0, 0.0, -9.81])
+_KP = np.array([280.0, 480.0, 200.0,  75.0, 5e4,  5e4 ])
+_KD = np.array([ 35.0,  50.0,  20.0,   2.0, 100., 100.])
+
+
+# ── Clay pile geometry (placed under the MOVE palm position) ─────────────────
+
+# Pan = −1.0 → palm ends up near (0.28, −0.44, 0.22). Put the pile there.
+PILE_CENTER_XY = np.array([0.28, -0.44])
+PILE_SIZE      = np.array([0.16, 0.16, 0.10])           # x, y, z extent
+PILE_N         = 10                                       # n particles / axis
+PILE_DENSITY   = 1400.0
+
+# Domain big enough to contain the arm workspace and the pile.
+DOMAIN_LOWER = np.array([-0.8, -0.8, 0.0])
+DOMAIN_UPPER = np.array([ 0.8,  0.8, 0.8])
+DX           = 0.03
 
 
 def make_material(kind: str):
@@ -70,170 +107,287 @@ def make_material(kind: str):
     raise ValueError(kind)
 
 
-def scripted_box_pose(t: float) -> tuple[np.ndarray, np.ndarray]:
-    if t < RELEASE_AT:
-        t0 = 0.0
-        prev = BOX_START
-        for dur, tgt in PHASES:
-            if t < t0 + dur:
-                a = (t - t0) / dur
-                return (1 - a) * prev + a * tgt, (tgt - prev) / dur
-            t0 += dur
-            prev = tgt
-        return prev, np.zeros(3)
-    dt_post = t - RELEASE_AT
-    return BOX_OVER + 0.5 * GRAVITY * dt_post ** 2, GRAVITY * dt_post
+def _smooth(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
 
-def build_solver(kind: str):
-    pts = sample_box_particles(PILE_LOWER, PILE_UPPER, PILE_N, PILE_DENSITY)
-    grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
-    collider = KinematicBoxCollider(
-        center=BOX_START.copy(), half_extent=BOX_HALF.copy(),
-        velocity=np.zeros(3),
-    )
-    solver = MPMSolver(
-        particles=pts, grid=grid,
-        material=make_material(kind),
-        gravity=GRAVITY,
-        bcs=[BoxBC(lower=DOMAIN_LOWER,
-                   upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
-                   mode="slip")],
-        colliders=[collider],
-    )
-    return solver, collider
+def _control(robot, q_target: np.ndarray) -> np.ndarray:
+    q_err  = q_target - robot.q
+    qd_err = -robot.qd
+    g_tau  = gravity_torques(robot, robot.q)
+    return _KP * q_err + _KD * qd_err + g_tau
 
 
-# ── SimViewer helpers: box wireframe + ground plane ─────────────────────────
-
-def _ground_mesh(size: float = 1.2) -> tuple[np.ndarray, np.ndarray]:
-    s = size / 2.0
-    verts = np.array([[-s, -s, 0], [s, -s, 0], [s, s, 0], [-s, s, 0]],
-                     dtype=np.float64) + np.array([0.5, 0.5, 0.0])
-    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
-    return verts, faces
-
-
-def _box_wireframe_mesh(center: np.ndarray, half: np.ndarray
-                        ) -> tuple[np.ndarray, np.ndarray]:
-    """Corner verts + triangle indices for a thin-face box. Rendered as
-    wireframe via SimViewer.set_meshes_wireframe_by_prefix."""
-    c, h = center, half
-    verts = np.array([
-        [c[0]-h[0], c[1]-h[1], c[2]-h[2]], [c[0]+h[0], c[1]-h[1], c[2]-h[2]],
-        [c[0]+h[0], c[1]+h[1], c[2]-h[2]], [c[0]-h[0], c[1]+h[1], c[2]-h[2]],
-        [c[0]-h[0], c[1]-h[1], c[2]+h[2]], [c[0]+h[0], c[1]-h[1], c[2]+h[2]],
-        [c[0]+h[0], c[1]+h[1], c[2]+h[2]], [c[0]-h[0], c[1]+h[1], c[2]+h[2]],
-    ], dtype=np.float64)
-    faces = np.array([
-        [0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],
-        [2,3,7],[2,7,6],[0,4,7],[0,7,3],[1,2,6],[1,6,5],
-    ], dtype=np.int32)
-    return verts, faces
-
-
-def _height_colors(z: np.ndarray) -> np.ndarray:
-    t = np.clip(z / 0.4, 0, 1).astype(np.float32)
+def _height_colors(z: np.ndarray, zmax: float) -> np.ndarray:
+    t = np.clip(z / max(zmax, 1e-6), 0, 1).astype(np.float32)
     return np.column_stack([0.3 + 0.5*t, 0.5 + 0.3*t, 1.0 - 0.4*t])
 
 
-def run_headless(kind: str) -> None:
-    solver, collider = build_solver(kind)
-    pts = solver.particles
-    n_steps = int(round(TOTAL_T / DT))
-    for step in range(n_steps + 1):
-        t = step * DT
-        c, v = scripted_box_pose(t)
-        collider.center = c
-        collider.velocity = v
-        if step % 100 == 0:
-            z_top = float(pts.x[:, 2].max())
-            xy_ext = float(np.ptp(pts.x[:, :2], axis=0).mean())
-            print(f"t={t:5.3f}s  box=({c[0]:.2f},{c[1]:.2f},{c[2]:.2f})  "
-                  f"z_top={z_top:.3f}  xy_ext={xy_ext:.3f}")
-        if step < n_steps:
-            solver.step(DT)
+# ═══════════════════════════════════════════════════════════════════
+# Main driver
+# ═══════════════════════════════════════════════════════════════════
 
+def run(material: str = "clay", headless: bool = False) -> None:
+    dt       = 0.001
+    substeps = 10
 
-def run_gui(kind: str) -> None:
+    # ── Arm ───────────────────────────────────────────────────────
+    robot = parse_urdf(_URDF)
+    robot.gravity = np.array([0.0, 0.0, -9.81])
+    robot.q[:]   = HOME_Q
+    robot.enforce_mimic()
+    robot.qd[:]  = 0.0
+    arm_solver = RBDSolver(robot=robot)
+    arm_solver.initialize(dt=dt)
+
+    # ── Rigid box (the thing the arm picks up) ────────────────────
+    BOX_SIZE   = np.array([0.080, 0.080, 0.080])
+    BOX_CENTRE = np.array([0.600, 0.000, 0.040])
+    BOX_COLOR  = np.array([0.85, 0.15, 0.15])
+    box_robot  = create_free_box(
+        name="target_box", size=tuple(BOX_SIZE),
+        mass=1.0, position=BOX_CENTRE.copy(),
+        color=np.append(BOX_COLOR, 1.0),
+    )
+    box_robot.gravity = np.array([0.0, 0.0, -9.81])
+    box_solver = RBDSolver(robot=box_robot)
+    box_solver.initialize(dt=dt)
+
+    # ── Rigid ground contact (arm ↔ ground, box ↔ ground, arm ↔ box) ──
+    contact = ContactSolver(
+        ground=GroundPlane(height=0.0),
+        params=ContactParams(stiffness=1e3, damping=50, friction_mu=0.0),
+    )
+    contact.register_rbd(arm_solver, robot_id="arm")
+    contact.register_rbd(box_solver, robot_id="box")
+    for arm_link in ["base_link", "link_1", "link_2", "link_3", "link_4",
+                     "palm_link"]:
+        contact.add_cross_filter("arm", arm_link, "box", "target_box_body")
+
+    # ── MPM pile ─────────────────────────────────────────────────
+    pile_lower = np.array([
+        PILE_CENTER_XY[0] - PILE_SIZE[0] / 2,
+        PILE_CENTER_XY[1] - PILE_SIZE[1] / 2,
+        0.0,
+    ])
+    pile_upper = pile_lower + PILE_SIZE
+    mpm_particles = sample_box_particles(pile_lower, pile_upper,
+                                         PILE_N, PILE_DENSITY)
+    mpm_grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
+    # Box pose that the MPM solver uses — lives outside the MPM domain
+    # until the rigid box actually falls onto the pile.
+    mpm_collider = KinematicBoxCollider(
+        center=BOX_CENTRE.copy(),
+        half_extent=BOX_SIZE * 0.5,
+        velocity=np.zeros(3),
+    )
+    mpm_solver = MPMSolver(
+        particles=mpm_particles, grid=mpm_grid,
+        material=make_material(material),
+        gravity=np.array([0.0, 0.0, -9.81]),
+        bcs=[BoxBC(lower=DOMAIN_LOWER,
+                   upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
+                   mode="slip")],
+        colliders=[mpm_collider],
+    )
+
+    # ── Phase interpolation state ────────────────────────────────
+    phase_idx     = 0
+    phase_start_t = 0.0
+    q_phase_start = HOME_Q.copy()
+    q_target      = HOME_Q.copy()
+
+    def advance_phases(t: float) -> None:
+        nonlocal phase_idx, phase_start_t, q_phase_start
+        if phase_idx >= len(_PHASES):
+            q_target[:] = _PHASES[-1][0]
+            return
+        tgt, dur = _PHASES[phase_idx]
+        alpha = _smooth((t - phase_start_t) / dur)
+        q_target[:] = q_phase_start + alpha * (tgt - q_phase_start)
+        if (t - phase_start_t) >= dur:
+            phase_idx    += 1
+            phase_start_t = t
+            q_phase_start = tgt.copy()
+
+    # ── Constraint grip (arm ↔ box kinematic coupling) ───────────
+    _LIFT_START_T   = sum(d for _, d in _PHASES[:5])
+    _RELEASE_START  = sum(d for _, d in _PHASES[:7])   # after MOVE ends
+    grip_active     = [False]
+    grip_palm_pos0  = np.zeros(3)
+    grip_box_pos0   = np.zeros(3)
+    grip_box_rot0   = np.zeros(3)
+    grip_offset     = np.zeros(3)
+    prev_palm_pos   = [None]
+    palm_idx        = robot.link_index("palm_link")
+
+    box_ground_xy  = BOX_CENTRE[:2].copy()
+    box_ground_rot = np.zeros(3)
+
+    sim_time = [0.0]
+
+    def step_once() -> None:
+        nonlocal grip_box_pos0, grip_box_rot0, grip_offset
+        dt_step = dt
+        advance_phases(sim_time[0])
+
+        # Arm PD + gravity comp + ground/box contact
+        arm_solver.clear_external_forces()
+        arm_solver.tau = _control(robot, q_target)
+        for li, w in contact.compute_rbd_contact_forces(arm_solver).items():
+            arm_solver.set_external_force(li, w)
+        arm_solver.step()
+        robot.enforce_mimic()
+
+        fk = robot.forward_kinematics()
+        palm_pos = fk[palm_idx].translation.copy()
+
+        # Rigid box physics + grip
+        box_solver.clear_external_forces()
+        for li, w in contact.compute_rbd_contact_forces(box_solver).items():
+            box_solver.set_external_force(li, w)
+        box_solver.step()
+
+        if not grip_active[0] and box_robot.q[2] < 0.045:
+            # Hold the box on the ground until the first grip activation
+            # so it doesn't wander under ground-contact noise.
+            if sim_time[0] < _LIFT_START_T:
+                box_robot.q[:2]   = box_ground_xy
+                box_robot.qd[:2]  = 0.0
+                box_robot.q[3:6]  = box_ground_rot
+                box_robot.qd[3:6] = 0.0
+
+        # Grip on/off. Active when fingers closed AND we haven't reached
+        # the release phase yet. Once release starts (fingers reopening),
+        # grip turns off permanently and the box follows free dynamics.
+        fingers_closed = robot.q[4] < 0.003
+        if (sim_time[0] >= _LIFT_START_T
+                and sim_time[0] < _RELEASE_START
+                and fingers_closed):
+            if not grip_active[0]:
+                grip_active[0]   = True
+                grip_palm_pos0[:] = palm_pos
+                grip_box_pos0 = box_robot.q[:3].copy()
+                grip_box_rot0 = box_robot.q[3:6].copy()
+                grip_offset   = grip_box_pos0 - grip_palm_pos0
+            target_pos = palm_pos + grip_offset
+            if prev_palm_pos[0] is not None:
+                palm_vel = (palm_pos - prev_palm_pos[0]) / dt_step
+            else:
+                palm_vel = np.zeros(3)
+            box_robot.q[:3]   = target_pos
+            box_robot.qd[:3]  = palm_vel
+            box_robot.q[3:6]  = grip_box_rot0
+            box_robot.qd[3:6] = 0.0
+        elif sim_time[0] >= _RELEASE_START and grip_active[0]:
+            # Release: hand off to free dynamics with the current palm vel.
+            grip_active[0] = False
+
+        # Feed the rigid box pose into the MPM collider and step MPM.
+        if prev_palm_pos[0] is not None:
+            box_vel = (box_robot.q[:3] - mpm_collider.center) / dt_step
+        else:
+            box_vel = np.zeros(3)
+        mpm_collider.center = box_robot.q[:3].copy()
+        mpm_collider.velocity = box_vel
+        try:
+            mpm_solver.step(dt_step)
+        except IndexError:
+            pass  # particle left the grid — skip MPM this substep
+
+        prev_palm_pos[0] = palm_pos
+        sim_time[0] += dt_step
+
+    # ── Headless: run a finite duration, print summary ───────────
+    if headless:
+        total_dur = sum(d for _, d in _PHASES) + 2.0   # + settle time
+        total_steps = int(total_dur / dt) + substeps
+        t_wall0 = time.time()
+        for fr in range(total_steps // substeps + 1):
+            for _ in range(substeps):
+                step_once()
+            if fr % 200 == 0:
+                p = mpm_particles
+                com_box = box_robot.q[:3]
+                z_top = float(p.x[:, 2].max())
+                xy_ext = float(np.ptp(p.x[:, :2], axis=0).mean())
+                ph = _PHASE_NAMES[min(phase_idx, len(_PHASE_NAMES) - 1)]
+                print(f"t={sim_time[0]:6.3f}s  phase={ph:<8}  "
+                      f"box=({com_box[0]:+.3f},{com_box[1]:+.3f},{com_box[2]:+.3f})  "
+                      f"pile z_top={z_top:.3f}  xy_ext={xy_ext:.3f}")
+        print(f"\nWall time: {time.time()-t_wall0:.2f} s")
+        return
+
+    # ── GUI ──────────────────────────────────────────────────────
     from robosim.viz.viewer import SimViewer
-
-    solver, collider = build_solver(kind)
-    pts = solver.particles
-    n_steps = int(round(TOTAL_T / DT))
+    from robosim.viz.scene_renderer import RobotRenderer
 
     viewer = SimViewer(
-        title=f"RoboSim — MPM Grasp-Drop [{kind.upper()}]",
+        title=f"RoboSim — MPM Grasp-Drop [{material.upper()}]",
         window_size=(1280, 800),
         background=(0.08, 0.08, 0.10),
     )
     viewer.initialize()
 
-    gv, gf = _ground_mesh(size=1.2)
-    viewer.add_mesh("ground", gv, gf, color=np.array([0.22, 0.22, 0.25]))
+    arm_renderer = RobotRenderer(robot, viewer)
+    arm_renderer.setup()
+    box_renderer = RobotRenderer(box_robot, viewer)
+    box_renderer.setup()
 
-    bv, bf = _box_wireframe_mesh(collider.center, collider.half_extent)
-    viewer.add_mesh("box/collider", bv, bf, color=np.array([0.95, 0.25, 0.25]))
-    viewer.set_meshes_wireframe_by_prefix("box/", True)
-
-    viewer.add_particles("mpm", pts.x, radius=0.009,
-                         per_vertex_color=_height_colors(pts.x[:, 2]))
+    viewer.add_particles(
+        "mpm", mpm_particles.x, radius=0.008,
+        per_vertex_color=_height_colors(
+            mpm_particles.x[:, 2], PILE_SIZE[2] * 2.0,
+        ),
+    )
 
     step_count = [0]
 
-    def step(frame: int) -> None:
-        for _ in range(SUBSTEPS_PER_FRAME):
-            t = step_count[0] * DT
-            if t <= TOTAL_T:
-                c, v = scripted_box_pose(t)
-                collider.center = c
-                collider.velocity = v
-            # After TOTAL_T the box is well below the pile; freeze the
-            # collider pose so it sits out of the way and the pile
-            # continues to settle under gravity.
-            try:
-                solver.step(DT)
-            except IndexError:
-                return
+    def frame_step(frame: int) -> None:
+        for _ in range(substeps):
+            step_once()
             step_count[0] += 1
-        # Refresh box wireframe corners for the new pose.
-        bv2, _ = _box_wireframe_mesh(collider.center, collider.half_extent)
-        viewer.update_mesh_vertices("box/collider", bv2)
-        viewer.update_particles("mpm", pts.x,
-                                per_vertex_color=_height_colors(pts.x[:, 2]))
-        t_sim = step_count[0] * DT
-        z_top = float(pts.x[:, 2].max())
-        xy_ext = float(np.ptp(pts.x[:, :2], axis=0).mean())
-        phase = ("SETTLE" if t_sim < 0.30
-                 else "LIFT" if t_sim < 0.70
-                 else "TRANSLATE" if t_sim < RELEASE_AT
-                 else "DROP" if t_sim < TOTAL_T
-                 else "RELAX")
+
+        arm_renderer.update()
+        box_renderer.update()
+        viewer.update_particles(
+            "mpm", mpm_particles.x,
+            per_vertex_color=_height_colors(
+                mpm_particles.x[:, 2], PILE_SIZE[2] * 2.0,
+            ),
+        )
+
+        ph = _PHASE_NAMES[min(phase_idx, len(_PHASE_NAMES) - 1)]
+        box_com = box_robot.q[:3]
+        p = mpm_particles
+        z_top = float(p.x[:, 2].max())
+        xy_ext = float(np.ptp(p.x[:, :2], axis=0).mean())
         viewer.add_text(
-            f"t = {t_sim:6.3f} s   step {step_count[0]}   "
-            f"[{kind.upper()}]   phase: {phase}\n"
-            f"Box  : ({collider.center[0]:+.3f}, "
-            f"{collider.center[1]:+.3f}, {collider.center[2]:+.3f})\n"
-            f"Pile z_top: {z_top:.3f}   xy extent: {xy_ext:.3f}\n"
+            f"t = {sim_time[0]:6.3f} s    Phase: {ph}    [{material.upper()}]\n"
+            f"Box CoM : ({box_com[0]:+.3f}, {box_com[1]:+.3f}, {box_com[2]:+.3f})\n"
+            f"Pile z_top: {z_top:.3f}    xy extent: {xy_ext:.3f}\n"
+            f"grip: {'ON' if grip_active[0] else 'off'}    "
+            f"q_fing: {robot.q[4]:+.3f} m\n"
             f"[LDrag=orbit  Scroll=zoom  ESC=quit]"
         )
 
-    viewer.add_callback(step)
+    viewer.add_callback(frame_step)
     viewer.show()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--material", choices=["clay", "sand", "metal", "elastic"],
                     default="clay")
     ap.add_argument("--headless", action="store_true")
     args = ap.parse_args()
-    if args.headless:
-        run_headless(args.material)
-    else:
+
+    if not args.headless:
         import taichi as ti
         ti.init(arch=ti.metal)
-        run_gui(args.material)
+
+    run(material=args.material, headless=args.headless)
 
 
 if __name__ == "__main__":
