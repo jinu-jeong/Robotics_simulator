@@ -37,6 +37,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from robosim.math.transforms import Transform
 from robosim.model.factory import create_free_box
 from robosim.model.urdf_parser import parse_urdf
 from robosim.physics.contact.detection import GroundPlane
@@ -142,6 +143,26 @@ def _stress_color(vm: np.ndarray, vmax: float) -> np.ndarray:
     g = np.clip(1.5 - np.abs(t - 0.50) * 4, 0, 1)
     b = np.clip(1.5 - np.abs(t - 0.25) * 4, 0, 1)
     return np.column_stack([r, g, b]).astype(np.float32)
+
+
+def _rotmat_to_xyz_euler(R: np.ndarray) -> np.ndarray:
+    """Decompose R into (rx, ry, rz) s.t. R = Rx(rx) · Ry(ry) · Rz(rz).
+
+    Matches the joint order of :func:`create_free_box` (tx, ty, tz, rx, ry,
+    rz chained intrinsically), so the result can be written directly into
+    ``q[3:6]`` to pose the free-floating RBD body. ``Transform.from_rpy``
+    uses a different (ZYX) convention and gives wrong q values.
+    """
+    b = np.arcsin(np.clip(R[0, 2], -1.0, 1.0))
+    cb = np.cos(b)
+    if abs(cb) < 1e-6:
+        # Gimbal lock — rare for this demo; fall back to zero roll.
+        a = 0.0
+        c = np.arctan2(R[1, 0], R[1, 1])
+    else:
+        a = np.arctan2(-R[1, 2], R[2, 2])
+        c = np.arctan2(-R[0, 1], R[0, 0])
+    return np.array([a, b, c])
 
 
 def _apply_ground_projection(body, mu: float = 0.9) -> None:
@@ -269,8 +290,13 @@ def run(mode: str = "rigid",
     contact.register_rbd(arm_solver, robot_id="arm")
     if mode == "rigid":
         contact.register_rbd(box_solver, robot_id="box")
+        # Disable contact between every arm link (including the fingers)
+        # and the box. The grip is kinematic, so SAT contact between
+        # rotated-box geometry and the fingers produced huge launch
+        # impulses the instant grip released — the box flew to +x=10 m.
         for arm_link in ["base_link", "link_1", "link_2", "link_3",
-                         "link_4", "palm_link"]:
+                         "link_4", "palm_link",
+                         "left_finger", "right_finger"]:
             contact.add_cross_filter("arm", arm_link, "box", "target_box_body")
 
     # ── MPM pile ─────────────────────────────────────────────────
@@ -319,13 +345,15 @@ def run(mode: str = "rigid",
 
     _LIFT_START_T  = sum(d for _, d in _PHASES[:5])
     _RELEASE_START = sum(d for _, d in _PHASES[:7])
-    grip_active    = [False]
-    grip_palm_pos0 = np.zeros(3)
-    grip_box_pos0  = np.zeros(3)
-    grip_box_rot0  = np.zeros(3)
-    grip_offset    = np.zeros(3)
-    grip_body_x0   = [None]
-    prev_palm_pos  = [None]
+    grip_active       = [False]
+    grip_palm_pos0    = np.zeros(3)
+    grip_palm_rot0    = np.eye(3)                # palm rotation at grip start
+    grip_box_pos0     = np.zeros(3)
+    grip_box_rot0_mat = np.eye(3)                # box rotation at grip start (matrix)
+    grip_offset_palm  = np.zeros(3)              # box-CoM offset in palm frame
+    grip_nodes_palm   = [None]                   # CB: node positions in palm frame
+    prev_palm_pos     = [None]
+    prev_box_x        = [None]                   # CB: previous step's x, for v finite-diff
     palm_idx       = robot.link_index("palm_link")
 
     _l_idx = robot.link_index("left_finger")
@@ -358,7 +386,8 @@ def run(mode: str = "rigid",
         return cb_body.x.mean(axis=0), BOX_SIZE * 0.5
 
     def step_once() -> None:
-        nonlocal grip_box_pos0, grip_box_rot0, grip_offset
+        nonlocal grip_box_pos0, grip_box_rot0_mat, grip_offset_palm
+        nonlocal grip_palm_rot0
         nonlocal cached_w_left, cached_w_right
         advance_phases(sim_time[0])
 
@@ -381,6 +410,7 @@ def run(mode: str = "rigid",
 
         fk = robot.forward_kinematics()
         palm_pos = fk[palm_idx].translation.copy()
+        palm_rot = fk[palm_idx].rotation.copy()
 
         fingers_closed = robot.q[4] < 0.003
         gripping_now = (sim_time[0] >= _LIFT_START_T
@@ -388,11 +418,15 @@ def run(mode: str = "rigid",
                         and fingers_closed)
 
         if mode == "rigid":
-            # Rigid box physics
-            box_solver.clear_external_forces()
-            for li, w in contact.compute_rbd_contact_forces(box_solver).items():
-                box_solver.set_external_force(li, w)
-            box_solver.step()
+            # Only step the box RBD when grip is **not** active. During
+            # kinematic carry we overwrite q anyway; letting the solver
+            # run in parallel just fights the overwrite and leaks
+            # angular velocity through the integrator.
+            if not gripping_now:
+                box_solver.clear_external_forces()
+                for li, w in contact.compute_rbd_contact_forces(box_solver).items():
+                    box_solver.set_external_force(li, w)
+                box_solver.step()
 
             if not grip_active[0] and box_robot.q[2] < 0.045 and sim_time[0] < _LIFT_START_T:
                 box_robot.q[:2]   = box_ground_xy
@@ -402,17 +436,38 @@ def run(mode: str = "rigid",
 
             if gripping_now:
                 if not grip_active[0]:
-                    grip_active[0]   = True
+                    grip_active[0]    = True
                     grip_palm_pos0[:] = palm_pos
-                    grip_box_pos0 = box_robot.q[:3].copy()
-                    grip_box_rot0 = box_robot.q[3:6].copy()
-                    grip_offset   = grip_box_pos0 - grip_palm_pos0
-                target_pos = palm_pos + grip_offset
-                palm_vel = ((palm_pos - prev_palm_pos[0]) / dt
-                            if prev_palm_pos[0] is not None else np.zeros(3))
-                box_robot.q[:3]   = target_pos
-                box_robot.qd[:3]  = palm_vel
-                box_robot.q[3:6]  = grip_box_rot0
+                    grip_palm_rot0    = palm_rot.copy()
+                    grip_box_pos0     = box_robot.q[:3].copy()
+                    # Box orientation from q[3:6] using the free-box
+                    # chain's XYZ-intrinsic joint order.
+                    rx, ry, rz = box_robot.q[3:6]
+                    Rx = np.array([[1,0,0],[0,np.cos(rx),-np.sin(rx)],
+                                   [0,np.sin(rx), np.cos(rx)]])
+                    Ry = np.array([[np.cos(ry),0,np.sin(ry)],[0,1,0],
+                                   [-np.sin(ry),0,np.cos(ry)]])
+                    Rz = np.array([[np.cos(rz),-np.sin(rz),0],
+                                   [np.sin(rz), np.cos(rz),0],[0,0,1]])
+                    grip_box_rot0_mat = Rx @ Ry @ Rz
+                    # Fixed offset from palm to box CoM, expressed in
+                    # palm-local coordinates so that rotating the palm
+                    # carries the box with it.
+                    grip_offset_palm = grip_palm_rot0.T @ (
+                        grip_box_pos0 - grip_palm_pos0
+                    )
+                # Apply palm motion to the box. Translation follows the
+                # palm pose (so the box swings around when the pan joint
+                # rotates); orientation is also rotated by the same palm
+                # delta so the box face-labelling stays consistent.
+                R_delta = palm_rot @ grip_palm_rot0.T
+                new_box_pos = palm_pos + palm_rot @ grip_offset_palm
+                new_box_rot_mat = R_delta @ grip_box_rot0_mat
+                new_box_rpy = _rotmat_to_xyz_euler(new_box_rot_mat)
+                old_box_pos = box_robot.q[:3].copy()
+                box_robot.q[:3]   = new_box_pos
+                box_robot.qd[:3]  = (new_box_pos - old_box_pos) / dt
+                box_robot.q[3:6]  = new_box_rpy
                 box_robot.qd[3:6] = 0.0
             elif sim_time[0] >= _RELEASE_START and grip_active[0]:
                 grip_active[0] = False
@@ -426,16 +481,22 @@ def run(mode: str = "rigid",
                 if not grip_active[0]:
                     grip_active[0]    = True
                     grip_palm_pos0[:] = palm_pos
-                    grip_body_x0[0]   = cb_body.x.copy()
-                    # Re-seat CB internal state so that on future free
-                    # steps it starts from "no internal motion".
+                    grip_palm_rot0    = palm_rot.copy()
+                    # Freeze each node in the palm frame at grip start.
+                    # Rotating the palm later carries every node with it.
+                    grip_nodes_palm[0] = (
+                        (cb_body.x - grip_palm_pos0) @ grip_palm_rot0
+                    )
+                    prev_box_x[0] = cb_body.x.copy()
                     if cb_body.q_r is not None:
                         cb_body.q_r[:] = 0.0
-                delta_palm = palm_pos - grip_palm_pos0
-                cb_body.x[:] = grip_body_x0[0] + delta_palm
-                palm_vel = ((palm_pos - prev_palm_pos[0]) / dt
-                            if prev_palm_pos[0] is not None else np.zeros(3))
-                cb_body.v[:] = palm_vel
+                # palm_pos + (nodes_in_palm) @ palm_rot^T  ← each row rotated by palm_rot.
+                new_x = palm_pos + grip_nodes_palm[0] @ palm_rot.T
+                # Velocity = finite diff so the angular contribution is
+                # captured automatically on release.
+                cb_body.v[:] = (new_x - prev_box_x[0]) / dt
+                prev_box_x[0] = new_x
+                cb_body.x[:] = new_x
                 cached_w_left[:]  = 0.0
                 cached_w_right[:] = 0.0
             else:
