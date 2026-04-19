@@ -69,7 +69,7 @@ class MPMSolver:
         base, w, dw = quadratic_bspline_weights(p.x, dx=dx, origin=g.origin)
         W, _ = tensor_product_weights(w, dw)
 
-        tau = self.material.kirchhoff_stress(p.F)             # (P, 3, 3)
+        tau = self.material.kirchhoff_stress(p.F, p.d)        # (P, 3, 3)
         # A_p = m_p · C_p  −  dt · (4/dx²) · V₀_p · τ_p   — MLS-MPM affine.
         affine = (
             p.m[:, None, None] * p.C
@@ -146,6 +146,9 @@ class MPMSolver:
         # yield surface; elastic materials just keep F_trial.
         project = getattr(self.material, "project", None)
         p.F = project(F_trial) if project is not None else F_trial
+        update_damage = getattr(self.material, "update_damage", None)
+        if update_damage is not None:
+            p.d = update_damage(p.F, p.d)
         p.x = p.x + dt * p.v
 
 

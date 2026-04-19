@@ -22,6 +22,7 @@ class Particles:
     V0: np.ndarray       # (P,)   reference volumes
     F: np.ndarray = field(default=None)   # (P, 3, 3) deformation gradient
     C: np.ndarray = field(default=None)   # (P, 3, 3) APIC affine matrix
+    d: np.ndarray = field(default=None)   # (P,)      damage ∈ [0, 1]
 
     def __post_init__(self) -> None:
         self.x = np.ascontiguousarray(self.x, dtype=np.float64)
@@ -41,6 +42,8 @@ class Particles:
             self.F = np.broadcast_to(np.eye(3), (P, 3, 3)).copy()
         if self.C is None:
             self.C = np.zeros((P, 3, 3), dtype=np.float64)
+        if self.d is None:
+            self.d = np.zeros(P, dtype=np.float64)
 
     @property
     def n(self) -> int:

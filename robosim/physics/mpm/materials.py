@@ -18,12 +18,23 @@ from dataclasses import dataclass
 import numpy as np
 
 
-def _kirchhoff_neo_hookean(F: np.ndarray, mu: float, lam: float) -> np.ndarray:
-    """τ = μ (F F^T − I) + λ · log(J) · I for a batch of F's."""
+def _kirchhoff_neo_hookean(
+    F: np.ndarray, mu: float, lam: float, d: np.ndarray | None = None
+) -> np.ndarray:
+    """τ = μ (F F^T − I) + λ · log(J) · I for a batch of F's.
+
+    When ``d`` (per-particle damage ∈ [0, 1]) is provided, the stress is
+    degraded by ``(1 − d)²`` — a standard quasi-brittle softening
+    (Miehe et al. 2010). A fully damaged particle (d=1) contributes no
+    stress, which is what lets an MPM blob separate into fragments.
+    """
     J = np.linalg.det(F)
     FFt = np.einsum("pab,pcb->pac", F, F)
     I3 = np.eye(3)
-    return mu * (FFt - I3) + (lam * np.log(J))[:, None, None] * I3
+    tau = mu * (FFt - I3) + (lam * np.log(J))[:, None, None] * I3
+    if d is not None:
+        tau = ((1.0 - d) ** 2)[:, None, None] * tau
+    return tau
 
 
 @dataclass
@@ -52,8 +63,8 @@ class NeoHookean:
     def lam(self) -> float:
         return self.young * self.poisson / ((1.0 + self.poisson) * (1.0 - 2.0 * self.poisson))
 
-    def kirchhoff_stress(self, F: np.ndarray) -> np.ndarray:
-        return _kirchhoff_neo_hookean(F, self.mu, self.lam)
+    def kirchhoff_stress(self, F: np.ndarray, d: np.ndarray | None = None) -> np.ndarray:
+        return _kirchhoff_neo_hookean(F, self.mu, self.lam, d)
 
 
 @dataclass
@@ -87,8 +98,8 @@ class VonMisesPlastic:
     def lam(self) -> float:
         return self.young * self.poisson / ((1.0 + self.poisson) * (1.0 - 2.0 * self.poisson))
 
-    def kirchhoff_stress(self, F_E: np.ndarray) -> np.ndarray:
-        return _kirchhoff_neo_hookean(F_E, self.mu, self.lam)
+    def kirchhoff_stress(self, F_E: np.ndarray, d: np.ndarray | None = None) -> np.ndarray:
+        return _kirchhoff_neo_hookean(F_E, self.mu, self.lam, d)
 
     def project(self, F_trial: np.ndarray) -> np.ndarray:
         """Radial-return projection to the Von Mises yield surface."""
@@ -151,8 +162,8 @@ class DruckerPragerPlastic:
         s = np.sin(self.friction_angle)
         return np.sqrt(2.0 / 3.0) * 2.0 * s / (3.0 - s)
 
-    def kirchhoff_stress(self, F_E: np.ndarray) -> np.ndarray:
-        return _kirchhoff_neo_hookean(F_E, self.mu, self.lam)
+    def kirchhoff_stress(self, F_E: np.ndarray, d: np.ndarray | None = None) -> np.ndarray:
+        return _kirchhoff_neo_hookean(F_E, self.mu, self.lam, d)
 
     def project(self, F_trial: np.ndarray) -> np.ndarray:
         U, sigma, Vt = np.linalg.svd(F_trial)
@@ -181,3 +192,46 @@ class DruckerPragerPlastic:
 
         sigma_new = np.exp(eps_new)
         return np.einsum("pab,pb,pbc->pac", U, sigma_new, Vt)
+
+
+@dataclass
+class DamagedNeoHookean:
+    """Neo-Hookean elasticity with monotonic local tensile damage.
+
+    Each particle carries a damage scalar ``d ∈ [0, 1]`` that degrades the
+    stress by ``(1 − d)²``. Damage grows irreversibly when the maximum
+    principal stretch ``λ_max = max σᵢ(F)`` exceeds a critical stretch
+    ``stretch_c`` (e.g. 1.3 for a 30 % tensile limit), following
+
+        d_new = max(d, 1 − (stretch_c / λ_max)^softening).
+
+    Once ``d → 1``, the particle is effectively "broken" — it still carries
+    momentum and mass, but contributes no stress, so the grid loses the
+    bridge that held its neighbours together. That is how an MPM blob
+    tears apart without any explicit crack tracking (CD-MPM, Wolper 2019).
+    """
+
+    young: float = 1e5
+    poisson: float = 0.3
+    stretch_c: float = 1.25          # critical principal stretch
+    softening: float = 2.0           # exponent controlling post-peak rate
+
+    @property
+    def mu(self) -> float:
+        return self.young / (2.0 * (1.0 + self.poisson))
+
+    @property
+    def lam(self) -> float:
+        return self.young * self.poisson / ((1.0 + self.poisson) * (1.0 - 2.0 * self.poisson))
+
+    def kirchhoff_stress(self, F: np.ndarray, d: np.ndarray | None = None) -> np.ndarray:
+        return _kirchhoff_neo_hookean(F, self.mu, self.lam, d)
+
+    def update_damage(self, F: np.ndarray, d: np.ndarray) -> np.ndarray:
+        """Grow per-particle damage from the current F. Monotonic."""
+        sigma = np.linalg.svd(F, compute_uv=False)               # (P, 3)
+        lam_max = sigma.max(axis=-1)                             # (P,)
+        ratio = np.maximum(lam_max / self.stretch_c, 1.0)        # (P,)
+        # ratio == 1 inside the elastic envelope → d_trial = 0.
+        d_trial = 1.0 - ratio ** (-self.softening)
+        return np.minimum(np.maximum(d, d_trial), 1.0)
