@@ -69,35 +69,54 @@ class MPMSolver:
         dx = g.dx
         D_inv = 4.0 / (dx * dx)
 
-        base, w, dw = quadratic_bspline_weights(p.x, dx=dx, origin=g.origin)
-        W, _ = tensor_product_weights(w, dw)
+        base, w, _ = quadratic_bspline_weights(p.x, dx=dx, origin=g.origin)
+        W, _ = tensor_product_weights(w)                       # (P, 3, 3, 3)
 
-        tau = self.material.kirchhoff_stress(p.F, p.d)        # (P, 3, 3)
-        # A_p = m_p · C_p  −  dt · (4/dx²) · V₀_p · τ_p   — MLS-MPM affine.
+        tau = self.material.kirchhoff_stress(p.F, p.d)         # (P, 3, 3)
+        # A_p = m_p · C_p  −  dt · (4/dx²) · V₀_p · τ_p — MLS-MPM affine.
         affine = (
             p.m[:, None, None] * p.C
             - (dt * D_inv) * p.V0[:, None, None] * tau
         )
 
+        nx, ny, nz = g.shape
+        n_cells = nx * ny * nz
+        P = p.x.shape[0]
+
+        # Build the full 27-stencil contribution in one go. Flat shape is
+        # (P * 27,) — one row per (particle, stencil-offset) pair.
+        # np.bincount is ~10× faster than 27 × np.add.at calls.
+        offsets = np.mgrid[0:3, 0:3, 0:3].reshape(3, -1).T     # (27, 3)
+        idx_all = base[:, None, :] + offsets[None, :, :]       # (P, 27, 3)
+        idx_flat = idx_all.reshape(-1, 3)                      # (P*27, 3)
+        flat_lin = (idx_flat[:, 0] * (ny * nz)
+                    + idx_flat[:, 1] * nz
+                    + idx_flat[:, 2])                          # (P*27,)
+
+        W_flat = W.reshape(P, -1)                              # (P, 27)
+        W_rep = W_flat.ravel()                                 # (P*27,)
+
+        # Mass contribution:   m_p * W_ijk
+        m_rep = np.repeat(p.m, 27) * W_rep                     # (P*27,)
+
+        # Momentum contribution:   W_ijk * (m_p * v_p + affine_p · dpos_p,ijk)
+        #   dpos[p, 27, 3] = origin + idx*dx − x_p
+        x_nodes = g.origin + idx_all * dx                      # (P, 27, 3)
+        dpos = x_nodes - p.x[:, None, :]                       # (P, 27, 3)
+        affine_dpos = np.einsum("pab,peb->pea", affine, dpos)  # (P, 27, 3)
+        mom = (p.m[:, None, None] * p.v[:, None, :]
+               + affine_dpos) * W_flat[:, :, None]             # (P, 27, 3)
+        mom_flat = mom.reshape(-1, 3)                          # (P*27, 3)
+
         g.reset()
-        for i in range(3):
-            for j in range(3):
-                for k in range(3):
-                    idx = base + np.array([i, j, k], dtype=np.int64)
-                    ix, iy, iz = idx[:, 0], idx[:, 1], idx[:, 2]
-                    W_ijk = W[:, i, j, k]
-
-                    x_node = g.origin + idx * dx
-                    dpos = x_node - p.x                       # (P, 3)
-
-                    affine_dpos = np.einsum("pab,pb->pa", affine, dpos)
-                    mom_contrib = W_ijk[:, None] * (
-                        p.m[:, None] * p.v + affine_dpos
-                    )
-                    mass_contrib = W_ijk * p.m
-
-                    np.add.at(g.m, (ix, iy, iz), mass_contrib)
-                    np.add.at(g.v, (ix, iy, iz), mom_contrib)
+        g.m.reshape(-1)[:] = np.bincount(
+            flat_lin, weights=m_rep, minlength=n_cells,
+        )
+        gv_flat = g.v.reshape(-1, 3)
+        for d in range(3):
+            gv_flat[:, d] = np.bincount(
+                flat_lin, weights=mom_flat[:, d], minlength=n_cells,
+            )
 
     def _normalise_grid(self) -> None:
         g = self.grid
@@ -110,32 +129,21 @@ class MPMSolver:
         dx = g.dx
         D_inv = 4.0 / (dx * dx)
 
-        base, w, dw = quadratic_bspline_weights(p.x, dx=dx, origin=g.origin)
-        W, _ = tensor_product_weights(w, dw)
+        base, w, _ = quadratic_bspline_weights(p.x, dx=dx, origin=g.origin)
+        W, _ = tensor_product_weights(w)                       # (P, 3, 3, 3)
+        P = p.x.shape[0]
 
-        v_new = np.zeros_like(p.v)
-        C_new = np.zeros_like(p.C)
+        # Batched 27-stencil gather in one shot (no Python loop).
+        offsets = np.mgrid[0:3, 0:3, 0:3].reshape(3, -1).T     # (27, 3)
+        idx_all = base[:, None, :] + offsets[None, :, :]       # (P, 27, 3)
+        v_all = g.v[idx_all[..., 0], idx_all[..., 1], idx_all[..., 2]]  # (P, 27, 3)
+        x_nodes = g.origin + idx_all * dx                      # (P, 27, 3)
+        dpos = x_nodes - p.x[:, None, :]                       # (P, 27, 3)
+        W_flat = W.reshape(P, -1)                              # (P, 27)
 
-        for i in range(3):
-            for j in range(3):
-                for k in range(3):
-                    idx = base + np.array([i, j, k], dtype=np.int64)
-                    ix, iy, iz = idx[:, 0], idx[:, 1], idx[:, 2]
-                    W_ijk = W[:, i, j, k]
-
-                    v_i = g.v[ix, iy, iz]
-                    x_node = g.origin + idx * dx
-                    dpos = x_node - p.x
-
-                    v_new += W_ijk[:, None] * v_i
-                    C_new += (
-                        D_inv
-                        * W_ijk[:, None, None]
-                        * np.einsum("pa,pb->pab", v_i, dpos)
-                    )
-
-        p.v = v_new
-        p.C = C_new
+        # v_new = Σ_ijk W · v_i ;  C_new = D_inv · Σ_ijk W · v_i ⊗ dpos
+        p.v = np.einsum("pe,pea->pa", W_flat, v_all)
+        p.C = D_inv * np.einsum("pe,pea,peb->pab", W_flat, v_all, dpos)
 
     def _update_F_and_advect(self, dt: float) -> None:
         p = self.particles

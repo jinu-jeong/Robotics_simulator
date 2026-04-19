@@ -68,48 +68,45 @@ def quadratic_bspline_weights(
 
 def tensor_product_weights(
     w: np.ndarray,
-    dw_dx: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build 3D tensor-product weights and gradients from per-axis weights.
+    dw_dx: np.ndarray | None = None,
+    need_grad: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Build 3D tensor-product weights (and optionally gradients).
 
     Parameters
     ----------
     w : (P, 3, 3)
         Per-axis weights from :func:`quadratic_bspline_weights`.
-    dw_dx : (P, 3, 3)
-        Per-axis weight gradients.
+    dw_dx : (P, 3, 3), optional
+        Per-axis weight gradients (required only when ``need_grad=True``).
+    need_grad : bool
+        Whether to materialise the ``(P, 3, 3, 3, 3)`` gradient tensor.
+        MLS-MPM's single-pass scheme does not need ``gradW`` — the affine
+        momentum term already encodes the gradient — so we skip it by
+        default and return ``(W, None)``.
 
     Returns
     -------
     W : (P, 3, 3, 3)
         ``W[p, i, j, k] = w[p, 0, i] * w[p, 1, j] * w[p, 2, k]``.
-    gradW : (P, 3, 3, 3, 3)
-        ``gradW[p, i, j, k, a]`` is the derivative of ``W[p, i, j, k]``
-        with respect to world coordinate axis ``a``.
+    gradW : (P, 3, 3, 3, 3) or None
     """
     wx, wy, wz = w[:, 0, :], w[:, 1, :], w[:, 2, :]          # (P, 3) each
-    dwx, dwy, dwz = dw_dx[:, 0, :], dw_dx[:, 1, :], dw_dx[:, 2, :]
-
     W = (
         wx[:, :, None, None]
         * wy[:, None, :, None]
         * wz[:, None, None, :]
     )
+    # Backwards-compat: if the caller passed dw_dx explicitly, assume they
+    # want the gradient; otherwise respect ``need_grad``.
+    if dw_dx is None and not need_grad:
+        return W, None
+    if dw_dx is None:
+        raise ValueError("dw_dx is required when need_grad=True")
 
-    gW_x = (
-        dwx[:, :, None, None]
-        * wy[:, None, :, None]
-        * wz[:, None, None, :]
-    )
-    gW_y = (
-        wx[:, :, None, None]
-        * dwy[:, None, :, None]
-        * wz[:, None, None, :]
-    )
-    gW_z = (
-        wx[:, :, None, None]
-        * wy[:, None, :, None]
-        * dwz[:, None, None, :]
-    )
+    dwx, dwy, dwz = dw_dx[:, 0, :], dw_dx[:, 1, :], dw_dx[:, 2, :]
+    gW_x = dwx[:, :, None, None] * wy[:, None, :, None] * wz[:, None, None, :]
+    gW_y = wx[:, :, None, None] * dwy[:, None, :, None] * wz[:, None, None, :]
+    gW_z = wx[:, :, None, None] * wy[:, None, :, None] * dwz[:, None, None, :]
     gradW = np.stack([gW_x, gW_y, gW_z], axis=-1)            # (P, 3, 3, 3, 3)
     return W, gradW

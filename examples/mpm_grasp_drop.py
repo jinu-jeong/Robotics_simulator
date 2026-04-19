@@ -85,7 +85,7 @@ _KD = np.array([ 35.0,  50.0,  20.0,   2.0, 100., 100.])
 # Pan = −1.0 → palm ends up near (0.28, −0.44, 0.22). Put the pile there.
 PILE_CENTER_XY = np.array([0.28, -0.44])
 PILE_SIZE      = np.array([0.16, 0.16, 0.10])           # x, y, z extent
-PILE_N         = 10                                       # n particles / axis
+PILE_N         = 8                                        # n particles / axis
 PILE_DENSITY   = 1400.0
 
 # MPM domain covers only the pile + enough space around it for the box to
@@ -296,12 +296,9 @@ def run(material: str = "clay", headless: bool = False) -> None:
             grip_active[0] = False
 
         # Feed the rigid box pose into the MPM collider and step MPM.
-        if prev_palm_pos[0] is not None:
-            box_vel = (box_robot.q[:3] - mpm_collider.center) / dt_step
-        else:
-            box_vel = np.zeros(3)
-        mpm_collider.center = box_robot.q[:3].copy()
-        mpm_collider.velocity = box_vel
+        new_center = box_robot.q[:3].copy()
+        mpm_collider.velocity = (new_center - mpm_collider.center) / dt_step
+        mpm_collider.center = new_center
         try:
             mpm_solver.step(dt_step)
         except IndexError:
