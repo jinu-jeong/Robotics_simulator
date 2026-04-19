@@ -164,7 +164,9 @@ class SimRunner:
 
             # ── viewer update ──
             if _viewer_ctx is not None:
-                self._update_viewer(_viewer_ctx, trajs)
+                alive = self._update_viewer(_viewer_ctx, trajs)
+                if not alive:
+                    break   # user closed the window
 
         t_wall = time.time() - t_wall0
 
@@ -574,7 +576,15 @@ class SimRunner:
 
     def _init_viewer(self):
         """Initialise Taichi viewer and renderers. Returns context dict."""
-        import taichi as ti  # noqa: F401
+        import taichi as ti
+        # ti.init() must be called before any Taichi field/window creation.
+        try:
+            ti.init(arch=ti.metal)   # macOS Metal (M-series / AMD)
+        except Exception:
+            try:
+                ti.init(arch=ti.vulkan)
+            except Exception:
+                ti.init()            # CPU fallback
         from robosim.viz.scene_renderer import RobotRenderer
         from robosim.viz.viewer import SimViewer
 
@@ -604,9 +614,14 @@ class SimRunner:
 
         return ctx
 
-    def _update_viewer(self, ctx: dict, trajs: list) -> None:
+    def _update_viewer(self, ctx: dict, trajs: list) -> bool:
+        """Render one viewer frame.  Returns False when the window is closed."""
         viewer = ctx["viewer"]
         scene  = self._scene
+
+        # Check if window was closed by the user
+        if not viewer._window.running:
+            return False
 
         for name, rr in ctx["renderers"].items():
             rr.update()
@@ -619,7 +634,6 @@ class SimRunner:
             # Von Mises stress coloring
             try:
                 from robosim.physics.fem.assembly import batch_von_mises
-                from robosim.viz.colormap import jet
                 vm = batch_von_mises(
                     bh._body.mesh, bh._body.x, bh._body.material,
                     bh._body._dN_list, bh._body._volumes,
@@ -645,6 +659,11 @@ class SimRunner:
                 f"  bot_z={bh.bottom_z:+.4f}"
             )
         viewer.add_text("\n".join(lines) + "\n[LDrag=orbit  Scroll=zoom  ESC=quit]")
+
+        # ── Actually render the frame ──────────────────────────────────────────
+        viewer._render_frame()
+        viewer._window.show()
+        return True
 
     # ── headless output ───────────────────────────────────────────────────────
 
