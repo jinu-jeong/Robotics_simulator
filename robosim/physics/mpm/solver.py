@@ -48,6 +48,7 @@ class MPMSolver:
     material: NeoHookean = field(default_factory=NeoHookean)
     gravity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, -9.81]))
     bcs: list[BoxBC] = field(default_factory=list)
+    colliders: list = field(default_factory=list)
 
     def step(self, dt: float) -> None:
         self._p2g_with_stress(dt)
@@ -55,6 +56,8 @@ class MPMSolver:
         apply_gravity(self.grid, dt, self.gravity)
         for bc in self.bcs:
             apply_box_bc(self.grid, bc.lower, bc.upper, mode=bc.mode)
+        for col in self.colliders:
+            col.apply(self.grid, dt)
         self._g2p(dt)
         self._update_F_and_advect(dt)
 
