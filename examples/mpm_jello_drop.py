@@ -1,23 +1,19 @@
 """Standalone MPM demo — elastic jello cube dropped onto a floor.
 
-Milestone 1 deliverable for the MPM solver. Runs the MLS-MPM solver
-directly (Scene API / rigid-body coupling arrives in Milestone 4).
+Taichi GGUI live view via :class:`SimViewer` (same style as grasp_demo).
+Headless mode prints diagnostics.
 
 Usage
 -----
-    python examples/mpm_jello_drop.py                  # live matplotlib animation
-    python examples/mpm_jello_drop.py --headless       # print diagnostics, no GUI
-    python examples/mpm_jello_drop.py --save out.mp4   # record an MP4 (needs ffmpeg)
-
-The cube starts at rest above the floor, falls under gravity, compresses
-on impact, rebounds, and wobbles. Centre-of-mass trajectory and total
-kinetic + elastic potential energy are printed along the way.
+    python examples/mpm_jello_drop.py                # GUI
+    python examples/mpm_jello_drop.py --headless     # diagnostics only
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,43 +26,42 @@ from robosim.physics.mpm.solver import BoxBC, MPMSolver, sample_box_particles  #
 
 
 # ── Physical setup ───────────────────────────────────────────────────────────
-
 DOMAIN_LOWER = np.array([0.0, 0.0, 0.0])
 DOMAIN_UPPER = np.array([0.6, 0.6, 0.6])
 CUBE_LOWER   = np.array([0.25, 0.25, 0.35])
 CUBE_UPPER   = np.array([0.35, 0.35, 0.45])
 DX           = 0.015
-N_PER_AXIS   = 8        # 512 particles inside the cube
-DENSITY      = 1000.0   # kg/m³  (water-like jello)
-YOUNG        = 4e4      # Pa
+N_PER_AXIS   = 8
+DENSITY      = 1000.0
+YOUNG        = 4e4
 POISSON      = 0.3
 GRAVITY      = np.array([0.0, 0.0, -9.81])
 DT           = 3e-4
-N_STEPS      = 1200     # ~0.36 s of sim time
-SNAPSHOT_EVERY = 20     # frames captured per dt_snapshot for animation
+N_STEPS      = 1200
+SUBSTEPS_PER_FRAME = 4
 
 
 def build_solver() -> MPMSolver:
-    pts = sample_box_particles(
-        lower=CUBE_LOWER,
-        upper=CUBE_UPPER,
-        n_per_axis=N_PER_AXIS,
-        density=DENSITY,
-    )
-    grid = Grid.from_bounds(lower=DOMAIN_LOWER, upper=DOMAIN_UPPER, dx=DX, pad=3)
+    pts  = sample_box_particles(CUBE_LOWER, CUBE_UPPER, N_PER_AXIS, DENSITY)
+    grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
     return MPMSolver(
-        particles=pts,
-        grid=grid,
+        particles=pts, grid=grid,
         material=NeoHookean(young=YOUNG, poisson=POISSON),
         gravity=GRAVITY,
-        bcs=[
-            BoxBC(
-                lower=DOMAIN_LOWER,
-                upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
-                mode="slip",
-            ),
-        ],
+        bcs=[BoxBC(lower=DOMAIN_LOWER,
+                   upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
+                   mode="slip")],
     )
+
+
+# ── Ground-plane mesh + grid lines (matches grasp_demo aesthetic) ────────────
+
+def _ground_mesh(size: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
+    s = size / 2.0
+    verts = np.array([[-s, -s, 0], [s, -s, 0], [s, s, 0], [-s, s, 0]],
+                     dtype=np.float64)
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    return verts + np.array([DOMAIN_UPPER[0]/2, DOMAIN_UPPER[1]/2, 0]), faces
 
 
 def kinetic_energy(solver: MPMSolver) -> float:
@@ -75,92 +70,89 @@ def kinetic_energy(solver: MPMSolver) -> float:
 
 
 def elastic_energy(solver: MPMSolver) -> float:
-    """Neo-Hookean strain energy density, integrated over the particles."""
-    p = solver.particles
-    mat = solver.material
-    J = np.linalg.det(p.F)
-    IC = np.einsum("pab,pab->p", p.F, p.F)       # tr(F F^T)
-    psi = 0.5 * mat.mu * (IC - 3.0) - mat.mu * np.log(J) + 0.5 * mat.lam * np.log(J) ** 2
+    p, mat = solver.particles, solver.material
+    J  = np.linalg.det(p.F)
+    IC = np.einsum("pab,pab->p", p.F, p.F)
+    psi = 0.5*mat.mu*(IC-3.0) - mat.mu*np.log(J) + 0.5*mat.lam*np.log(J)**2
     return float((psi * p.V0).sum())
 
-
-# ── Drivers ──────────────────────────────────────────────────────────────────
 
 def run_headless() -> None:
     solver = build_solver()
     pts = solver.particles
-    print(f"[init] {pts.n} particles, grid {solver.grid.shape}, dx={solver.grid.dx}")
-
+    print(f"[init] {pts.n} particles, grid {solver.grid.shape}")
     for step in range(N_STEPS + 1):
         if step % 60 == 0:
             com = pts.x.mean(axis=0)
-            vcom = (pts.m[:, None] * pts.v).sum(axis=0) / pts.m.sum()
-            KE = kinetic_energy(solver)
-            PE = elastic_energy(solver)
-            t = step * DT
-            print(
-                f"t={t:5.3f}s  com=({com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f})  "
-                f"v_com_z={vcom[2]:+.3f}  KE={KE:.3e}  PE={PE:.3e}  total={KE+PE:.3e}"
-            )
+            vcom_z = float((pts.m * pts.v[:, 2]).sum() / pts.m.sum())
+            KE, PE = kinetic_energy(solver), elastic_energy(solver)
+            print(f"t={step*DT:5.3f}s  com_z={com[2]:.3f}  v_com_z={vcom_z:+.3f}"
+                  f"  KE={KE:.3e}  PE={PE:.3e}  total={KE+PE:.3e}")
         if step < N_STEPS:
             solver.step(DT)
 
 
-def run_animated(save_path: str | None) -> None:
-    import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
+def run_gui() -> None:
+    from robosim.viz.viewer import SimViewer
 
     solver = build_solver()
     pts = solver.particles
 
-    # Pre-roll one step so the scatter has something non-degenerate to show.
-    frames_x = [pts.x.copy()]
-    for step in range(N_STEPS):
-        solver.step(DT)
-        if step % SNAPSHOT_EVERY == 0:
-            frames_x.append(pts.x.copy())
+    viewer = SimViewer(
+        title="RoboSim — MPM Jello Drop",
+        window_size=(1280, 800),
+        background=(0.08, 0.08, 0.10),
+    )
+    viewer.initialize()
 
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_xlim(DOMAIN_LOWER[0], DOMAIN_UPPER[0])
-    ax.set_ylim(DOMAIN_LOWER[1], DOMAIN_UPPER[1])
-    ax.set_zlim(DOMAIN_LOWER[2], DOMAIN_UPPER[2])
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    ax.set_title("MPM jello drop")
-
-    scat = ax.scatter(
-        frames_x[0][:, 0], frames_x[0][:, 1], frames_x[0][:, 2],
-        s=8, c=frames_x[0][:, 2], cmap="viridis",
+    gv, gf = _ground_mesh(size=0.8)
+    viewer.add_mesh("ground", gv, gf, color=np.array([0.22, 0.22, 0.25]))
+    viewer.add_particles(
+        "mpm", pts.x, radius=0.006,
+        per_vertex_color=_height_colors(pts.x[:, 2]),
     )
 
-    def update(i: int):
-        x = frames_x[i]
-        scat._offsets3d = (x[:, 0], x[:, 1], x[:, 2])
-        scat.set_array(x[:, 2])
-        ax.set_title(f"MPM jello drop — t={i * SNAPSHOT_EVERY * DT:.2f}s")
-        return (scat,)
+    step_count = [0]
+    t_wall0 = time.time()
 
-    anim = FuncAnimation(fig, update, frames=len(frames_x), interval=40, blit=False)
+    def step(frame: int) -> None:
+        if step_count[0] >= N_STEPS:
+            return
+        for _ in range(SUBSTEPS_PER_FRAME):
+            solver.step(DT)
+            step_count[0] += 1
+            if step_count[0] >= N_STEPS:
+                break
+        viewer.update_particles("mpm", pts.x,
+                                per_vertex_color=_height_colors(pts.x[:, 2]))
+        com = pts.x.mean(axis=0)
+        vcom_z = float((pts.m * pts.v[:, 2]).sum() / pts.m.sum())
+        KE, PE = kinetic_energy(solver), elastic_energy(solver)
+        t_sim = step_count[0] * DT
+        viewer.add_text(
+            f"t = {t_sim:6.3f} s   step {step_count[0]}/{N_STEPS}\n"
+            f"CoM z  : {com[2]:+.3f} m   v_com_z: {vcom_z:+.3f} m/s\n"
+            f"KE = {KE:8.2e}  PE = {PE:8.2e}  total = {KE+PE:8.2e}\n"
+            f"[LDrag=orbit  Scroll=zoom  ESC=quit]"
+        )
 
-    if save_path is not None:
-        anim.save(save_path, dpi=150, fps=25)
-        print(f"saved animation to {save_path}")
-    else:
-        plt.show()
+    viewer.add_callback(step)
+    viewer.show()
+
+
+def _height_colors(z: np.ndarray) -> np.ndarray:
+    t = np.clip((z - DOMAIN_LOWER[2]) / (DOMAIN_UPPER[2] - DOMAIN_LOWER[2]), 0, 1)
+    return np.column_stack([0.3 + 0.5*t, 0.5 + 0.3*t, 1.0 - 0.4*t]).astype(np.float32)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MPM jello drop demo")
-    parser.add_argument("--headless", action="store_true", help="print diagnostics, no GUI")
-    parser.add_argument("--save", default=None, help="save animation to this path (mp4/gif)")
-    args = parser.parse_args()
-
-    if args.headless and args.save is None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--headless", action="store_true")
+    args = ap.parse_args()
+    if args.headless:
         run_headless()
     else:
-        run_animated(save_path=args.save)
+        run_gui()
 
 
 if __name__ == "__main__":

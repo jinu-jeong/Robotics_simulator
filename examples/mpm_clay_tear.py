@@ -3,14 +3,15 @@
 A horizontal clay bar is pulled at both ends with a uniform tensile
 strain rate. Interior particles stretch past the critical principal
 stretch, accumulate damage, and eventually stop transmitting stress —
-so the bar separates into two fragments. Colour encodes per-particle
-damage ``d ∈ [0, 1]``.
+so the bar separates into two fragments.
+
+Colour encodes per-particle damage ``d ∈ [0, 1]`` (cool → hot).
+Rendering via :class:`SimViewer` (same Taichi GGUI style as grasp_demo).
 
 Usage
 -----
     python examples/mpm_clay_tear.py
     python examples/mpm_clay_tear.py --headless
-    python examples/mpm_clay_tear.py --save tear.mp4
 """
 
 from __future__ import annotations
@@ -36,10 +37,10 @@ BAR_UPPER    = np.array([0.70, 0.52, 0.52])
 DX           = 0.02
 N_X, N_YZ    = 41, 5
 DENSITY      = 1200.0
-STRAIN_RATE  = 10.0                       # 1/s — tensile pull rate
+STRAIN_RATE  = 10.0
 DT           = 2e-4
 N_STEPS      = 900
-SNAPSHOT_EVERY = 10
+SUBSTEPS_PER_FRAME = 4
 
 
 def build_solver() -> MPMSolver:
@@ -51,24 +52,35 @@ def build_solver() -> MPMSolver:
     P = x.shape[0]
     V = float(np.prod(BAR_UPPER - BAR_LOWER))
     pts = Particles(
-        x=x,
-        v=np.zeros_like(x),
+        x=x, v=np.zeros_like(x),
         m=np.full(P, DENSITY * V / P),
         V0=np.full(P, V / P),
     )
-    # Uniform extension in x.
     pts.v[:, 0] = STRAIN_RATE * (pts.x[:, 0] - 0.5)
-
-    grid = Grid.from_bounds(lower=DOMAIN_LOWER, upper=DOMAIN_UPPER, dx=DX, pad=3)
+    grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
     return MPMSolver(
-        particles=pts,
-        grid=grid,
-        material=DamagedNeoHookean(
-            young=1.5e4, poisson=0.3, stretch_c=1.05, softening=3.0
-        ),
-        gravity=np.zeros(3),
-        bcs=[],
+        particles=pts, grid=grid,
+        material=DamagedNeoHookean(young=1.5e4, poisson=0.3,
+                                   stretch_c=1.05, softening=3.0),
+        gravity=np.zeros(3), bcs=[],
     )
+
+
+def _ground_mesh(size: float = 1.2) -> tuple[np.ndarray, np.ndarray]:
+    s = size / 2.0
+    verts = np.array([[-s, -s, 0.47], [s, -s, 0.47], [s, s, 0.47], [-s, s, 0.47]],
+                     dtype=np.float64) + np.array([0.5, 0.5, 0.0])
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    return verts, faces
+
+
+def _damage_colors(d: np.ndarray) -> np.ndarray:
+    """Inferno-ish: cool blue (pristine) → orange/yellow (fully broken)."""
+    d = np.clip(d, 0.0, 1.0).astype(np.float32)
+    r = np.clip(1.6 * d, 0, 1)
+    g = np.clip(0.2 + 0.8 * d * d, 0, 1)
+    b = np.clip(0.8 * (1.0 - d), 0, 1)
+    return np.column_stack([r, g, b])
 
 
 def run_headless() -> None:
@@ -78,65 +90,65 @@ def run_headless() -> None:
     for step in range(N_STEPS + 1):
         if step % 100 == 0:
             ext = float(np.ptp(pts.x[:, 0]))
-            d_max = float(pts.d.max())
-            d_mean = float(pts.d.mean())
-            frac_broken = float((pts.d > 0.99).mean())
-            print(
-                f"t={step*DT:5.3f}s  x_ext={ext:.3f}  d_max={d_max:.3f}  "
-                f"d_mean={d_mean:.3f}  broken={frac_broken:.2%}"
-            )
+            print(f"t={step*DT:5.3f}s  x_ext={ext:.3f}  "
+                  f"d_max={pts.d.max():.3f}  d_mean={pts.d.mean():.3f}  "
+                  f"broken={float((pts.d > 0.99).mean()):.2%}")
         if step < N_STEPS:
             solver.step(DT)
 
 
-def run_animated(save_path: str | None) -> None:
-    import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
+def run_gui() -> None:
+    from robosim.viz.viewer import SimViewer
 
     solver = build_solver()
     pts = solver.particles
 
-    frames = [(pts.x.copy(), pts.d.copy())]
-    for step in range(N_STEPS):
-        solver.step(DT)
-        if step % SNAPSHOT_EVERY == 0:
-            frames.append((pts.x.copy(), pts.d.copy()))
+    viewer = SimViewer(
+        title="RoboSim — CD-MPM Clay Tear",
+        window_size=(1280, 800),
+        background=(0.08, 0.08, 0.10),
+    )
+    viewer.initialize()
 
-    fig = plt.figure(figsize=(7, 5))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_xlim(0.0, 1.0); ax.set_ylim(0.3, 0.7); ax.set_zlim(0.3, 0.7)
-    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    gv, gf = _ground_mesh(size=1.4)
+    viewer.add_mesh("ground", gv, gf, color=np.array([0.22, 0.22, 0.25]))
+    viewer.add_particles("mpm", pts.x, radius=0.007,
+                         per_vertex_color=_damage_colors(pts.d))
 
-    x0, d0 = frames[0]
-    scat = ax.scatter(x0[:, 0], x0[:, 1], x0[:, 2], s=10, c=d0,
-                      cmap="inferno", vmin=0.0, vmax=1.0)
-    fig.colorbar(scat, ax=ax, label="damage d")
+    step_count = [0]
 
-    def update(i: int):
-        x, d = frames[i]
-        scat._offsets3d = (x[:, 0], x[:, 1], x[:, 2])
-        scat.set_array(d)
-        ax.set_title(f"CD-MPM clay tear — t={i*SNAPSHOT_EVERY*DT:.2f}s")
-        return (scat,)
+    def step(frame: int) -> None:
+        if step_count[0] >= N_STEPS:
+            return
+        for _ in range(SUBSTEPS_PER_FRAME):
+            solver.step(DT)
+            step_count[0] += 1
+            if step_count[0] >= N_STEPS:
+                break
+        viewer.update_particles("mpm", pts.x,
+                                per_vertex_color=_damage_colors(pts.d))
+        ext = float(np.ptp(pts.x[:, 0]))
+        t_sim = step_count[0] * DT
+        viewer.add_text(
+            f"t = {t_sim:6.3f} s   step {step_count[0]}/{N_STEPS}\n"
+            f"x extent : {ext:.3f} m\n"
+            f"d_max = {pts.d.max():.3f}   d_mean = {pts.d.mean():.3f}\n"
+            f"broken   : {float((pts.d > 0.99).mean()):.2%}\n"
+            f"[LDrag=orbit  Scroll=zoom  ESC=quit]"
+        )
 
-    anim = FuncAnimation(fig, update, frames=len(frames), interval=40, blit=False)
-
-    if save_path is not None:
-        anim.save(save_path, dpi=150, fps=25)
-        print(f"saved animation to {save_path}")
-    else:
-        plt.show()
+    viewer.add_callback(step)
+    viewer.show()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--save", default=None)
     args = ap.parse_args()
-    if args.headless and args.save is None:
+    if args.headless:
         run_headless()
     else:
-        run_animated(save_path=args.save)
+        run_gui()
 
 
 if __name__ == "__main__":

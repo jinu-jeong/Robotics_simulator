@@ -161,6 +161,20 @@ class _MeshEntry:
     _cached_edges: np.ndarray | None = field(default=None, repr=False)
 
 
+@dataclass
+class _ParticleEntry:
+    """A renderable particle cloud stored in the viewer."""
+    positions: np.ndarray                       # (P, 3) world-space
+    radius: float = 0.005
+    color: np.ndarray = field(default_factory=lambda: np.array([0.35, 0.75, 1.0]))
+    per_vertex_color: np.ndarray | None = None  # (P, 3) optional per-particle RGB
+    visible: bool = True
+    # Private Taichi fields — lazily (re)allocated in _render_frame().
+    _ti_pos: "ti.MatrixField | None" = field(default=None, repr=False)
+    _ti_col: "ti.MatrixField | None" = field(default=None, repr=False)
+    _cap: int = field(default=0, repr=False)
+
+
 # ── SimViewer ────────────────────────────────────────────────────
 
 class SimViewer:
@@ -180,6 +194,7 @@ class SimViewer:
         self.background = background
 
         self._meshes: dict[str, _MeshEntry] = {}
+        self._particles: dict[str, _ParticleEntry] = {}
         self._window: ti.ui.Window | None = None
         self._canvas = None
         self._scene = None
@@ -358,6 +373,49 @@ class SimViewer:
     def update_mesh_color(self, name: str, per_vertex_color: np.ndarray):
         """Update per-vertex color of an existing mesh."""
         self._meshes[name].per_vertex_color = per_vertex_color
+
+    # ── Particle cloud API ────────────────────────────────────────
+
+    def add_particles(
+        self,
+        name: str,
+        positions: np.ndarray,
+        radius: float = 0.005,
+        color: np.ndarray = np.array([0.35, 0.75, 1.0]),
+        per_vertex_color: np.ndarray | None = None,
+    ):
+        """Register a particle cloud (e.g. MPM material points).
+
+        Subsequent frames call :meth:`update_particles` with new positions
+        and/or colours. Radius and colour-mode stay stable across frames.
+        """
+        self._particles[name] = _ParticleEntry(
+            positions=np.ascontiguousarray(positions, dtype=np.float32),
+            radius=float(radius),
+            color=np.asarray(color, dtype=np.float32)[:3].copy(),
+            per_vertex_color=(
+                None if per_vertex_color is None
+                else np.ascontiguousarray(per_vertex_color, dtype=np.float32)
+            ),
+        )
+
+    def update_particles(
+        self,
+        name: str,
+        positions: np.ndarray,
+        per_vertex_color: np.ndarray | None = None,
+    ):
+        """Swap in new positions (and optional per-particle colours)."""
+        entry = self._particles[name]
+        entry.positions = np.ascontiguousarray(positions, dtype=np.float32)
+        if per_vertex_color is not None:
+            entry.per_vertex_color = np.ascontiguousarray(
+                per_vertex_color, dtype=np.float32
+            )
+
+    def set_particles_visible(self, name: str, visible: bool):
+        if name in self._particles:
+            self._particles[name].visible = visible
 
     def set_mesh_visible(self, name: str, visible: bool):
         """Show or hide a mesh by name."""
@@ -557,6 +615,30 @@ class SimViewer:
                 self._ti_wire_verts, width=2.0,
                 indices=self._ti_wire_indices,
                 per_vertex_color=self._ti_wire_colors,
+            )
+
+        # Particle clouds — one scene.particles() call per registered entry.
+        for entry in self._particles.values():
+            if not entry.visible or entry.positions.size == 0:
+                continue
+            P = entry.positions.shape[0]
+            if entry._ti_pos is None or entry._cap < P:
+                entry._cap = max(P, 1)
+                entry._ti_pos = ti.Vector.field(3, dtype=ti.f32, shape=entry._cap)
+                entry._ti_col = ti.Vector.field(3, dtype=ti.f32, shape=entry._cap)
+            pos_pad = np.zeros((entry._cap, 3), dtype=np.float32)
+            pos_pad[:P] = entry.positions
+            entry._ti_pos.from_numpy(pos_pad)
+            col_pad = np.zeros((entry._cap, 3), dtype=np.float32)
+            if entry.per_vertex_color is not None:
+                col_pad[:P] = entry.per_vertex_color
+            else:
+                col_pad[:P] = entry.color[None, :]
+            entry._ti_col.from_numpy(col_pad)
+            self._scene.particles(
+                entry._ti_pos,
+                radius=entry.radius,
+                per_vertex_color=entry._ti_col,
             )
 
         self._canvas.set_background_color(self.background)

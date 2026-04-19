@@ -1,17 +1,18 @@
-"""Milestone 2 demo — plastic MPM materials compared side by side.
+"""MPM plasticity demo — elastic / metal / sand side-by-side.
 
 Drops an initially-elevated cube with a downward kick onto the floor and
 runs the MPM solver under one of three materials:
 
-* ``--material elastic``  — pure Neo-Hookean, bounces back and wobbles.
+* ``--material elastic``  — Neo-Hookean, bounces back and wobbles.
 * ``--material metal``    — Von Mises J2, keeps a permanent flatten.
 * ``--material sand``     — Drucker-Prager, collapses into a granular heap.
+
+Uses :class:`SimViewer` (same Taichi GGUI style as grasp_demo).
 
 Usage
 -----
     python examples/mpm_plasticity_demo.py --material metal
     python examples/mpm_plasticity_demo.py --material sand --headless
-    python examples/mpm_plasticity_demo.py --material elastic --save elastic.mp4
 """
 
 from __future__ import annotations
@@ -26,9 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from robosim.physics.mpm.grid import Grid                             # noqa: E402
 from robosim.physics.mpm.materials import (                           # noqa: E402
-    DruckerPragerPlastic,
-    NeoHookean,
-    VonMisesPlastic,
+    DruckerPragerPlastic, NeoHookean, VonMisesPlastic,
 )
 from robosim.physics.mpm.solver import BoxBC, MPMSolver, sample_box_particles  # noqa: E402
 
@@ -43,116 +42,118 @@ DENSITY      = 1200.0
 GRAVITY      = np.array([0.0, 0.0, -9.81])
 DT           = 3e-4
 N_STEPS      = 1500
-SNAPSHOT_EVERY = 20
-INITIAL_KICK = np.array([0.0, 0.0, -2.0])     # extra downward velocity
+SUBSTEPS_PER_FRAME = 4
+INITIAL_KICK = np.array([0.0, 0.0, -2.0])
 
 
 def make_material(kind: str):
     if kind == "elastic":
         return NeoHookean(young=1e5, poisson=0.3)
     if kind == "metal":
-        # Metal-like: stiff bulk, moderate yield so dents stay without
-        # behaving like a fluid.
         return VonMisesPlastic(young=3e5, poisson=0.3, yield_stress=3e3)
     if kind == "sand":
-        return DruckerPragerPlastic(
-            young=8e4, poisson=0.3, friction_angle=np.deg2rad(35.0)
-        )
-    raise ValueError(f"unknown material: {kind!r}")
+        return DruckerPragerPlastic(young=8e4, poisson=0.3,
+                                    friction_angle=np.deg2rad(35.0))
+    raise ValueError(kind)
 
 
 def build_solver(kind: str) -> MPMSolver:
-    pts = sample_box_particles(
-        lower=CUBE_LOWER,
-        upper=CUBE_UPPER,
-        n_per_axis=N_PER_AXIS,
-        density=DENSITY,
-    )
+    pts = sample_box_particles(CUBE_LOWER, CUBE_UPPER, N_PER_AXIS, DENSITY)
     pts.v[:] = INITIAL_KICK
-    grid = Grid.from_bounds(lower=DOMAIN_LOWER, upper=DOMAIN_UPPER, dx=DX, pad=3)
+    grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
     return MPMSolver(
-        particles=pts,
-        grid=grid,
+        particles=pts, grid=grid,
         material=make_material(kind),
         gravity=GRAVITY,
-        bcs=[BoxBC(
-            lower=DOMAIN_LOWER,
-            upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
-            mode="slip",
-        )],
+        bcs=[BoxBC(lower=DOMAIN_LOWER,
+                   upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
+                   mode="slip")],
     )
+
+
+def _ground_mesh(size: float = 1.2) -> tuple[np.ndarray, np.ndarray]:
+    s = size / 2.0
+    verts = np.array([[-s, -s, 0], [s, -s, 0], [s, s, 0], [-s, s, 0]],
+                     dtype=np.float64) + np.array([0.5, 0.5, 0.0])
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    return verts, faces
+
+
+def _height_colors(z: np.ndarray) -> np.ndarray:
+    t = np.clip(z / 0.5, 0, 1)
+    return np.column_stack([0.3 + 0.5*t, 0.5 + 0.3*t, 1.0 - 0.4*t]).astype(np.float32)
 
 
 def run_headless(kind: str) -> None:
     solver = build_solver(kind)
     pts = solver.particles
-    print(f"[init] material={kind}, {pts.n} particles, grid {solver.grid.shape}")
+    print(f"[init] material={kind}, {pts.n} particles")
     for step in range(N_STEPS + 1):
         if step % 100 == 0:
             com = pts.x.mean(axis=0)
-            z_lo, z_hi = pts.x[:, 2].min(), pts.x[:, 2].max()
             xy_ext = np.ptp(pts.x[:, :2], axis=0).mean()
             vcom_z = float((pts.m * pts.v[:, 2]).sum() / pts.m.sum())
-            print(
-                f"t={step*DT:5.3f}s  com_z={com[2]:.3f}  z=[{z_lo:.3f},{z_hi:.3f}]  "
-                f"xy_extent={xy_ext:.3f}  v_com_z={vcom_z:+.3f}"
-            )
+            print(f"t={step*DT:5.3f}s  com_z={com[2]:.3f}  xy_ext={xy_ext:.3f}"
+                  f"  v_com_z={vcom_z:+.3f}")
         if step < N_STEPS:
             solver.step(DT)
 
 
-def run_animated(kind: str, save_path: str | None) -> None:
-    import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
+def run_gui(kind: str) -> None:
+    from robosim.viz.viewer import SimViewer
 
     solver = build_solver(kind)
     pts = solver.particles
 
-    frames = [pts.x.copy()]
-    for step in range(N_STEPS):
-        solver.step(DT)
-        if step % SNAPSHOT_EVERY == 0:
-            frames.append(pts.x.copy())
-
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_xlim(DOMAIN_LOWER[0], DOMAIN_UPPER[0])
-    ax.set_ylim(DOMAIN_LOWER[1], DOMAIN_UPPER[1])
-    ax.set_zlim(DOMAIN_LOWER[2], DOMAIN_UPPER[2])
-    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-
-    scat = ax.scatter(
-        frames[0][:, 0], frames[0][:, 1], frames[0][:, 2],
-        s=8, c=frames[0][:, 2], cmap="plasma",
+    viewer = SimViewer(
+        title=f"RoboSim — MPM Plasticity [{kind.upper()}]",
+        window_size=(1280, 800),
+        background=(0.08, 0.08, 0.10),
     )
+    viewer.initialize()
 
-    def update(i: int):
-        x = frames[i]
-        scat._offsets3d = (x[:, 0], x[:, 1], x[:, 2])
-        scat.set_array(x[:, 2])
-        ax.set_title(f"{kind} — t={i * SNAPSHOT_EVERY * DT:.2f}s")
-        return (scat,)
+    gv, gf = _ground_mesh(size=1.2)
+    viewer.add_mesh("ground", gv, gf, color=np.array([0.22, 0.22, 0.25]))
+    viewer.add_particles("mpm", pts.x, radius=0.008,
+                         per_vertex_color=_height_colors(pts.x[:, 2]))
 
-    anim = FuncAnimation(fig, update, frames=len(frames), interval=40, blit=False)
+    step_count = [0]
 
-    if save_path is not None:
-        anim.save(save_path, dpi=150, fps=25)
-        print(f"saved animation to {save_path}")
-    else:
-        plt.show()
+    def step(frame: int) -> None:
+        if step_count[0] >= N_STEPS:
+            return
+        for _ in range(SUBSTEPS_PER_FRAME):
+            solver.step(DT)
+            step_count[0] += 1
+            if step_count[0] >= N_STEPS:
+                break
+        viewer.update_particles("mpm", pts.x,
+                                per_vertex_color=_height_colors(pts.x[:, 2]))
+        com = pts.x.mean(axis=0)
+        xy_ext = float(np.ptp(pts.x[:, :2], axis=0).mean())
+        z_lo, z_hi = float(pts.x[:, 2].min()), float(pts.x[:, 2].max())
+        t_sim = step_count[0] * DT
+        viewer.add_text(
+            f"t = {t_sim:6.3f} s   step {step_count[0]}/{N_STEPS}   [{kind.upper()}]\n"
+            f"CoM   : ({com[0]:+.3f}, {com[1]:+.3f}, {com[2]:+.3f})\n"
+            f"z range: [{z_lo:+.3f}, {z_hi:+.3f}]   xy extent: {xy_ext:.3f}\n"
+            f"[LDrag=orbit  Scroll=zoom  ESC=quit]"
+        )
+
+    viewer.add_callback(step)
+    viewer.show()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--material", choices=["elastic", "metal", "sand"], default="metal")
+    ap.add_argument("--material", choices=["elastic", "metal", "sand"],
+                    default="metal")
     ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--save", default=None)
     args = ap.parse_args()
-
-    if args.headless and args.save is None:
+    if args.headless:
         run_headless(args.material)
     else:
-        run_animated(args.material, save_path=args.save)
+        run_gui(args.material)
 
 
 if __name__ == "__main__":
