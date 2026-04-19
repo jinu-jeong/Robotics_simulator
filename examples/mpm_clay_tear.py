@@ -148,6 +148,8 @@ def main() -> None:
     if args.headless:
         run_headless()
     else:
+        import taichi as ti
+        ti.init(arch=ti.metal)
         run_gui()
 
 
