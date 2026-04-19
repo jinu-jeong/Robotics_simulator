@@ -103,14 +103,34 @@ class KinematicBoxCollider:
         self.velocity = np.asarray(self.velocity, dtype=np.float64).reshape(3)
 
     def apply(self, grid: Grid, dt: float) -> None:
-        nx, ny, nz = grid.shape
-        xs = grid.origin[0] + np.arange(nx) * grid.dx
-        ys = grid.origin[1] + np.arange(ny) * grid.dx
-        zs = grid.origin[2] + np.arange(nz) * grid.dx
+        # Fast AABB rejection + slice: compute the index range of grid
+        # nodes that could lie inside the box, and only process that
+        # sub-block. For a small collider in a large grid this avoids
+        # touching 99 % of the cells every step.
+        lo = self.center - self.half_extent
+        hi = self.center + self.half_extent
+        inv_dx = 1.0 / grid.dx
+        ix_lo = int(np.floor((lo[0] - grid.origin[0]) * inv_dx))
+        ix_hi = int(np.ceil ((hi[0] - grid.origin[0]) * inv_dx)) + 1
+        iy_lo = int(np.floor((lo[1] - grid.origin[1]) * inv_dx))
+        iy_hi = int(np.ceil ((hi[1] - grid.origin[1]) * inv_dx)) + 1
+        iz_lo = int(np.floor((lo[2] - grid.origin[2]) * inv_dx))
+        iz_hi = int(np.ceil ((hi[2] - grid.origin[2]) * inv_dx)) + 1
 
+        nx, ny, nz = grid.shape
+        ix_lo = max(ix_lo, 0); ix_hi = min(ix_hi, nx)
+        iy_lo = max(iy_lo, 0); iy_hi = min(iy_hi, ny)
+        iz_lo = max(iz_lo, 0); iz_hi = min(iz_hi, nz)
+        if ix_lo >= ix_hi or iy_lo >= iy_hi or iz_lo >= iz_hi:
+            return  # box is entirely outside the grid → nothing to do
+
+        xs = grid.origin[0] + np.arange(ix_lo, ix_hi) * grid.dx
+        ys = grid.origin[1] + np.arange(iy_lo, iy_hi) * grid.dx
+        zs = grid.origin[2] + np.arange(iz_lo, iz_hi) * grid.dx
         dx = xs[:, None, None] - self.center[0]
         dy = ys[None, :, None] - self.center[1]
         dz = zs[None, None, :] - self.center[2]
+        shp = (ix_hi - ix_lo, iy_hi - iy_lo, iz_hi - iz_lo)
         inside = (
             (np.abs(dx) <= self.half_extent[0])
             & (np.abs(dy) <= self.half_extent[1])
@@ -119,32 +139,34 @@ class KinematicBoxCollider:
         if not inside.any():
             return
 
-        # Penetration depth into each face; axis of smallest is the nearest face.
+        # Penetration depth per axis; nearest face = smallest penetration.
         pen = np.stack(
             [
-                self.half_extent[0] - np.abs(dx * np.ones_like(inside, dtype=np.float64)),
-                self.half_extent[1] - np.abs(dy * np.ones_like(inside, dtype=np.float64)),
-                self.half_extent[2] - np.abs(dz * np.ones_like(inside, dtype=np.float64)),
+                np.broadcast_to(self.half_extent[0] - np.abs(dx), shp),
+                np.broadcast_to(self.half_extent[1] - np.abs(dy), shp),
+                np.broadcast_to(self.half_extent[2] - np.abs(dz), shp),
             ],
             axis=-1,
         )
-        axis = np.argmin(pen, axis=-1)                     # (nx, ny, nz)
-        disp = np.stack(
-            [np.broadcast_to(dx, inside.shape),
-             np.broadcast_to(dy, inside.shape),
-             np.broadcast_to(dz, inside.shape)],
-            axis=-1,
-        )
+        axis = np.argmin(pen, axis=-1)
+        disp = np.stack([
+            np.broadcast_to(dx, shp),
+            np.broadcast_to(dy, shp),
+            np.broadcast_to(dz, shp),
+        ], axis=-1)
 
         # Per-node outward normal (unit axis, sign of the displacement).
-        n = np.zeros((nx, ny, nz, 3))
+        n = np.zeros(shp + (3,))
         for a in range(3):
             mask_a = inside & (axis == a)
             sgn = np.sign(disp[..., a])
             sgn = np.where(sgn == 0, 1.0, sgn)
             n[..., a] = np.where(mask_a, sgn, n[..., a])
 
-        v_rel = grid.v - self.velocity
-        v_n = (v_rel * n).sum(axis=-1, keepdims=True)       # (nx, ny, nz, 1)
+        v_slice = grid.v[ix_lo:ix_hi, iy_lo:iy_hi, iz_lo:iz_hi]
+        v_rel = v_slice - self.velocity
+        v_n = (v_rel * n).sum(axis=-1, keepdims=True)
         push_out = inside[..., None] & (v_n < 0.0)
-        grid.v = np.where(push_out, grid.v - v_n * n, grid.v)
+        grid.v[ix_lo:ix_hi, iy_lo:iy_hi, iz_lo:iz_hi] = np.where(
+            push_out, v_slice - v_n * n, v_slice,
+        )

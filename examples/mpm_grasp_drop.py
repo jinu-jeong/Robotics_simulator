@@ -88,10 +88,21 @@ PILE_SIZE      = np.array([0.16, 0.16, 0.10])           # x, y, z extent
 PILE_N         = 10                                       # n particles / axis
 PILE_DENSITY   = 1400.0
 
-# Domain big enough to contain the arm workspace and the pile.
-DOMAIN_LOWER = np.array([-0.8, -0.8, 0.0])
-DOMAIN_UPPER = np.array([ 0.8,  0.8, 0.8])
-DX           = 0.03
+# MPM domain covers only the pile + enough space around it for the box to
+# enter/exit during the drop. Oversized domains kill performance — every
+# MPM step touches every grid cell. Arm workspace is irrelevant here.
+_PAD         = 0.12       # metres of clearance around the pile in xy/z
+DOMAIN_LOWER = np.array([
+    PILE_CENTER_XY[0] - PILE_SIZE[0] / 2 - _PAD,
+    PILE_CENTER_XY[1] - PILE_SIZE[1] / 2 - _PAD,
+    0.0,
+])
+DOMAIN_UPPER = np.array([
+    PILE_CENTER_XY[0] + PILE_SIZE[0] / 2 + _PAD,
+    PILE_CENTER_XY[1] + PILE_SIZE[1] / 2 + _PAD,
+    PILE_SIZE[2] + _PAD,
+])
+DX           = 0.025
 
 
 def make_material(kind: str):
