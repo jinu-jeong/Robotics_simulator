@@ -182,17 +182,20 @@ def run_gui(kind: str) -> None:
     step_count = [0]
 
     def step(frame: int) -> None:
-        if step_count[0] >= n_steps:
-            return
         for _ in range(SUBSTEPS_PER_FRAME):
             t = step_count[0] * DT
-            c, v = scripted_box_pose(t)
-            collider.center = c
-            collider.velocity = v
-            solver.step(DT)
+            if t <= TOTAL_T:
+                c, v = scripted_box_pose(t)
+                collider.center = c
+                collider.velocity = v
+            # After TOTAL_T the box is well below the pile; freeze the
+            # collider pose so it sits out of the way and the pile
+            # continues to settle under gravity.
+            try:
+                solver.step(DT)
+            except IndexError:
+                return
             step_count[0] += 1
-            if step_count[0] >= n_steps:
-                break
         # Refresh box wireframe corners for the new pose.
         bv2, _ = _box_wireframe_mesh(collider.center, collider.half_extent)
         viewer.update_mesh_vertices("box/collider", bv2)
@@ -204,9 +207,10 @@ def run_gui(kind: str) -> None:
         phase = ("SETTLE" if t_sim < 0.30
                  else "LIFT" if t_sim < 0.70
                  else "TRANSLATE" if t_sim < RELEASE_AT
-                 else "DROP")
+                 else "DROP" if t_sim < TOTAL_T
+                 else "RELAX")
         viewer.add_text(
-            f"t = {t_sim:6.3f} s   step {step_count[0]}/{n_steps}   "
+            f"t = {t_sim:6.3f} s   step {step_count[0]}   "
             f"[{kind.upper()}]   phase: {phase}\n"
             f"Box  : ({collider.center[0]:+.3f}, "
             f"{collider.center[1]:+.3f}, {collider.center[2]:+.3f})\n"

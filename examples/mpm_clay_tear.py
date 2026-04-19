@@ -118,19 +118,18 @@ def run_gui() -> None:
     step_count = [0]
 
     def step(frame: int) -> None:
-        if step_count[0] >= N_STEPS:
-            return
         for _ in range(SUBSTEPS_PER_FRAME):
-            solver.step(DT)
+            try:
+                solver.step(DT)
+            except IndexError:
+                return  # fragments flew off the grid — freeze, keep drawing
             step_count[0] += 1
-            if step_count[0] >= N_STEPS:
-                break
         viewer.update_particles("mpm", pts.x,
                                 per_vertex_color=_damage_colors(pts.d))
         ext = float(np.ptp(pts.x[:, 0]))
         t_sim = step_count[0] * DT
         viewer.add_text(
-            f"t = {t_sim:6.3f} s   step {step_count[0]}/{N_STEPS}\n"
+            f"t = {t_sim:6.3f} s   step {step_count[0]}\n"
             f"x extent : {ext:.3f} m\n"
             f"d_max = {pts.d.max():.3f}   d_mean = {pts.d.mean():.3f}\n"
             f"broken   : {float((pts.d > 0.99).mean()):.2%}\n"

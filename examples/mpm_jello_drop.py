@@ -113,16 +113,14 @@ def run_gui() -> None:
     )
 
     step_count = [0]
-    t_wall0 = time.time()
 
     def step(frame: int) -> None:
-        if step_count[0] >= N_STEPS:
-            return
         for _ in range(SUBSTEPS_PER_FRAME):
-            solver.step(DT)
+            try:
+                solver.step(DT)
+            except IndexError:
+                return  # particle left the grid — freeze physics, keep drawing
             step_count[0] += 1
-            if step_count[0] >= N_STEPS:
-                break
         viewer.update_particles("mpm", pts.x,
                                 per_vertex_color=_height_colors(pts.x[:, 2]))
         com = pts.x.mean(axis=0)
@@ -130,7 +128,7 @@ def run_gui() -> None:
         KE, PE = kinetic_energy(solver), elastic_energy(solver)
         t_sim = step_count[0] * DT
         viewer.add_text(
-            f"t = {t_sim:6.3f} s   step {step_count[0]}/{N_STEPS}\n"
+            f"t = {t_sim:6.3f} s   step {step_count[0]}\n"
             f"CoM z  : {com[2]:+.3f} m   v_com_z: {vcom_z:+.3f} m/s\n"
             f"KE = {KE:8.2e}  PE = {PE:8.2e}  total = {KE+PE:8.2e}\n"
             f"[LDrag=orbit  Scroll=zoom  ESC=quit]"
