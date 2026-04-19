@@ -173,6 +173,12 @@ class SimRunner:
         if headless:
             self._print_summary(t_wall)
 
+        # ── Keep viewer open until user closes the window ─────────────────────
+        if _viewer_ctx is not None:
+            viewer = _viewer_ctx["viewer"]
+            while viewer._window.running:
+                self._update_viewer(_viewer_ctx, trajs)
+
         return {
             "sim_time":  self._time,
             "wall_time": t_wall,
