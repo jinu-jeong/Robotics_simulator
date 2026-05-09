@@ -12,6 +12,7 @@ pytest.importorskip("pymetis", reason="pymetis not installed")
 
 from robosim.physics.fem.mesh import FEMesh                              # noqa: E402
 from robosim.physics.fem.partition import (                              # noqa: E402
+    build_region_partition,
     partition_mesh_nodes,
     partition_mesh_elements,
     nested_dissection_order,
@@ -123,3 +124,63 @@ def test_nd_trivial_sizes():
     assert P0.shape == (0,)
     P1 = nested_dissection_order(sp.csc_matrix(np.array([[2.0]])))
     assert np.array_equal(P1, np.array([0]))
+
+
+# ── RegionPartition tests ──────────────────────────────────────────────────
+
+def test_region_partition_K1_is_trivial(hex_box: FEMesh):
+    rp = build_region_partition(hex_box, n_regions=1)
+    assert rp.n_regions == 1
+    assert rp.element_region.shape == (hex_box.n_elements,)
+    assert rp.element_region.max() == 0
+    assert len(rp.region_elements) == 1
+    assert rp.region_elements[0].size == hex_box.n_elements
+    # All nodes are interior (no shared boundary in K=1).
+    assert rp.region_interior_nodes[0].size == hex_box.n_nodes
+    assert rp.inter_region_boundary_nodes.size == 0
+
+
+def test_region_partition_K4_invariants(hex_box: FEMesh):
+    K = 4
+    rp = build_region_partition(hex_box, n_regions=K)
+    assert rp.n_regions == K
+    assert len(rp.region_elements) == K
+    assert len(rp.region_nodes) == K
+    assert len(rp.region_interior_nodes) == K
+
+    # Element labels cover [0, K) and partition n_elements.
+    assert rp.element_region.shape == (hex_box.n_elements,)
+    sizes = np.array([e.size for e in rp.region_elements])
+    assert sizes.sum() == hex_box.n_elements
+    # Balance: each region within 1.5× the mean.
+    mean = hex_box.n_elements / K
+    assert sizes.max() < 1.5 * mean
+
+    # Interior nodes per region are disjoint.
+    interiors = [set(arr.tolist()) for arr in rp.region_interior_nodes]
+    for i in range(K):
+        for j in range(i + 1, K):
+            assert interiors[i].isdisjoint(interiors[j])
+
+    # Interior ∪ boundary covers every node, no double-count of interiors
+    # in boundary.
+    all_interior = set().union(*interiors)
+    boundary = set(rp.inter_region_boundary_nodes.tolist())
+    assert all_interior.isdisjoint(boundary)
+    assert all_interior | boundary == set(range(hex_box.n_nodes))
+
+    # Each boundary node really appears in ≥ 2 regions.
+    region_node_sets = [set(arr.tolist()) for arr in rp.region_nodes]
+    for n in rp.inter_region_boundary_nodes:
+        count = sum(1 for s in region_node_sets if int(n) in s)
+        assert count >= 2
+
+
+def test_region_partition_boundary_is_small_minority(hex_box: FEMesh):
+    """METIS edge-cut should keep the inter-region boundary much
+    smaller than the total node count for a roughly-uniform mesh."""
+    K = 4
+    rp = build_region_partition(hex_box, n_regions=K)
+    boundary_frac = rp.inter_region_boundary_nodes.size / hex_box.n_nodes
+    # Empirically ≈ 0.4 for 6×6×6 hex box at K=4; require < 0.6 with margin.
+    assert boundary_frac < 0.6

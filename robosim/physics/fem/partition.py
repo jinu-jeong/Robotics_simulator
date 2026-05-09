@@ -4,7 +4,7 @@ Two distinct uses of METIS in a FEM codebase, both wrapped here:
 
 1. **K-way mesh partitioning** — split element/node sets into ``K`` roughly
    balanced regions with small interface size. Used for:
-   * Future hybrid full-order/reduced-order plasticity (each region either
+   * Hybrid full-order/reduced-order plasticity (each region either
      CB-reduced or full-FEM depending on local stress state).
    * Domain decomposition for parallel solvers.
 
@@ -19,6 +19,7 @@ don't touch these functions don't pay the import cost.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
@@ -26,6 +27,104 @@ import scipy.sparse as sp
 
 if TYPE_CHECKING:
     from robosim.physics.fem.mesh import FEMesh
+
+
+@dataclass
+class RegionPartition:
+    """K-way mesh partition with element + node membership bookkeeping.
+
+    Built once at body-construction time from
+    :func:`partition_mesh_elements`; consumed by the hybrid CB-plastic
+    body for per-region state-machine routing (ELASTIC ⇄ PLASTIC_ACTIVE).
+
+    Conventions
+    -----------
+    * ``element_region[e] = r``  — element ``e`` belongs to region ``r``.
+    * ``region_elements[r]``     — int64 array of element indices in region ``r``.
+    * ``region_nodes[r]``        — sorted int64 array of *all* nodes touched by
+      any element in region ``r`` (includes shared boundary nodes).
+    * ``region_interior_nodes[r]`` — nodes in ``region_nodes[r]`` *not*
+      appearing in any other region's element. Safe to be reduced
+      (CB interior DOFs) — when this region is ELASTIC, these nodes can
+      be expressed via modal coordinates.
+    * ``inter_region_boundary_nodes`` — sorted int64 array of nodes shared
+      by ≥ 2 regions. These are the master DOFs that *always* stay
+      full-order; the hybrid solver couples regions through them.
+    """
+
+    n_regions: int
+    element_region: np.ndarray             # (n_elements,) int64
+    region_elements: list[np.ndarray]      # [r] -> element indices
+    region_nodes: list[np.ndarray]         # [r] -> all nodes touched
+    region_interior_nodes: list[np.ndarray]  # [r] -> nodes ONLY in region r
+    inter_region_boundary_nodes: np.ndarray  # nodes in ≥ 2 regions
+
+
+def build_region_partition(mesh: "FEMesh", n_regions: int) -> RegionPartition:
+    """METIS K-way partition + per-region node bookkeeping.
+
+    K=1 short-circuit returns a single region with all elements/nodes
+    and an empty boundary set.
+    """
+    if n_regions <= 0:
+        raise ValueError(f"n_regions must be ≥ 1, got {n_regions}")
+
+    elements = np.asarray(mesh.elements, dtype=np.int64)
+    n_elements = elements.shape[0]
+    n_nodes = int(mesh.n_nodes)
+
+    if n_regions == 1:
+        all_elem = np.arange(n_elements, dtype=np.int64)
+        all_node = np.arange(n_nodes, dtype=np.int64)
+        return RegionPartition(
+            n_regions=1,
+            element_region=np.zeros(n_elements, dtype=np.int64),
+            region_elements=[all_elem],
+            region_nodes=[all_node],
+            region_interior_nodes=[all_node],
+            inter_region_boundary_nodes=np.array([], dtype=np.int64),
+        )
+
+    elem_region = partition_mesh_elements(mesh, n_regions)
+
+    # Per-region element index lists.
+    region_elements = [
+        np.where(elem_region == r)[0].astype(np.int64)
+        for r in range(n_regions)
+    ]
+
+    # Per-region node sets: union of all element-node memberships.
+    # Also count, per node, how many distinct regions contain it.
+    region_nodes: list[np.ndarray] = []
+    region_membership_count = np.zeros(n_nodes, dtype=np.int64)
+    region_owner_of_node = -np.ones(n_nodes, dtype=np.int64)
+    region_node_seen = np.zeros((n_regions, n_nodes), dtype=bool)
+    for r in range(n_regions):
+        nodes_r = np.unique(elements[region_elements[r]].ravel())
+        region_nodes.append(nodes_r.astype(np.int64))
+        region_node_seen[r, nodes_r] = True
+    region_membership_count = region_node_seen.sum(axis=0).astype(np.int64)
+
+    # Interior nodes per region: appear in ONLY one region.
+    region_interior_nodes: list[np.ndarray] = []
+    for r in range(n_regions):
+        in_r = region_node_seen[r]
+        interior_mask = in_r & (region_membership_count == 1)
+        region_interior_nodes.append(
+            np.where(interior_mask)[0].astype(np.int64)
+        )
+
+    # Inter-region boundary: nodes in ≥ 2 regions.
+    inter_region_boundary = np.where(region_membership_count >= 2)[0].astype(np.int64)
+
+    return RegionPartition(
+        n_regions=n_regions,
+        element_region=elem_region,
+        region_elements=region_elements,
+        region_nodes=region_nodes,
+        region_interior_nodes=region_interior_nodes,
+        inter_region_boundary_nodes=inter_region_boundary,
+    )
 
 
 # ── Adjacency builders ─────────────────────────────────────────────────────
