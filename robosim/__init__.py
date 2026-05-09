@@ -4,7 +4,7 @@ __version__ = "0.1.0"
 
 # ── Scene API (high-level) ────────────────────────────────────────────────────
 from robosim.scene.scene   import Scene
-from robosim.scene.objects import Robot, Box, Ground, FEM, CB, Rigid
+from robosim.scene.objects import Robot, Box, Ground, FEM, FEMPlastic, CB, Rigid
 from robosim.scene.handles import (
     RobotHandle,
     FEMBodyHandle,
@@ -18,7 +18,7 @@ __all__ = [
     # scene
     "Scene",
     "Robot", "Box", "Ground",
-    "FEM", "CB", "Rigid",
+    "FEM", "FEMPlastic", "CB", "Rigid",
     # handles
     "RobotHandle", "FEMBodyHandle", "CBBodyHandle", "RigidBodyHandle",
     # control

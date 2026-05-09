@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Callable
 import numpy as np
 
 from robosim.scene.objects import Robot as RobotDef, Box as BoxDef, Ground as GroundDef
-from robosim.scene.objects import FEM, CB, Rigid
+from robosim.scene.objects import FEM, FEMPlastic, CB, Rigid
 from robosim.scene.handles import RobotHandle, FEMBodyHandle, CBBodyHandle, RigidBodyHandle
 from robosim.scene.runner import SimRunner, _ContactPair
 
@@ -166,7 +166,9 @@ class Scene:
 
         ground_z = self._ground.height if self._ground else 0.0
 
-        if isinstance(phys, FEM):
+        if isinstance(phys, FEMPlastic):
+            handle = self._build_fem_plastic_box(defn, name, phys, ground_z)
+        elif isinstance(phys, FEM):
             handle = self._build_fem_box(defn, name, phys, ground_z)
         elif isinstance(phys, CB):
             handle = self._build_cb_box(defn, name, phys, ground_z)
@@ -204,6 +206,45 @@ class Scene:
             max_newton_iters=phys.max_newton_iters,
         )
         # Attach fem_dt and fem_every for runner
+        handle = FEMBodyHandle(name=name, body=body, solver=solver)
+        handle._fem_dt         = fem_dt
+        handle._fem_every      = phys.dt_scale
+        handle._arm_step_count = 0
+        return handle
+
+    def _build_fem_plastic_box(self, defn: BoxDef, name: str, phys: FEMPlastic,
+                                ground_z: float):
+        """Tet4 FEM body with corotational small-strain J2 plasticity.
+
+        Mirrors :meth:`_build_fem_box` but routes to ``TetMesh`` (the
+        only mesh kind currently wired through the plastic assembly
+        path) and a ``CorotationalPlastic`` constitutive model. The
+        runner picks this up via the same FEMBodyHandle plumbing — the
+        contact / grip code is mesh-agnostic.
+        """
+        from robosim.physics.fem.materials import CorotationalPlastic
+        from robosim.physics.fem.mesh import TetMesh
+        from robosim.physics.fem.solver import DeformableBody, FEMSolver
+
+        origin = defn._pos - defn._size * 0.5
+        origin[2] = ground_z
+
+        mesh     = TetMesh.create_box(origin=origin, size=defn._size,
+                                      divisions=phys.mesh)
+        density  = defn._mass / float(np.prod(defn._size))
+        material = CorotationalPlastic(
+            young=phys.young, poisson=phys.poisson,
+            yield_stress=phys.yield_stress, hardening=phys.hardening,
+        )
+
+        body = DeformableBody(name=name, mesh=mesh, material=material, density=density)
+        fem_dt = self.dt * phys.dt_scale
+        solver = FEMSolver(
+            bodies=[body],
+            gravity=self.gravity.copy(),
+            damping=phys.damping,
+            max_newton_iters=phys.max_newton_iters,
+        )
         handle = FEMBodyHandle(name=name, body=body, solver=solver)
         handle._fem_dt         = fem_dt
         handle._fem_every      = phys.dt_scale

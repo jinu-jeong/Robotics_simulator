@@ -66,6 +66,61 @@ class FEM:
                 f"mesh={self.mesh})")
 
 
+class FEMPlastic:
+    """Tet4 finite-element body with corotational small-strain J2 plasticity.
+
+    Same elastic skeleton as :class:`FEM` (corotational stress in the
+    rotated frame), with a textbook Simo & Hughes radial-return mapping
+    bolted on. Per element the body persists a 3×3 plastic-strain tensor;
+    once the trial elastic stress crosses the yield surface, the
+    deviatoric part is projected back, eps_p grows, and the body keeps
+    a permanent set after the load is released.
+
+    Plastic plumbing is wired only for **Tet4** elements, so this class
+    forces a TetMesh internally — ``mesh`` here is divisions, just like
+    :class:`FEM`, but the resulting mesh is built with
+    :meth:`TetMesh.create_box` (5 tets per hex cell).
+
+    Parameters
+    ----------
+    young, poisson, density, damping : same as :class:`FEM`.
+    yield_stress : initial Mises yield stress σ_Y [Pa]; below this the
+        body is purely elastic and matches the FEM reference.
+    hardening    : linear isotropic hardening modulus H [Pa].
+        ``0`` → perfect plasticity (the surface stays put — fully
+        reversible elastic rebound through the *same* surface in the
+        opposite direction can erase plastic strain). Use a few
+        ``× 1e4 - 1e5`` to keep visible permanent set after release.
+    """
+
+    def __init__(
+        self,
+        young:            float = 1e5,
+        poisson:          float = 0.45,
+        density:          float = 1000.0,
+        damping:          float = 0.5,
+        mesh:             tuple[int, int, int] = (6, 6, 6),
+        yield_stress:     float = 1e3,
+        hardening:        float = 5e4,
+        max_newton_iters: int   = 1,
+        dt_scale:         int   = 5,
+    ):
+        self.young            = young
+        self.poisson          = poisson
+        self.density          = density
+        self.damping          = damping
+        self.mesh             = tuple(mesh)
+        self.yield_stress     = yield_stress
+        self.hardening        = hardening
+        self.max_newton_iters = max_newton_iters
+        self.dt_scale         = dt_scale
+
+    def __repr__(self) -> str:
+        return (f"FEMPlastic(E={self.young:.0e}, ν={self.poisson}, "
+                f"σ_Y={self.yield_stress:.0e}, H={self.hardening:.0e}, "
+                f"mesh={self.mesh})")
+
+
 class CB:
     """Craig-Bampton reduced-order deformable body physics (fastest deformable).
 
