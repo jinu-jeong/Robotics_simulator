@@ -51,12 +51,11 @@ class MPMSolver:
     colliders: list = field(default_factory=list)
 
     def step(self, dt: float) -> None:
+        # _p2g_with_stress stashes ``self._active_flat`` from the unique'd
+        # flat_lin (cheap O(P·27 log) sort), avoiding a full O(n_cells)
+        # ``flatnonzero(grid.m)`` scan on the typically-95 %-empty grid.
         self._p2g_with_stress(dt)
-        # Cache active-node flat indices so the downstream grid-wide ops
-        # (normalise, gravity, BCs) can skip the ~95 % of cells that are
-        # zero. ~3-4× speedup on those passes for a localised blob.
-        active_flat = np.flatnonzero(self.grid.m.ravel())
-        self._active_flat = active_flat
+        active_flat = self._active_flat
         self._normalise_grid()
         apply_gravity(self.grid, dt, self.gravity, active_flat=active_flat)
         for bc in self.bcs:
@@ -125,6 +124,17 @@ class MPMSolver:
             gv_flat[:, d] = np.bincount(
                 flat_lin, weights=mom_flat[:, d], minlength=n_cells,
             )
+
+        # Active-node set for downstream grid-wide ops. Derived from
+        # flat_lin (size P·27) instead of scanning the whole grid — ~3-5×
+        # cheaper on sparse problems. Filter by m > 0 because quadratic
+        # B-spline weights are exactly zero when a particle sits on the
+        # axis-aligned support boundary, in which case a node is in
+        # flat_lin but accumulates no mass — feeding it to the normalise
+        # step would divide by zero.
+        candidates = np.unique(flat_lin)
+        m_flat_view = g.m.reshape(-1)
+        self._active_flat = candidates[m_flat_view[candidates] > 0.0]
 
     def _normalise_grid(self) -> None:
         g = self.grid
