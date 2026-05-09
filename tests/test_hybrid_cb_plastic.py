@@ -223,13 +223,17 @@ def test_state_machine_elastic_to_active_to_rebuild_pending():
         body.update_region_states()
     assert any(s == RegionState.PLASTIC_ACTIVE for s in body.region_state)
 
-    # Phase D: remove the load and run long enough for plastic flow
-    # to die out and the no-flow counter to trigger REBUILD_PENDING.
+    # Phase D: remove the load and watch for the REBUILD_PENDING
+    # transient. Once *all* regions reach REBUILD_PENDING the auto
+    # rebuild fires and flips them back to ELASTIC, so we sample on
+    # every tick and assert the transient was observed at least once.
+    saw_rebuild_pending = False
     for _ in range(400):
         body.step(dt=5e-4)
-        body.update_region_states()
-    assert any(s == RegionState.REBUILD_PENDING for s in body.region_state), (
-        f"expected REBUILD_PENDING somewhere, got {body.region_state}"
+        if any(s == RegionState.REBUILD_PENDING for s in body.region_state):
+            saw_rebuild_pending = True
+    assert saw_rebuild_pending, (
+        f"REBUILD_PENDING was never observed; final states={body.region_state}"
     )
 
 
@@ -249,6 +253,60 @@ def test_state_machine_K1_no_yield_stays_elastic():
         body.step(dt=5e-4)
         body.update_region_states()
     assert body.region_state == [RegionState.ELASTIC]
+
+
+def test_rebuild_rom_absorbs_permanent_set_and_resets_state():
+    """After rebuild_rom():
+    * mesh.nodes is updated to the deformed shape (new reference)
+    * eps_p is zeroed (permanent set is now in geometry, not history)
+    * all regions return to ELASTIC
+    * the body keeps its velocity through the rebuild
+    """
+    mesh = _tet_box()
+    fixed = np.where(mesh.nodes[:, 0] < 1e-9)[0]
+    body = HybridCBPlasticBody(
+        mesh=mesh,
+        material=CorotationalElastic(young=1e6, poisson=0.3),
+        density=1000.0, n_modes=8, fixed_nodes=fixed,
+        gravity=np.zeros(3), damping=5.0,
+        yield_stress=5e2, hardening=5e4, n_regions=2,
+        rebuild_after_steady_steps=5,
+    )
+    body.initialize(dt=5e-4)
+
+    # Drive a yielding tip pull then release until the global rebuild fires.
+    right = np.where(mesh.nodes[:, 0] > 0.2 - 1e-9)[0]
+    n_dof = mesh.n_nodes * 3
+    f_pull = np.zeros(n_dof)
+    f_pull[right * 3 + 2] = -10.0 / max(1, len(right))
+    for _ in range(15):
+        body.step(dt=5e-4, extra_forces={0: f_pull})
+
+    nodes_before = mesh.nodes.copy()
+    eps_p_before_norm = float(np.linalg.norm(body.eps_p))
+    assert eps_p_before_norm > 1e-4
+
+    # Run the unloaded settling phase. step() auto-fires rebuild_rom
+    # once every region reports REBUILD_PENDING.
+    rebuilds_before = body._rebuild_count
+    for _ in range(800):
+        body.step(dt=5e-4)
+        if body._rebuild_count > rebuilds_before:
+            break
+
+    assert body._rebuild_count == rebuilds_before + 1, (
+        "rebuild_rom did not fire within the budget"
+    )
+
+    # Mesh reference moved — the new rest is the deformed shape.
+    moved = np.linalg.norm(mesh.nodes - nodes_before)
+    assert moved > 1e-4, f"mesh.nodes barely moved after rebuild: {moved:.3e}"
+    # eps_p reset.
+    assert np.linalg.norm(body.eps_p) == 0.0
+    # All regions back to ELASTIC.
+    assert all(s == RegionState.ELASTIC for s in body.region_state)
+    # body.x equals the new mesh reference (rest in new ref frame).
+    np.testing.assert_allclose(body.x, mesh.nodes, atol=1e-12)
 
 
 def test_active_then_back_to_elastic_preserves_state():

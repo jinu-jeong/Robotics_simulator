@@ -186,6 +186,10 @@ class HybridCBPlasticBody:
     def initialize(self, dt: float) -> None:
         """Build the CB basis (delegates to CraigBamptonBody)."""
         self._cb.initialize(dt=dt)
+        self._cached_dt = float(dt)
+        # Counter of how many ROM rebuilds have happened — useful for
+        # demos / tests that want to confirm the rebuild fired.
+        self._rebuild_count = 0
 
     # ── Stress diagnostics (drive the per-region state machine) ───────
 
@@ -322,6 +326,70 @@ class HybridCBPlasticBody:
                 out[r] = float(sigma_eq[elems_r].max())
         return out
 
+    def all_rebuild_pending(self) -> bool:
+        return all(s == RegionState.REBUILD_PENDING for s in self.region_state)
+
+    def rebuild_rom(self) -> None:
+        """Absorb the current deformed shape into the reference geometry
+        and rebuild the CB basis on top of it.
+
+        Steps
+        -----
+        1. ``mesh.nodes`` ← current ``x`` (so ``x − mesh.nodes`` = 0, the
+           new rest configuration is the deformed one).
+        2. ``eps_p`` ← 0 — the permanent set is now baked into the
+           reference, not stored in plastic-strain history.
+        3. Reconstruct the underlying ``CraigBamptonBody`` so dN_list /
+           volumes / mass / stiffness / Φ_CB all reflect the new
+           reference.
+        4. Restore ``v`` so kinetic state survives the rebuild; ``q_r``
+           starts at zero in the new modal basis (because ``x =
+           new_ref_nodes`` ⇒ disp = 0 ⇒ q_r = 0).
+        5. All regions reset to ELASTIC, all counters cleared.
+
+        Caller normally invokes via the global trigger ``step()`` runs
+        when ``all_rebuild_pending()`` is True; can also be called
+        directly for testing or non-standard cadences.
+        """
+        if self._cb.x is None:
+            raise RuntimeError("rebuild_rom called before initialize()")
+
+        new_ref_nodes = self._cb.x.copy()
+        carry_v = self._cb.v.copy() if self._cb.v is not None else None
+
+        # ── 1. Update reference geometry on the mesh in place ──────────
+        # The mesh object is owned by this body — mutating its node
+        # array is the cheapest way to push the new reference through
+        # every downstream precompute (shape gradients are computed at
+        # construction from mesh.nodes).
+        self.mesh.nodes = new_ref_nodes
+
+        # ── 2. Drop accumulated plasticity ─────────────────────────────
+        self.eps_p = np.zeros_like(self.eps_p)
+        self._eps_p_prev_update = np.zeros_like(self._eps_p_prev_update)
+
+        # ── 3. Reconstruct CB body around the new reference ────────────
+        self._cb = CraigBamptonBody(
+            mesh=self.mesh, material=self.material, density=self.density,
+            n_modes=self.n_modes,
+            fixed_nodes=(self.fixed_nodes if self.fixed_nodes.size > 0 else None),
+            gravity=self.gravity, damping=self.damping,
+            name=self.name + "_cb",
+        )
+        self._cb.initialize(dt=self._cached_dt)
+
+        # ── 4. Restore kinetic state — q_r begins at zero ──────────────
+        self._cb.x = new_ref_nodes.copy()
+        if carry_v is not None:
+            self._cb.v = carry_v
+        if self._cb.q_r is not None:
+            self._cb.q_r[:] = 0.0
+
+        # ── 5. Region state machine reset ──────────────────────────────
+        self.region_state = [RegionState.ELASTIC] * self.n_regions
+        self._rebuild_counter = [0] * self.n_regions
+        self._rebuild_count += 1
+
     def step(
         self,
         dt: float,
@@ -348,6 +416,8 @@ class HybridCBPlasticBody:
             self._step_full_fem_plastic(dt, extra_forces)
         if auto_update_states:
             self.update_region_states()
+            if self.all_rebuild_pending():
+                self.rebuild_rom()
 
     def _step_full_fem_plastic(
         self,
