@@ -1,19 +1,22 @@
-"""Hybrid CB-plastic vs full-FEM plastic — side-by-side cantilever.
+"""CB-reduced elastic vs CB-hybrid plastic — side-by-side cantilever.
 
-Same loading scenario as ``fem_plastic_demo.py`` (clamped bar, tip pull,
-release, settle), but two backends running in parallel:
+Mirror of ``fem_plastic_demo.py`` (clamped bar, tip pull, release,
+settle) but both bars run through the **Craig-Bampton reduced-order
+basis** instead of full FEM:
 
-  • Left  bar — full-FEM ``CorotationalPlastic`` (every step is full
-                 implicit Euler over the whole mesh).
-  • Right bar — :class:`HybridCBPlasticBody`. METIS K-way partition;
-                 ELASTIC regions step through Craig-Bampton (cheap),
-                 PLASTIC_ACTIVE regions fall to full FEM only where
-                 yielding occurs, REBUILD_PENDING regions wait for
-                 settle. When all regions reach REBUILD_PENDING the
-                 deformed shape is absorbed into the reference and the
-                 body returns to all-CB at the new rest config.
+  • Left  bar — :class:`CraigBamptonBody` with ``CorotationalElastic``.
+                Reduced step every substep; bar fully recovers when
+                released (no plastic mechanism in this body).
+  • Right bar — :class:`HybridCBPlasticBody` with linear isotropic
+                hardening. CB step while every region is ELASTIC; falls
+                to full FEM J2 only on regions whose σ_eq crosses σ_Y;
+                rebuilds the basis at the deformed shape once plastic
+                flow has settled. Keeps a clear permanent set after
+                release — same physics signature as the FEM-side
+                ``fem_plastic_demo.py``, but driven through the
+                CB / hybrid pipeline.
 
-GUI mode colours the hybrid bar's surface elements by state:
+GUI mode colours the hybrid bar's surface elements by region state:
 
   blue   — ELASTIC          (CB fast path)
   red    — PLASTIC_ACTIVE   (full FEM J2 return mapping running here)
@@ -35,22 +38,19 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from robosim.physics.fem.materials import (                          # noqa: E402
-    CorotationalElastic, CorotationalPlastic,
+from robosim.physics.fem.materials import CorotationalElastic         # noqa: E402
+from robosim.physics.fem.mesh import TetMesh                          # noqa: E402
+from robosim.physics.fem.reduced import (                             # noqa: E402
+    CraigBamptonBody, CraigBamptonSolver,
 )
-from robosim.physics.fem.mesh import TetMesh                         # noqa: E402
-from robosim.physics.fem.solver import DeformableBody, FEMSolver     # noqa: E402
-from robosim.physics.fem.hybrid import (                             # noqa: E402
+from robosim.physics.fem.hybrid import (                              # noqa: E402
     HybridCBPlasticBody, RegionState,
 )
 
 
-# ── Geometry & material (sized so CB reduction is meaningful) ────────────────
-# Bar mesh chosen large enough that CB's ~10 reduced DOFs really cut work
-# vs full-FEM (~ 1.5k DOFs). Fewer divisions ⇒ CB looks the same speed
-# as FEM and the demo tells you nothing.
+# ── Geometry & material (matches fem_plastic_demo apart from mesh size) ─────
 L, W, H = 0.40, 0.05, 0.05
-DIVISIONS = (24, 4, 4)        # ~1920 tets, 625 nodes, 1875 dofs
+DIVISIONS = (16, 3, 3)         # same mesh resolution as fem_plastic_demo
 DENSITY = 1000.0
 YOUNG = 5e7
 POISSON = 0.3
@@ -64,12 +64,12 @@ N_RELEASE_STEPS = 800
 TIP_FORCE = 35.0
 
 # Hybrid-only knobs.
-N_REGIONS = 6                       # METIS k-way along the bar's long axis
-N_MODES = 12
+N_REGIONS = 4
+N_MODES = 10
 REBUILD_AFTER_STEADY_STEPS = 30
 
 
-# ── Mesh helper (same as fem_plastic_demo) ───────────────────────────────────
+# ── Mesh helper (same 5-tet decomposition as fem_plastic_demo) ──────────────
 
 def _hex_to_5tet(nx, ny, nz, lx, ly, lz, x_offset=0.0) -> TetMesh:
     xs = np.linspace(0.0, lx, nx + 1) + x_offset
@@ -110,26 +110,27 @@ def _hex_to_5tet(nx, ny, nz, lx, ly, lz, x_offset=0.0) -> TetMesh:
     return TetMesh(nodes=nodes, elements=np.asarray(tets, dtype=np.int64))
 
 
-# ── Body builders ────────────────────────────────────────────────────────────
+# ── Body builders ───────────────────────────────────────────────────────────
 
-def _make_full_fem_bar() -> tuple[DeformableBody, FEMSolver]:
+def _make_elastic_cb_bar() -> tuple[CraigBamptonBody, CraigBamptonSolver]:
     mesh = _hex_to_5tet(*DIVISIONS, lx=L, ly=W, lz=H)
     fixed = np.where(mesh.nodes[:, 0] < 1e-9)[0]
-    body = DeformableBody(
-        name="fem_plastic", mesh=mesh,
-        material=CorotationalPlastic(
-            young=YOUNG, poisson=POISSON,
-            yield_stress=YIELD_STRESS, hardening=HARDENING,
-        ),
-        density=DENSITY, fixed_nodes=fixed,
+    body = CraigBamptonBody(
+        mesh=mesh,
+        material=CorotationalElastic(young=YOUNG, poisson=POISSON),
+        density=DENSITY,
+        n_modes=N_MODES,
+        fixed_nodes=fixed,
+        gravity=np.zeros(3),
+        damping=DAMPING,
+        name="cb_elastic",
     )
-    solver = FEMSolver(bodies=[body], dt=DT, gravity=np.zeros(3),
-                       damping=DAMPING, max_newton_iters=10)
-    solver.initialize(DT)
+    solver = CraigBamptonSolver(bodies=[body])
+    solver.initialize(dt=DT)
     return body, solver
 
 
-def _make_hybrid_bar() -> HybridCBPlasticBody:
+def _make_hybrid_plastic_bar() -> HybridCBPlasticBody:
     mesh = _hex_to_5tet(*DIVISIONS, lx=L, ly=W, lz=H)
     fixed = np.where(mesh.nodes[:, 0] < 1e-9)[0]
     body = HybridCBPlasticBody(
@@ -140,19 +141,18 @@ def _make_hybrid_bar() -> HybridCBPlasticBody:
         yield_stress=YIELD_STRESS, hardening=HARDENING,
         n_modes=N_MODES, n_regions=N_REGIONS,
         rebuild_after_steady_steps=REBUILD_AFTER_STEADY_STEPS,
-        name="hybrid_plastic",
+        name="cb_hybrid_plastic",
     )
     body.initialize(dt=DT)
     return body
 
 
-# ── Common diagnostics ───────────────────────────────────────────────────────
+# ── Common diagnostics ──────────────────────────────────────────────────────
 
 def _tip_force_vector(mesh: TetMesh, total_force_z: float) -> np.ndarray:
     n_dof = mesh.n_nodes * 3
     f = np.zeros(n_dof)
-    tip_x = mesh.nodes[:, 0].max()
-    tip = np.where(mesh.nodes[:, 0] > tip_x - 1e-9)[0]
+    tip = np.where(mesh.nodes[:, 0] > L - 1e-9)[0]
     per_node = total_force_z / len(tip)
     for n in tip:
         f[n * 3 + 2] = per_node
@@ -160,84 +160,68 @@ def _tip_force_vector(mesh: TetMesh, total_force_z: float) -> np.ndarray:
 
 
 def _tip_z_displacement(x: np.ndarray, ref_nodes: np.ndarray) -> float:
-    tip_x = ref_nodes[:, 0].max()
-    tip = np.where(ref_nodes[:, 0] > tip_x - 1e-9)[0]
+    tip = np.where(ref_nodes[:, 0] > L - 1e-9)[0]
     return float(np.mean(x[tip, 2] - ref_nodes[tip, 2]))
 
 
-# ── Headless ─────────────────────────────────────────────────────────────────
+# ── Headless ────────────────────────────────────────────────────────────────
 
 def run_headless() -> None:
-    bar_fem, solver_fem = _make_full_fem_bar()
-    bar_hyb = _make_hybrid_bar()
+    bar_e, solver_e = _make_elastic_cb_bar()
+    bar_p           = _make_hybrid_plastic_bar()
 
-    # Reference geometries for tip deflection (hybrid mutates mesh.nodes
-    # at every rebuild, so capture the original now).
-    ref_fem = bar_fem.mesh.nodes.copy()
-    ref_hyb = bar_hyb.mesh.nodes.copy()
+    # The hybrid body mutates its own mesh.nodes at each rebuild, so
+    # snapshot the original geometry now for tip-deflection reporting.
+    ref_e = bar_e.mesh.nodes.copy()
+    ref_p = bar_p.mesh.nodes.copy()
 
-    f_pull_fem = _tip_force_vector(bar_fem.mesh, -TIP_FORCE)
-    f_pull_hyb = _tip_force_vector(bar_hyb.mesh, -TIP_FORCE)
+    f_pull_e = _tip_force_vector(bar_e.mesh, -TIP_FORCE)
+    f_pull_p = _tip_force_vector(bar_p.mesh, -TIP_FORCE)
 
-    print(f"[init] mesh        : {bar_fem.mesh.n_nodes} nodes / {bar_fem.mesh.n_elements} tets / {bar_fem.mesh.n_nodes*3} dofs")
-    print(f"[init] hybrid n_r  : {bar_hyb._cb._n_r} reduced dofs over {N_REGIONS} regions, {N_MODES} modes")
-    print(f"[init] dt={DT}s    load={N_LOAD_STEPS} steps  release={N_RELEASE_STEPS} steps")
+    print(f"[init] mesh: {bar_e.mesh.n_nodes} nodes / {bar_e.mesh.n_elements} tets")
+    print(f"[init] dt={DT}s  load={N_LOAD_STEPS} steps  release={N_RELEASE_STEPS} steps")
     print(f"[init] young={YOUNG:.1e}  yield={YIELD_STRESS:.1e}  H={HARDENING:.1e}")
+    print(f"[init] hybrid: K={N_REGIONS} regions, {N_MODES} CB modes")
     print()
-    print(f"{'phase':<10}{'t (s)':>8}{'tip_z FEM (mm)':>18}{'tip_z HYB (mm)':>18}"
-          f"{'rebuilds':>11}{'states (HYB)':>26}")
+    print(f"{'phase':<10}{'t (s)':>8}"
+          f"{'tip_z elastic (mm)':>22}{'tip_z plastic (mm)':>22}"
+          f"{'states (HYB)':>16}{'rebuilds':>10}")
 
     def _log(phase: str, step: int) -> None:
-        d_fem = _tip_z_displacement(bar_fem.x, ref_fem) * 1000
-        d_hyb = _tip_z_displacement(bar_hyb.x, ref_hyb) * 1000
-        states = ''.join(s.value[0].upper() for s in bar_hyb.region_state)  # E/P/R
-        print(f"{phase:<10}{step*DT:>8.3f}{d_fem:>18.3f}{d_hyb:>18.3f}"
-              f"{bar_hyb._rebuild_count:>11d}{states:>26s}")
+        de = _tip_z_displacement(bar_e.x, ref_e) * 1000
+        dp = _tip_z_displacement(bar_p.x, ref_p) * 1000
+        states = ''.join(s.value[0].upper() for s in bar_p.region_state)
+        print(f"{phase:<10}{step*DT:>8.3f}{de:>22.3f}{dp:>22.3f}"
+              f"{states:>16s}{bar_p._rebuild_count:>10d}")
 
-    # ── Loading ──
-    t_fem = t_hyb = 0.0
+    # Loading phase
     for k in range(N_LOAD_STEPS):
-        t0 = time.perf_counter()
-        solver_fem.step(DT, extra_forces={0: f_pull_fem})
-        t_fem += time.perf_counter() - t0
-        t0 = time.perf_counter()
-        bar_hyb.step(DT, extra_forces={0: f_pull_hyb})
-        t_hyb += time.perf_counter() - t0
+        solver_e.step(dt=DT, extra_forces={0: f_pull_e})
+        bar_p.step(DT, extra_forces={0: f_pull_p})
         if k % 100 == 0:
             _log("load", k)
     _log("load_end", N_LOAD_STEPS)
 
-    # ── Release ──
+    # Release phase
     for k in range(N_RELEASE_STEPS):
-        t0 = time.perf_counter()
-        solver_fem.step(DT)
-        t_fem += time.perf_counter() - t0
-        t0 = time.perf_counter()
-        bar_hyb.step(DT)
-        t_hyb += time.perf_counter() - t0
+        solver_e.step(dt=DT)
+        bar_p.step(DT)
         if k % 200 == 0:
             _log("release", N_LOAD_STEPS + k)
     _log("settle", N_LOAD_STEPS + N_RELEASE_STEPS)
 
-    # ── Summary ──
-    n_steps_total = N_LOAD_STEPS + N_RELEASE_STEPS
+    # Summary
+    final_e = _tip_z_displacement(bar_e.x, ref_e) * 1000
+    final_p = _tip_z_displacement(bar_p.x, ref_p) * 1000
+    peak_p = float(np.linalg.norm(bar_p.eps_p, axis=(1, 2)).max())
     print()
-    print(f"Wall time per step:")
-    print(f"  FEM    : {t_fem*1000/n_steps_total:7.3f} ms/step  (total {t_fem:.2f} s)")
-    print(f"  HYBRID : {t_hyb*1000/n_steps_total:7.3f} ms/step  (total {t_hyb:.2f} s)")
-    if t_hyb > 0:
-        print(f"  speedup: {t_fem/t_hyb:.2f}× (HYBRID vs FEM)")
-    print()
-    print(f"Final tip-z displacement (after release):")
-    print(f"  FEM    : {_tip_z_displacement(bar_fem.x, ref_fem)*1000:+.3f} mm")
-    print(f"  HYBRID : {_tip_z_displacement(bar_hyb.x, ref_hyb)*1000:+.3f} mm  "
-          f"(rebuilds={bar_hyb._rebuild_count})")
-    eps_p_max_fem = float(np.linalg.norm(bar_fem.eps_p, axis=(1, 2)).max())
-    eps_p_max_hyb = float(np.linalg.norm(bar_hyb.eps_p, axis=(1, 2)).max())
-    print(f"  ‖eps_p‖ peak: FEM={eps_p_max_fem:.4f}  HYBRID={eps_p_max_hyb:.4f}")
+    print(f"Final tip-z displacement after release:")
+    print(f"  elastic CB     : {final_e:+8.3f} mm")
+    print(f"  hybrid plastic : {final_p:+8.3f} mm  (permanent set; "
+          f"rebuilds={bar_p._rebuild_count}, ‖eps_p‖_peak={peak_p:.4f})")
 
 
-# ── GUI ──────────────────────────────────────────────────────────────────────
+# ── GUI ─────────────────────────────────────────────────────────────────────
 
 def _state_color(state: RegionState) -> tuple[float, float, float]:
     if state == RegionState.ELASTIC:         return (0.30, 0.55, 0.95)   # cool blue
@@ -249,50 +233,45 @@ def run_gui() -> None:
     import taichi as ti
     ti.init(arch=ti.metal)
 
-    bar_fem, solver_fem = _make_full_fem_bar()
-    bar_hyb = _make_hybrid_bar()
-    ref_fem = bar_fem.mesh.nodes.copy()
-    ref_hyb = bar_hyb.mesh.nodes.copy()
+    bar_e, solver_e = _make_elastic_cb_bar()
+    bar_p           = _make_hybrid_plastic_bar()
+    ref_e = bar_e.mesh.nodes.copy()
+    ref_p = bar_p.mesh.nodes.copy()
 
-    f_pull_fem = _tip_force_vector(bar_fem.mesh, -TIP_FORCE)
-    f_pull_hyb = _tip_force_vector(bar_hyb.mesh, -TIP_FORCE)
+    f_pull_e = _tip_force_vector(bar_e.mesh, -TIP_FORCE)
+    f_pull_p = _tip_force_vector(bar_p.mesh, -TIP_FORCE)
 
-    surf_fem = bar_fem.mesh.extract_surface()
-    surf_hyb = bar_hyb.mesh.extract_surface()
-    y_shift = W * 1.6        # plastic bar offset for visualisation only
+    surf_e = bar_e.mesh.extract_surface()
+    surf_p = bar_p.mesh.extract_surface()
+    y_shift = W * 1.6
 
-    n_v_fem = bar_fem.mesh.n_nodes
-    n_v_hyb = bar_hyb.mesh.n_nodes
-    v_fem = ti.Vector.field(3, dtype=ti.f32, shape=n_v_fem)
-    c_fem = ti.Vector.field(3, dtype=ti.f32, shape=n_v_fem)
-    i_fem = ti.field(dtype=ti.i32, shape=surf_fem.shape[0] * 3)
-    v_hyb = ti.Vector.field(3, dtype=ti.f32, shape=n_v_hyb)
-    c_hyb = ti.Vector.field(3, dtype=ti.f32, shape=n_v_hyb)
-    i_hyb = ti.field(dtype=ti.i32, shape=surf_hyb.shape[0] * 3)
-
-    i_fem.from_numpy(surf_fem.ravel().astype(np.int32))
-    i_hyb.from_numpy(surf_hyb.ravel().astype(np.int32))
-    c_fem.from_numpy(np.tile([0.30, 0.55, 0.95],
-                             (n_v_fem, 1)).astype(np.float32))
+    n_v_e = bar_e.mesh.n_nodes
+    n_v_p = bar_p.mesh.n_nodes
+    v_e = ti.Vector.field(3, dtype=ti.f32, shape=n_v_e)
+    c_e = ti.Vector.field(3, dtype=ti.f32, shape=n_v_e)
+    i_e = ti.field(dtype=ti.i32, shape=surf_e.shape[0] * 3)
+    v_p = ti.Vector.field(3, dtype=ti.f32, shape=n_v_p)
+    c_p = ti.Vector.field(3, dtype=ti.f32, shape=n_v_p)
+    i_p = ti.field(dtype=ti.i32, shape=surf_p.shape[0] * 3)
+    i_e.from_numpy(surf_e.ravel().astype(np.int32))
+    i_p.from_numpy(surf_p.ravel().astype(np.int32))
+    # Elastic bar: solid cool blue.
+    c_e.from_numpy(np.tile([0.30, 0.55, 0.95],
+                           (n_v_e, 1)).astype(np.float32))
 
     def _hybrid_node_colors() -> np.ndarray:
-        """Per-node colour from the region containing the most elements
-        touching that node; ties broken by lowest region index. Cheap,
-        good-enough visual."""
-        n_nodes = bar_hyb.mesh.n_nodes
-        # per-node colour: start cool blue, paint per-element colours
-        # over each surface node so PLASTIC_ACTIVE visibly bleeds into
-        # neighbour nodes.
+        """Per-node colour from the region containing each element it
+        belongs to. Cheap, good-enough visual."""
+        n_nodes = bar_p.mesh.n_nodes
         cols = np.tile([0.30, 0.55, 0.95], (n_nodes, 1)).astype(np.float32)
-        # Per-element state from element_region.
-        for r, elem_idx in enumerate(bar_hyb.partition.region_elements):
-            col = _state_color(bar_hyb.region_state[r])
+        for r, elem_idx in enumerate(bar_p.partition.region_elements):
+            col = _state_color(bar_p.region_state[r])
             for e in elem_idx:
-                for n in bar_hyb.mesh.elements[e]:
+                for n in bar_p.mesh.elements[e]:
                     cols[n] = col
         return cols
 
-    window = ti.ui.Window("CB-hybrid plastic vs full-FEM plastic",
+    window = ti.ui.Window("CB elastic vs CB-hybrid plastic",
                           (1400, 800), vsync=True)
     canvas = window.get_canvas()
     canvas.set_background_color((0.08, 0.08, 0.10))
@@ -311,21 +290,19 @@ def run_gui() -> None:
     while window.running:
         for _ in range(sub):
             k = step_count[0]
-            ext_fem = {0: f_pull_fem} if k < N_LOAD_STEPS else None
-            ext_hyb = {0: f_pull_hyb} if k < N_LOAD_STEPS else None
-            solver_fem.step(DT, extra_forces=ext_fem)
-            bar_hyb.step(DT, extra_forces=ext_hyb)
+            ext_e = {0: f_pull_e} if k < N_LOAD_STEPS else None
+            ext_p = {0: f_pull_p} if k < N_LOAD_STEPS else None
+            solver_e.step(dt=DT, extra_forces=ext_e)
+            bar_p.step(DT, extra_forces=ext_p)
             step_count[0] += 1
             fps_window_steps[0] += 1
 
-        v_fem.from_numpy(bar_fem.x.astype(np.float32))
-        # Hybrid bar: shift Y for visualisation, recolour by region state.
-        v_hyb_arr = bar_hyb.x.astype(np.float32).copy()
-        v_hyb_arr[:, 1] += y_shift
-        v_hyb.from_numpy(v_hyb_arr)
-        c_hyb.from_numpy(_hybrid_node_colors())
+        v_e.from_numpy(bar_e.x.astype(np.float32))
+        v_p_arr = bar_p.x.astype(np.float32).copy()
+        v_p_arr[:, 1] += y_shift
+        v_p.from_numpy(v_p_arr)
+        c_p.from_numpy(_hybrid_node_colors())
 
-        # FPS over a 0.25 s sliding window.
         now = time.perf_counter()
         if now - last_wall[0] > 0.25:
             fps_value[0] = fps_window_steps[0] / (now - last_wall[0])
@@ -336,29 +313,29 @@ def run_gui() -> None:
         scene.set_camera(cam)
         scene.ambient_light((0.4, 0.4, 0.4))
         scene.point_light(pos=(1.0, 1.0, 1.0), color=(0.9, 0.9, 0.9))
-        scene.mesh(v_fem, indices=i_fem, per_vertex_color=c_fem, two_sided=True)
-        scene.mesh(v_hyb, indices=i_hyb, per_vertex_color=c_hyb, two_sided=True)
+        scene.mesh(v_e, indices=i_e, per_vertex_color=c_e, two_sided=True)
+        scene.mesh(v_p, indices=i_p, per_vertex_color=c_p, two_sided=True)
         canvas.scene(scene)
 
-        d_fem = _tip_z_displacement(bar_fem.x, ref_fem) * 1000
-        d_hyb = _tip_z_displacement(bar_hyb.x, ref_hyb) * 1000
+        de = _tip_z_displacement(bar_e.x, ref_e) * 1000
+        dp = _tip_z_displacement(bar_p.x, ref_p) * 1000
         phase = "LOADING" if step_count[0] < N_LOAD_STEPS else "RELEASE"
-        n_active = sum(1 for s in bar_hyb.region_state
+        n_active = sum(1 for s in bar_p.region_state
                        if s == RegionState.PLASTIC_ACTIVE)
-        n_pending = sum(1 for s in bar_hyb.region_state
+        n_pending = sum(1 for s in bar_p.region_state
                         if s == RegionState.REBUILD_PENDING)
         window.GUI.begin("status", 0.02, 0.02, 0.34, 0.28)
         window.GUI.text(f"phase    : {phase}")
         window.GUI.text(f"step     : {step_count[0]}  t = {step_count[0]*DT:.3f} s")
         window.GUI.text(f"sim FPS  : {fps_value[0]:.1f}")
         window.GUI.text("")
-        window.GUI.text(f"FEM    tip_z : {d_fem:+.2f} mm")
-        window.GUI.text(f"HYBRID tip_z : {d_hyb:+.2f} mm")
+        window.GUI.text(f"elastic CB tip_z : {de:+.2f} mm")
+        window.GUI.text(f"hybrid     tip_z : {dp:+.2f} mm")
         window.GUI.text("")
         window.GUI.text(f"hybrid regions : K={N_REGIONS}")
         window.GUI.text(f"  active         : {n_active}")
         window.GUI.text(f"  rebuild pending: {n_pending}")
-        window.GUI.text(f"  rebuilds done  : {bar_hyb._rebuild_count}")
+        window.GUI.text(f"  rebuilds done  : {bar_p._rebuild_count}")
         window.GUI.end()
         window.show()
 
