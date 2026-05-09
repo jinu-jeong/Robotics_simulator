@@ -134,6 +134,123 @@ def test_active_branch_runs_and_grows_plastic_strain():
     assert np.linalg.norm(body.eps_p) > 1e-4
 
 
+def test_per_region_sigma_eq_below_yield_at_rest():
+    """At the reference configuration with zero loading the equivalent
+    stress is zero, so max σ_eq per region is zero everywhere."""
+    mesh = _tet_box()
+    body = HybridCBPlasticBody(
+        mesh=mesh,
+        material=CorotationalElastic(young=1e6, poisson=0.3),
+        n_modes=4, n_regions=4,
+        yield_stress=1e3,
+    )
+    body.initialize(dt=1e-3)
+    sigma_eq = body.per_element_sigma_eq()
+    assert sigma_eq.shape == (mesh.n_elements,)
+    np.testing.assert_allclose(sigma_eq, 0.0, atol=1e-9)
+    region_max = body.per_region_max_sigma_eq()
+    assert region_max.shape == (4,)
+    np.testing.assert_allclose(region_max, 0.0, atol=1e-9)
+
+
+def test_per_region_sigma_eq_grows_under_load():
+    """After a few PLASTIC_ACTIVE steps under tip load, σ_eq exceeds the
+    yield stress somewhere, so the corresponding region reports a max
+    above σ_Y."""
+    mesh = _tet_box()
+    fixed = np.where(mesh.nodes[:, 0] < 1e-9)[0]
+    body = HybridCBPlasticBody(
+        mesh=mesh,
+        material=CorotationalElastic(young=1e6, poisson=0.3),
+        density=1000.0, n_modes=8, fixed_nodes=fixed,
+        gravity=np.array([0.0, 0.0, -9.81]),
+        damping=0.5,
+        yield_stress=1e3, hardening=2e5, n_regions=4,
+    )
+    body.initialize(dt=5e-4)
+    body.region_state[0] = RegionState.PLASTIC_ACTIVE
+
+    right = np.where(mesh.nodes[:, 0] > 0.2 - 1e-9)[0]
+    n_dof = mesh.n_nodes * 3
+    f_pull = np.zeros(n_dof)
+    f_pull[right * 3 + 2] = -80.0 / max(1, len(right))
+    for _ in range(60):
+        body.step(dt=5e-4, extra_forces={0: f_pull})
+
+    region_max = body.per_region_max_sigma_eq()
+    # At least one region's max σ_eq exceeds σ_Y (we drove past yield).
+    assert region_max.max() > body.yield_stress, (
+        f"expected some region above σ_Y={body.yield_stress}, "
+        f"got region max = {region_max}"
+    )
+
+
+def test_state_machine_elastic_to_active_to_rebuild_pending():
+    """Drive a region through the full ELASTIC → ACTIVE → REBUILD_PENDING
+    arc with a small yielding pull that we can fully damp out within
+    a tractable test budget."""
+    mesh = _tet_box()
+    fixed = np.where(mesh.nodes[:, 0] < 1e-9)[0]
+    body = HybridCBPlasticBody(
+        mesh=mesh,
+        material=CorotationalElastic(young=1e6, poisson=0.3),
+        density=1000.0, n_modes=8, fixed_nodes=fixed,
+        gravity=np.zeros(3),       # gravity-free so the bar can settle
+        damping=5.0,               # heavy damping for fast quiescence
+        yield_stress=5e2, hardening=5e4, n_regions=2,
+        hysteresis=0.05, rebuild_after_steady_steps=5,
+    )
+    body.initialize(dt=5e-4)
+
+    # Phase A: rest → all ELASTIC, no transition.
+    any_active = body.update_region_states()
+    assert all(s == RegionState.ELASTIC for s in body.region_state)
+    assert any_active is False
+
+    # Phase B: small yielding pull → ACTIVE in at least one region.
+    right = np.where(mesh.nodes[:, 0] > 0.2 - 1e-9)[0]
+    n_dof = mesh.n_nodes * 3
+    f_pull = np.zeros(n_dof)
+    f_pull[right * 3 + 2] = -10.0 / max(1, len(right))   # gentle
+    body.step(dt=5e-4, extra_forces={0: f_pull})
+    any_active_b = body.update_region_states()
+    assert any_active_b is True
+    assert RegionState.PLASTIC_ACTIVE in body.region_state
+
+    # Phase C: hold the load briefly so plastic flow is unmistakable.
+    for _ in range(15):
+        body.step(dt=5e-4, extra_forces={0: f_pull})
+        body.update_region_states()
+    assert any(s == RegionState.PLASTIC_ACTIVE for s in body.region_state)
+
+    # Phase D: remove the load and run long enough for plastic flow
+    # to die out and the no-flow counter to trigger REBUILD_PENDING.
+    for _ in range(400):
+        body.step(dt=5e-4)
+        body.update_region_states()
+    assert any(s == RegionState.REBUILD_PENDING for s in body.region_state), (
+        f"expected REBUILD_PENDING somewhere, got {body.region_state}"
+    )
+
+
+def test_state_machine_K1_no_yield_stays_elastic():
+    """A K=1 body that never sees a yielding load stays ELASTIC for as
+    long as we step it; the counter never advances."""
+    mesh = _tet_box()
+    body = HybridCBPlasticBody(
+        mesh=mesh,
+        material=CorotationalElastic(young=1e6, poisson=0.3),
+        n_modes=4, n_regions=1,
+        gravity=np.zeros(3), damping=0.5,
+        yield_stress=1e6,    # absurdly high — never yields
+    )
+    body.initialize(dt=5e-4)
+    for _ in range(50):
+        body.step(dt=5e-4)
+        body.update_region_states()
+    assert body.region_state == [RegionState.ELASTIC]
+
+
 def test_active_then_back_to_elastic_preserves_state():
     """Run a few PLASTIC_ACTIVE steps, then flip back to ELASTIC and
     ensure the next CB step still works (q_r resync is correct)."""

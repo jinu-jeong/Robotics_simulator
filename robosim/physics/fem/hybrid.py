@@ -33,6 +33,9 @@ from typing import Optional
 
 import numpy as np
 
+from robosim.physics.fem.assembly import (
+    _batch_deformation_gradients, _batch_polar_decomposition,
+)
 from robosim.physics.fem.materials import (
     CorotationalElastic, CorotationalPlastic, NeoHookean,
 )
@@ -127,6 +130,10 @@ class HybridCBPlasticBody:
         # first transition to PLASTIC_ACTIVE; for now a zero buffer so
         # diagnostics can read it unconditionally.
         self.eps_p = np.zeros((mesh.n_elements, 3, 3), dtype=np.float64)
+        # Snapshot from the previous ``update_region_states`` call —
+        # compared against ``self.eps_p`` to decide whether plastic flow
+        # actually happened in the last step (state-machine trigger).
+        self._eps_p_prev_update = np.zeros_like(self.eps_p)
 
         # Underlying CB body — handles the all-ELASTIC fast path. The
         # plastic-active full-FEM step shares this body's mesh-level
@@ -180,25 +187,167 @@ class HybridCBPlasticBody:
         """Build the CB basis (delegates to CraigBamptonBody)."""
         self._cb.initialize(dt=dt)
 
+    # ── Stress diagnostics (drive the per-region state machine) ───────
+
+    def per_element_sigma_eq(self) -> np.ndarray:
+        """Per-element von-Mises equivalent stress at the current state.
+
+        Built from the trial-elastic stress in the corotated frame, with
+        the *current* eps_p already subtracted — i.e. matches the
+        quantity the J2 yield function compares against ``σ_Y``. Length-
+        ``n_elements`` float64 array. Available regardless of which
+        branch (ELASTIC vs PLASTIC_ACTIVE) just ran; the caller is
+        responsible for invoking it after a step rather than before.
+        """
+        if self._cb.x is None:
+            raise RuntimeError(
+                "per_element_sigma_eq called before initialize() — x is None"
+            )
+        if self._cb._dN_list is None or self._cb._volumes is None:
+            raise RuntimeError(
+                "per_element_sigma_eq called before CB basis is built"
+            )
+
+        # Tet4 path is the only one wired in Phase 1; matches the plastic
+        # assembly path's element-data convention (dN_list = (ne, 4, 3)).
+        if not isinstance(self._cb._dN_list, np.ndarray):
+            raise NotImplementedError(
+                "per_element_sigma_eq currently supports Tet4 meshes only"
+            )
+
+        F_all = _batch_deformation_gradients(
+            self._cb.x, self.mesh.elements, self._cb._dN_list,
+        )
+        R_all, S_all = _batch_polar_decomposition(F_all)
+        I3 = np.eye(3)[np.newaxis]
+        # Trial elastic strain in corotated frame minus accumulated eps_p.
+        eps_e = (
+            0.5 * (S_all + np.transpose(S_all, (0, 2, 1)))
+            - I3 - self.eps_p
+        )
+        tr_e = np.trace(eps_e, axis1=1, axis2=2)
+        mu = self._plastic_material.mu
+        lam = self._plastic_material.lam
+        sigma = 2.0 * mu * eps_e + lam * tr_e[:, None, None] * I3
+        # von Mises: σ_eq = sqrt(3/2) · ‖dev(σ)‖_F
+        tr_s = np.trace(sigma, axis1=1, axis2=2)
+        dev = sigma - (tr_s / 3.0)[:, None, None] * I3
+        norm_dev = np.linalg.norm(dev, axis=(1, 2))
+        return np.sqrt(1.5) * norm_dev
+
+    def update_region_states(self) -> bool:
+        """Run one tick of the per-region state machine.
+
+        Triggers:
+        * ELASTIC → PLASTIC_ACTIVE   when ``max σ_eq ≥ σ_Y`` somewhere
+            in the region. (σ_eq exceeding σ_Y in trial-elastic stress
+            means the elastic predictor is outside the yield surface,
+            i.e. the next step will yield.)
+        * PLASTIC_ACTIVE → REBUILD_PENDING when *no plastic flow*
+            actually happened in the region for
+            ``rebuild_after_steady_steps`` consecutive update calls.
+            Plastic-flow detection: the per-element Frobenius norm of
+            ``eps_p_now − eps_p_at_last_update`` falls below a small
+            threshold. This is the right signal because, with hardening,
+            σ_eq at rest stays *above* σ_Y (the yield surface has
+            expanded) — so a σ_eq comparison would falsely keep regions
+            "active" forever.
+        * REBUILD_PENDING → PLASTIC_ACTIVE if any region element starts
+            flowing again before the global rebuild fires.
+
+        REBUILD_PENDING is a holding state. The actual ROM rebuild
+        (Phase 2F) fires only when all regions are in this state.
+
+        Returns ``True`` iff any region is PLASTIC_ACTIVE *after* this
+        update — the caller uses this to pick dispatch on the next step.
+        """
+        region_max = self.per_region_max_sigma_eq()
+        # Per-element ‖Δeps_p‖ over the last update window.
+        delta_eps_p = np.linalg.norm(
+            self.eps_p - self._eps_p_prev_update, axis=(1, 2),
+        )
+        # Threshold scaled to the yield strain so it tracks the model
+        # naturally; below this, any change is float noise. ``5 % of
+        # yield strain`` is a generous floor that ignores numerical
+        # jitter without missing genuine plastic flow.
+        flow_threshold = 0.05 * (self.yield_stress / max(self._plastic_material.young, 1e-12))
+
+        any_active = False
+        for r in range(self.n_regions):
+            state = self.region_state[r]
+            elems_r = self.partition.region_elements[r]
+            sm = float(region_max[r])
+            max_dflow = float(delta_eps_p[elems_r].max()) if elems_r.size > 0 else 0.0
+
+            if state == RegionState.ELASTIC:
+                if sm >= self.yield_stress:
+                    self.region_state[r] = RegionState.PLASTIC_ACTIVE
+                    self._rebuild_counter[r] = 0
+                    any_active = True
+
+            elif state == RegionState.PLASTIC_ACTIVE:
+                if max_dflow > flow_threshold:
+                    # Still flowing.
+                    self._rebuild_counter[r] = 0
+                    any_active = True
+                else:
+                    # No detectable plastic flow this step.
+                    self._rebuild_counter[r] += 1
+                    if self._rebuild_counter[r] >= self.rebuild_after_steady_steps:
+                        self.region_state[r] = RegionState.REBUILD_PENDING
+                        self._rebuild_counter[r] = 0
+                    else:
+                        any_active = True
+
+            elif state == RegionState.REBUILD_PENDING:
+                if max_dflow > flow_threshold:
+                    self.region_state[r] = RegionState.PLASTIC_ACTIVE
+                    self._rebuild_counter[r] = 0
+                    any_active = True
+
+        # Snapshot for the next call's delta computation.
+        self._eps_p_prev_update = self.eps_p.copy()
+        return any_active
+
+    def per_region_max_sigma_eq(self) -> np.ndarray:
+        """Maximum equivalent stress per region — the quantity the
+        ELASTIC ⇄ PLASTIC_ACTIVE state machine triggers on. Length-K
+        float64; regions with zero elements (impossible by construction
+        but defensive) report 0."""
+        sigma_eq = self.per_element_sigma_eq()
+        out = np.zeros(self.n_regions, dtype=np.float64)
+        for r in range(self.n_regions):
+            elems_r = self.partition.region_elements[r]
+            if elems_r.size > 0:
+                out[r] = float(sigma_eq[elems_r].max())
+        return out
+
     def step(
         self,
         dt: float,
         extra_forces: Optional[dict] = None,
+        auto_update_states: bool = True,
     ) -> None:
-        """Advance one substep.
+        """Advance one substep, then run the state-machine tick.
 
         Routing (Phase 2C-D, all-or-nothing):
         * Every region ELASTIC → :class:`CraigBamptonBody` reduced step.
-        * Any region PLASTIC_ACTIVE → fall back to a *whole-body*
-          full-FEM implicit-Euler step driven by
-          :class:`CorotationalPlastic`. Per-region full-FEM with the
-          elastic remainder still reduced is a Phase 3 refinement; at
-          this stage the simpler whole-body fallback is correct (just
-          conservative on speed) and keeps the state transition trivial.
+        * Any region PLASTIC_ACTIVE → whole-body full-FEM implicit-Euler
+          step driven by :class:`CorotationalPlastic`. Per-region
+          full-FEM with the elastic remainder still reduced is a
+          Phase 3 refinement.
+
+        After integration, ``update_region_states`` runs by default
+        (``auto_update_states=True``) so the next call sees the right
+        state. Callers running their own state-machine cadence can pass
+        ``False`` and call :meth:`update_region_states` themselves.
         """
         if self.all_elastic():
-            return self._cb.step(dt=dt, extra_forces=extra_forces)
-        return self._step_full_fem_plastic(dt, extra_forces)
+            self._cb.step(dt=dt, extra_forces=extra_forces)
+        else:
+            self._step_full_fem_plastic(dt, extra_forces)
+        if auto_update_states:
+            self.update_region_states()
 
     def _step_full_fem_plastic(
         self,
