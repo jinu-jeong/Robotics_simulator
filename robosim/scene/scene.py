@@ -28,8 +28,11 @@ from typing import TYPE_CHECKING, Callable
 import numpy as np
 
 from robosim.scene.objects import Robot as RobotDef, Box as BoxDef, Ground as GroundDef
-from robosim.scene.objects import FEM, FEMPlastic, CB, Rigid
-from robosim.scene.handles import RobotHandle, FEMBodyHandle, CBBodyHandle, RigidBodyHandle
+from robosim.scene.objects import FEM, FEMPlastic, HybridPlastic, CB, Rigid
+from robosim.scene.handles import (
+    RobotHandle, FEMBodyHandle, CBBodyHandle, RigidBodyHandle,
+    HybridPlasticBodyHandle,
+)
 from robosim.scene.runner import SimRunner, _ContactPair
 
 if TYPE_CHECKING:
@@ -166,7 +169,9 @@ class Scene:
 
         ground_z = self._ground.height if self._ground else 0.0
 
-        if isinstance(phys, FEMPlastic):
+        if isinstance(phys, HybridPlastic):
+            handle = self._build_hybrid_plastic_box(defn, name, phys, ground_z)
+        elif isinstance(phys, FEMPlastic):
             handle = self._build_fem_plastic_box(defn, name, phys, ground_z)
         elif isinstance(phys, FEM):
             handle = self._build_fem_box(defn, name, phys, ground_z)
@@ -247,6 +252,53 @@ class Scene:
         )
         handle = FEMBodyHandle(name=name, body=body, solver=solver)
         handle._fem_dt         = fem_dt
+        handle._fem_every      = phys.dt_scale
+        handle._arm_step_count = 0
+        return handle
+
+    def _build_hybrid_plastic_box(self, defn: BoxDef, name: str,
+                                   phys: HybridPlastic, ground_z: float):
+        """Hybrid CB ⇄ full-FEM plastic body (HybridCBPlasticBody).
+
+        The body itself doubles as its own solver — its
+        ``step(dt, extra_forces)`` routes ELASTIC regions through CB and
+        ACTIVE regions through full-FEM J2 every substep. Tet4 mesh is
+        forced (the only kind plastic assembly supports today).
+        """
+        from robosim.physics.fem.materials import CorotationalElastic
+        from robosim.physics.fem.mesh import TetMesh
+        from robosim.physics.fem.hybrid import HybridCBPlasticBody
+
+        origin = defn._pos - defn._size * 0.5
+        origin[2] = ground_z
+
+        mesh    = TetMesh.create_box(origin=origin, size=defn._size,
+                                     divisions=phys.mesh)
+        density = defn._mass / float(np.prod(defn._size))
+        # Elastic skeleton — HybridCBPlasticBody builds the
+        # CorotationalPlastic side internally from young/poisson +
+        # yield_stress/hardening.
+        elastic = CorotationalElastic(young=phys.young, poisson=phys.poisson)
+
+        body = HybridCBPlasticBody(
+            mesh=mesh, material=elastic, density=density,
+            n_modes=phys.n_modes,
+            gravity=self.gravity.copy(),
+            damping=phys.damping,
+            name=name,
+            yield_stress=phys.yield_stress,
+            hardening=phys.hardening,
+            n_regions=phys.n_regions,
+            hysteresis=phys.hysteresis,
+            rebuild_after_steady_steps=phys.rebuild_after_steady_steps,
+        )
+
+        # Body acts as solver for the runner — its step() takes
+        # (dt, extra_forces) just like CraigBamptonSolver.step.
+        handle = HybridPlasticBodyHandle(name=name, body=body)
+        # Same fem_dt / fem_every plumbing as FEM/FEMPlastic so the
+        # runner's substep gating works uniformly.
+        handle._fem_dt         = self.dt * phys.dt_scale
         handle._fem_every      = phys.dt_scale
         handle._arm_step_count = 0
         return handle

@@ -5,13 +5,24 @@ small-strain J2 plasticity, so the finger contacts dent the box
 permanently. Watch the surface near the gripper jaws — once σ_eq
 crosses σ_Y the deformation stops disappearing on release.
 
-Same trajectory + arm setup as ``grasp_scene.py``; the only difference
-is ``.physics(FEMPlastic(...))`` in place of ``FEM(...)`` / ``CB(...)``.
+Two box backends:
+
+* ``--mode fem``     (default) — full FEM with :class:`FEMPlastic`.
+                                Every step runs full-order J2.
+* ``--mode hybrid``  — :class:`HybridPlastic`: METIS K-way partition,
+                       per-region state machine. ELASTIC regions run
+                       through Craig-Bampton (cheap), PLASTIC_ACTIVE
+                       regions fall to full FEM. After plastic flow
+                       dies out the body absorbs the deformed shape
+                       into its reference and returns to the all-CB
+                       fast path. The end-state print exposes the
+                       rebuild count and final per-region states.
 
 Usage::
 
-    python examples/pure_simulation/grasp_scene_plastic.py            # GUI
-    python examples/pure_simulation/grasp_scene_plastic.py --headless # diagnostics
+    python examples/pure_simulation/grasp_scene_plastic.py            # GUI fem
+    python examples/pure_simulation/grasp_scene_plastic.py --mode hybrid
+    python examples/pure_simulation/grasp_scene_plastic.py --mode hybrid --headless
 """
 
 from __future__ import annotations
@@ -24,7 +35,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from robosim import Scene, Robot, Box, Ground, FEMPlastic, JointPD
+from robosim import Scene, Robot, Box, Ground, FEMPlastic, HybridPlastic, JointPD
 
 
 _URDF = str(Path(__file__).parent / "urdf" / "arm6_gripper" / "arm6_gripper.urdf")
@@ -42,7 +53,23 @@ LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.013,  0.013])
 _LIFT_START_T = 1.5 + 1.2 + 2.5 + 1.5 + 1.5   # = 8.2 s
 
 
-def main(headless: bool = False) -> None:
+def _box_physics(mode: str):
+    """Common plastic params, two backends sharing them."""
+    common = dict(
+        young=5e4, poisson=0.45,
+        yield_stress=5e2, hardening=8e4,
+        mesh=(4, 4, 4), dt_scale=5,
+    )
+    if mode == "hybrid":
+        return HybridPlastic(
+            **common,
+            n_modes=10, n_regions=4,
+            rebuild_after_steady_steps=50,
+        )
+    return FEMPlastic(**common)
+
+
+def main(headless: bool = False, mode: str = "fem") -> None:
     scene = Scene(dt=0.001, gravity=[0, 0, -9.81], substeps=10)
 
     scene.add(Ground(height=0.0))
@@ -63,11 +90,7 @@ def main(headless: bool = False) -> None:
     # rebound erase it via reverse yielding).
     box = scene.add(
         Box(size=0.08, mass=0.5, pos=[0.6, 0.0, 0.04])
-        .physics(FEMPlastic(
-            young=5e4, poisson=0.45,
-            yield_stress=5e2, hardening=8e4,
-            mesh=(4, 4, 4), dt_scale=5,
-        ))
+        .physics(_box_physics(mode))
         .name("box")
     )
 
@@ -90,8 +113,12 @@ def main(headless: bool = False) -> None:
     traj.phase("LIFT",     target=LIFT_Q,     duration=3.0)
 
     print(scene)
-    print("[plastic] σ_Y =", box._body.material.yield_stress,
-          "  H =", box._body.material.hardening)
+    if mode == "hybrid":
+        plastic_mat = box._body._plastic_material
+    else:
+        plastic_mat = box._body.material
+    print(f"[plastic] mode={mode}  σ_Y={plastic_mat.yield_stress}  "
+          f"H={plastic_mat.hardening}")
     scene.run(
         trajectories=traj,
         duration=_LIFT_START_T + 3.2,
@@ -114,10 +141,17 @@ def main(headless: bool = False) -> None:
               f"{float(eps_p_eq.max()):.4f}  (~{eps_p_eq.max()*100:.1f}% strain)")
         print(f"[plastic] yielded elements (ε_p_eq > 1e-4) = "
               f"{int((eps_p_eq > 1e-4).sum())} / {eps_p_eq.size}")
+    if mode == "hybrid":
+        states = [s.value for s in body.region_state]
+        print(f"[hybrid]  region_states = {states}")
+        print(f"[hybrid]  rebuild_count = {body._rebuild_count}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plastic grasp demo (Scene API)")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--mode", choices=["fem", "hybrid"], default="fem",
+                        help="box backend: 'fem' = full-FEM J2; 'hybrid' = "
+                             "CB ⇄ full-FEM state-machine.")
     args = parser.parse_args()
-    main(headless=args.headless)
+    main(headless=args.headless, mode=args.mode)

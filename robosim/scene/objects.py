@@ -121,6 +121,70 @@ class FEMPlastic:
                 f"mesh={self.mesh})")
 
 
+class HybridPlastic:
+    """Hybrid CB / full-FEM body with state-machine plasticity.
+
+    Wraps :class:`HybridCBPlasticBody` for the Scene API. Each substep
+    a per-region state machine routes between two backends:
+
+    * **ELASTIC**: Craig-Bampton reduced step (cheap; the hot path
+      while the body is well below yield). Costs O(n_modes).
+    * **PLASTIC_ACTIVE**: full-FEM implicit Euler with corotational J2
+      return mapping. Engaged when ``max σ_eq ≥ σ_Y`` in any region.
+      Costs O(n_dofs) per Newton iter.
+
+    Once a region's plastic flow dies out (``‖Δeps_p‖`` ≈ 0 for several
+    consecutive ticks) it goes to REBUILD_PENDING. When *all* regions
+    reach this state, the body absorbs the deformed shape into the
+    reference geometry, drops eps_p, rebuilds the CB basis, and
+    returns to the ELASTIC fast path. Permanent set is preserved
+    geometrically across the rebuild boundary.
+
+    Forces a Tet4 mesh (the only mesh kind plastic assembly supports).
+
+    Parameters mirror :class:`FEMPlastic` plus:
+    n_regions                  : METIS k-way partition count.
+    n_modes                    : CB fixed-interface eigenmodes.
+    rebuild_after_steady_steps : ticks of zero plastic flow before a
+                                 region transitions to REBUILD_PENDING.
+    hysteresis                 : (reserved; kept for future σ_eq dead-band).
+    """
+
+    def __init__(
+        self,
+        young:                       float = 1e5,
+        poisson:                     float = 0.45,
+        density:                     float = 1000.0,
+        damping:                     float = 0.5,
+        mesh:                        tuple[int, int, int] = (6, 6, 6),
+        yield_stress:                float = 1e3,
+        hardening:                   float = 5e4,
+        n_modes:                     int = 10,
+        n_regions:                   int = 4,
+        hysteresis:                  float = 0.05,
+        rebuild_after_steady_steps:  int = 50,
+        dt_scale:                    int = 5,
+    ):
+        self.young                       = young
+        self.poisson                     = poisson
+        self.density                     = density
+        self.damping                     = damping
+        self.mesh                        = tuple(mesh)
+        self.yield_stress                = yield_stress
+        self.hardening                   = hardening
+        self.n_modes                     = n_modes
+        self.n_regions                   = n_regions
+        self.hysteresis                  = hysteresis
+        self.rebuild_after_steady_steps  = rebuild_after_steady_steps
+        self.dt_scale                    = dt_scale
+
+    def __repr__(self) -> str:
+        return (f"HybridPlastic(E={self.young:.0e}, ν={self.poisson}, "
+                f"σ_Y={self.yield_stress:.0e}, H={self.hardening:.0e}, "
+                f"K={self.n_regions}, n_modes={self.n_modes}, "
+                f"mesh={self.mesh})")
+
+
 class CB:
     """Craig-Bampton reduced-order deformable body physics (fastest deformable).
 

@@ -220,8 +220,10 @@ class SimRunner:
         for bh in self._scene._body_handles.values():
             if hasattr(bh, '_solver') and hasattr(bh._solver, 'initialize'):
                 phys = self._scene._body_physics.get(bh.name)
-                from robosim.scene.objects import FEM, CB
-                if isinstance(phys, FEM):
+                from robosim.scene.objects import FEM, FEMPlastic, HybridPlastic, CB
+                # Substep-gated bodies (FEM-side): scale fem_dt by
+                # phys.dt_scale and run every dt_scale arm steps.
+                if isinstance(phys, (FEM, FEMPlastic, HybridPlastic)):
                     fem_dt = dt * phys.dt_scale
                     bh._solver.initialize(dt=fem_dt)
                     bh._fem_dt    = fem_dt
@@ -334,7 +336,10 @@ class SimRunner:
     # ── body step ─────────────────────────────────────────────────────────────
 
     def _step_body(self, bh, dt: float) -> None:
-        from robosim.scene.handles import FEMBodyHandle, CBBodyHandle, RigidBodyHandle
+        from robosim.scene.handles import (
+            FEMBodyHandle, CBBodyHandle, RigidBodyHandle,
+            HybridPlasticBodyHandle,
+        )
         from robosim.scene.objects import FEM, CB
 
         phys = self._scene._body_physics.get(bh.name)
@@ -407,6 +412,34 @@ class SimRunner:
                     bh._solver.step(dt=dt)
             else:
                 bh._solver.step(dt=dt)
+                if cp := self._find_contact_pair(bh):
+                    for idx in cp._cached_wrenches:
+                        cp._cached_wrenches[idx][:] = 0.0
+
+            self._apply_ground_projection(bh._body)
+            self._update_grip_fem(bh, dt)
+
+        elif isinstance(bh, HybridPlasticBodyHandle):
+            # Same dispatch shape as CB — penalty contact + extra_forces
+            # to bh._solver.step. The hybrid body internally routes
+            # ELASTIC regions through CB and ACTIVE regions through
+            # full-FEM J2 each substep. Use ``fem_dt`` (= arm_dt ·
+            # phys.dt_scale) so the dt the body was initialised with
+            # stays cached and ``initialize`` doesn't refire each tick.
+            fem_dt = bh._fem_dt
+            if not grip_active:
+                cp = self._find_contact_pair(bh)
+                if cp is not None:
+                    fk = cp.robot._model.forward_kinematics()
+                    f_ext, wrenches = self._compute_penalty_contact(cp, fk, bh._body)
+                    bh._solver.step(dt=fem_dt, extra_forces={0: f_ext})
+                    for li_name, w in wrenches.items():
+                        idx = cp.robot._model.link_index(li_name)
+                        cp._cached_wrenches[idx] = w
+                else:
+                    bh._solver.step(dt=fem_dt)
+            else:
+                bh._solver.step(dt=fem_dt)
                 if cp := self._find_contact_pair(bh):
                     for idx in cp._cached_wrenches:
                         cp._cached_wrenches[idx][:] = 0.0
@@ -729,9 +762,12 @@ class SimRunner:
             rr.setup()
             ctx["renderers"][rh.name] = rr
 
-        from robosim.scene.handles import FEMBodyHandle, CBBodyHandle, RigidBodyHandle
+        from robosim.scene.handles import (
+            FEMBodyHandle, CBBodyHandle, RigidBodyHandle,
+            HybridPlasticBodyHandle,
+        )
         for bh in scene._body_handles.values():
-            if isinstance(bh, (FEMBodyHandle, CBBodyHandle)):
+            if isinstance(bh, (FEMBodyHandle, CBBodyHandle, HybridPlasticBodyHandle)):
                 surf = bh._body.mesh.extract_surface()
                 color = scene._body_colors.get(bh.name, np.array([0.2, 0.6, 0.9]))
                 viewer.add_mesh(bh.name, bh._body.x, surf, color=color, opacity=1.0)

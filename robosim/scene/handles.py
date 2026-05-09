@@ -10,6 +10,7 @@ Hierarchy::
     RigidBodyHandle           — free-floating rigid body
     FEMBodyHandle             — Hex8 FEM deformable body
     CBBodyHandle              — Craig-Bampton reduced-order body
+    HybridPlasticBodyHandle   — hybrid CB ⇄ full-FEM plastic body
 """
 
 from __future__ import annotations
@@ -275,3 +276,66 @@ class CBBodyHandle(_DeformableHandle):
                 f"  com          : ({c[0]:+.4f}, {c[1]:+.4f}, {c[2]:+.4f})\n"
                 f"  extents      : X={ext[0]:.1f}  Y={ext[1]:.1f}  Z={ext[2]:.1f} mm\n"
                 f"  bottom_z     : {self.bottom_z:+.4f} m")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Hybrid CB / full-FEM plastic body
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HybridPlasticBodyHandle(_DeformableHandle):
+    """Handle for a :class:`HybridCBPlasticBody` — region-partitioned
+    ELASTIC ⇄ PLASTIC_ACTIVE state machine that drops to full-FEM J2
+    plasticity wherever yielding occurs and returns to the CB fast path
+    once each region settles. See :class:`robosim.scene.objects.HybridPlastic`.
+
+    The runner treats this handle through the same penalty-contact /
+    extra-forces path as :class:`CBBodyHandle` — the underlying body is
+    duck-typed as both ``_body`` (for ``.x``/``.v`` reads) and
+    ``_solver`` (its ``step(dt, extra_forces)`` is what the runner
+    invokes per substep).
+    """
+
+    def __init__(self, name: str, body):
+        super().__init__(name)
+        self._body = body
+        # The hybrid body itself acts as solver — its step(dt,
+        # extra_forces) routes ELASTIC → CB / ACTIVE → full-FEM.
+        self._solver = body
+
+    @property
+    def nodes(self) -> np.ndarray:
+        return self._body.x.copy()
+
+    @property
+    def velocity(self) -> np.ndarray:
+        return self._body.v.copy()
+
+    @property
+    def region_states(self):
+        """List of per-region :class:`RegionState`."""
+        return list(self._body.region_state)
+
+    @property
+    def rebuild_count(self) -> int:
+        return int(getattr(self._body, "_rebuild_count", 0))
+
+    @property
+    def eps_p(self) -> np.ndarray:
+        """(n_elements, 3, 3) plastic strain. Resets after each rebuild."""
+        return self._body.eps_p
+
+    def __repr__(self) -> str:
+        if self._body.x is None:
+            return f"HybridPlasticBodyHandle '{self._name}'  (not yet initialized)"
+        ext = self.extents * 1e3
+        c   = self.com
+        states = [s.value for s in self._body.region_state]
+        rb_count = getattr(self._body, "_rebuild_count", 0)
+        return (f"HybridPlasticBodyHandle '{self._name}'\n"
+                f"  nodes      : {self._body.x.shape[0]}  K={self._body.n_regions}\n"
+                f"  states     : {states}\n"
+                f"  rebuilds   : {rb_count}\n"
+                f"  com        : ({c[0]:+.4f}, {c[1]:+.4f}, {c[2]:+.4f})\n"
+                f"  extents    : X={ext[0]:.1f}  Y={ext[1]:.1f}  Z={ext[2]:.1f} mm\n"
+                f"  bottom_z   : {self.bottom_z:+.4f} m")
+

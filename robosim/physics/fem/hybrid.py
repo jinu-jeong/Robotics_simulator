@@ -180,6 +180,16 @@ class HybridCBPlasticBody:
     def n_regions(self) -> int:
         return self.partition.n_regions
 
+    # ── Pass-throughs to the inner CB body for diagnostics that target
+    # FEM-style deformable bodies (von Mises colouring, etc.) ──────────
+    @property
+    def _dN_list(self):
+        return self._cb._dN_list
+
+    @property
+    def _volumes(self):
+        return self._cb._volumes
+
     def all_elastic(self) -> bool:
         return all(s == RegionState.ELASTIC for s in self.region_state)
 
