@@ -126,11 +126,11 @@ def run_headless(backend: str = "numpy") -> None:
           f"last-window {fps.current:.1f} FPS)")
 
 
-def run_gui() -> None:
+def run_gui(backend: str = "numpy") -> None:
     from robosim.viz.viewer import SimViewer
     from robosim.util.fps import FPSCounter
 
-    solver = build_solver()
+    solver = build_solver(backend)
     pts = solver.particles
 
     viewer = SimViewer(
@@ -194,7 +194,7 @@ def main() -> None:
     if args.headless:
         run_headless(backend=args.backend)
     else:
-        run_gui()
+        run_gui(backend=args.backend)
 
 
 if __name__ == "__main__":

@@ -219,3 +219,93 @@ class TaichiMPMSolver:
 
     def particles_F(self) -> np.ndarray:
         return self.F.to_numpy()
+
+    # ── MPMSolver-compatible facade (so demos can swap) ──
+    @property
+    def particles(self) -> "_TiParticleView":
+        """Live particle view exposing ``.x / .v / .m / .V0 / .F / .C`` like
+        :class:`Particles`. Each access copies from Taichi fields back to
+        NumPy — fine for diagnostics (per-frame), avoid in hot loops."""
+        return _TiParticleView(self)
+
+    @property
+    def material(self) -> "_TiMaterialView":
+        """Stub material exposing ``.mu / .lam`` so energy diagnostics that
+        read ``solver.material.mu`` work identically to the NumPy path."""
+        return _TiMaterialView(self.mu, self.lam)
+
+    @classmethod
+    def from_numpy_setup(
+        cls,
+        *,
+        particles,
+        grid,
+        material,
+        gravity: Sequence[float] = (0.0, 0.0, -9.81),
+        bcs: Optional[Sequence] = None,
+    ) -> "TaichiMPMSolver":
+        """High-level constructor mirroring :class:`MPMSolver`.
+
+        Caller must have called ``ti.init(arch=...)`` before this. Only the
+        first ``BoxBC`` in ``bcs`` is honoured (matches MVP scope);
+        colliders are not supported yet.
+        """
+        if not hasattr(material, "young"):
+            raise TypeError(
+                f"TaichiMPMSolver only supports elastic NeoHookean-style "
+                f"materials (with .young/.poisson); got {type(material).__name__}"
+            )
+        bc_lower = None
+        bc_upper = None
+        if bcs:
+            bc = bcs[0]
+            bc_lower = bc.lower
+            bc_upper = bc.upper
+        return cls(
+            particles_x=particles.x.copy(),
+            particles_v=particles.v.copy(),
+            particles_m=particles.m.copy(),
+            particles_V0=particles.V0.copy(),
+            grid_origin=grid.origin,
+            grid_dx=grid.dx,
+            grid_shape=grid.shape,
+            young=float(material.young),
+            poisson=float(material.poisson),
+            gravity=tuple(gravity),
+            bc_lower=bc_lower,
+            bc_upper=bc_upper,
+        )
+
+
+class _TiParticleView:
+    """``.x / .v / .m / .V0 / .F / .C / .n`` getters reading from Taichi fields."""
+
+    __slots__ = ("_sv",)
+
+    def __init__(self, sv: "TaichiMPMSolver") -> None:
+        self._sv = sv
+
+    @property
+    def x(self) -> np.ndarray: return self._sv.x.to_numpy()
+    @property
+    def v(self) -> np.ndarray: return self._sv.v.to_numpy()
+    @property
+    def m(self) -> np.ndarray: return self._sv.m_p.to_numpy()
+    @property
+    def V0(self) -> np.ndarray: return self._sv.V0.to_numpy()
+    @property
+    def F(self) -> np.ndarray: return self._sv.F.to_numpy()
+    @property
+    def C(self) -> np.ndarray: return self._sv.C_.to_numpy()
+    @property
+    def n(self) -> int: return int(self._sv.P)
+
+
+class _TiMaterialView:
+    """``.mu / .lam / .young / .poisson`` for energy-diagnostic compatibility."""
+
+    __slots__ = ("mu", "lam")
+
+    def __init__(self, mu: float, lam: float) -> None:
+        self.mu = mu
+        self.lam = lam
