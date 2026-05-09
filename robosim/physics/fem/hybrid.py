@@ -130,6 +130,14 @@ class HybridCBPlasticBody:
         # first transition to PLASTIC_ACTIVE; for now a zero buffer so
         # diagnostics can read it unconditionally.
         self.eps_p = np.zeros((mesh.n_elements, 3, 3), dtype=np.float64)
+        # Peak-nodal-speed gate on the rebuild trigger. Below this the
+        # body is treated as quasi-static (no transient elastic
+        # deformation to misclassify as permanent set). 1 mm/s is the
+        # bench-scale "really at rest" floor for the demos here; well
+        # above float noise but tight enough that a slow-settling
+        # cantilever doesn't fire the rebuild while it's still
+        # rebounding past its plastic-equilibrium tip position.
+        self._quasistatic_v_threshold = 1e-3
         # Snapshot from the previous ``update_region_states`` call —
         # compared against ``self.eps_p`` to decide whether plastic flow
         # actually happened in the last step (state-machine trigger).
@@ -337,7 +345,33 @@ class HybridCBPlasticBody:
         return out
 
     def all_rebuild_pending(self) -> bool:
-        return all(s == RegionState.REBUILD_PENDING for s in self.region_state)
+        """True iff a coordinated rebuild should fire *right now*.
+
+        Conditions:
+        1. No region is currently PLASTIC_ACTIVE.
+        2. At least one region is REBUILD_PENDING (so something to absorb).
+        3. The body is quasi-static — peak nodal speed below
+           ``_quasistatic_v_threshold``. Without this, a rebuild that
+           lands mid-oscillation bakes the *current elastic* deformation
+           into the new reference (plastic + transient elastic both),
+           which over-counts permanent set on subsequent rebuilds.
+
+        ELASTIC regions don't need to re-yield to unblock a rebuild;
+        they just had no plastic flow to begin with.
+        """
+        any_pending = False
+        for s in self.region_state:
+            if s == RegionState.PLASTIC_ACTIVE:
+                return False
+            if s == RegionState.REBUILD_PENDING:
+                any_pending = True
+        if not any_pending:
+            return False
+        if self._cb.v is not None:
+            v_peak = float(np.linalg.norm(self._cb.v, axis=1).max())
+            if v_peak > self._quasistatic_v_threshold:
+                return False
+        return True
 
     def rebuild_rom(self) -> None:
         """Absorb the current deformed shape into the reference geometry
