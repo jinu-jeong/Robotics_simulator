@@ -8,7 +8,9 @@ import numpy as np
 import scipy.sparse as sp
 
 from robosim.physics.fem.mesh import TetMesh, FEMesh, CompositeMesh
-from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
+from robosim.physics.fem.materials import (
+    CorotationalElastic, CorotationalPlastic, NeoHookean,
+)
 from robosim.physics.fem.assembly import (
     assemble_forces,
     assemble_mass_matrix,
@@ -34,7 +36,7 @@ class DeformableBody:
 
     name: str
     mesh: TetMesh | FEMesh | CompositeMesh
-    material: CorotationalElastic | NeoHookean = field(
+    material: CorotationalElastic | CorotationalPlastic | NeoHookean = field(
         default_factory=lambda: CorotationalElastic()
     )
     density: float = 1000.0
@@ -43,6 +45,10 @@ class DeformableBody:
     # State (set on initialize)
     x: np.ndarray | None = field(default=None, repr=False)
     v: np.ndarray | None = field(default=None, repr=False)
+    # Per-element 3×3 plastic strain tensor — auto-allocated on initialize
+    # iff material is :class:`CorotationalPlastic`. Stays ``None`` for
+    # purely elastic bodies (saves the (n_e, 3, 3) buffer).
+    eps_p: np.ndarray | None = field(default=None, repr=False)
 
     # Precomputed (set on initialize)
     _dN_list: list[np.ndarray] | None = field(default=None, repr=False)
@@ -100,6 +106,11 @@ class FEMSolver:
             body._M = assemble_mass_matrix(body.mesh, body.density, body._volumes)
             body._fixed_dofs = None  # reset cache
 
+            # Plastic state buffer (per-element 3×3 symmetric tensor) for
+            # CorotationalPlastic bodies. Elastic materials skip the alloc.
+            if isinstance(body.material, CorotationalPlastic):
+                body.eps_p = np.zeros((body.mesh.n_elements, 3, 3), dtype=np.float64)
+
         self._time = 0.0
 
     def step(self, dt: float | None = None,
@@ -139,10 +150,13 @@ class FEMSolver:
                 fixed_dofs=body.fixed_dofs,
                 damping=self.damping,
                 max_newton_iters=self.max_newton_iters,
+                eps_p=body.eps_p,
             )
 
             body.x = result.x_new
             body.v = result.v_new
+            if result.eps_p_new is not None:
+                body.eps_p = result.eps_p_new
 
         self._time += dt
 

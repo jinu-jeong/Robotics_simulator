@@ -19,7 +19,9 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 from robosim.physics.fem.mesh import TetMesh
-from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
+from robosim.physics.fem.materials import (
+    CorotationalElastic, CorotationalPlastic, NeoHookean,
+)
 from robosim.physics.fem.assembly import (
     assemble_forces,
     assemble_stiffness,
@@ -37,6 +39,9 @@ class ImplicitEulerResult:
     newton_iters: int
     converged: bool
     residual_norm: float
+    # Updated per-element plastic strain (only set when material is
+    # CorotationalPlastic; ``None`` for elastic materials).
+    eps_p_new: np.ndarray | None = None
 
 
 def implicit_euler_step(
@@ -45,7 +50,7 @@ def implicit_euler_step(
     v: np.ndarray,
     f_ext: np.ndarray,
     dt: float,
-    material: CorotationalElastic | NeoHookean,
+    material: CorotationalElastic | CorotationalPlastic | NeoHookean,
     M: sp.csr_matrix,
     dN_list: list[np.ndarray],
     volumes: np.ndarray,
@@ -53,6 +58,7 @@ def implicit_euler_step(
     max_newton_iters: int = 20,
     tol: float = 1e-6,
     damping: float = 0.0,
+    eps_p: np.ndarray | None = None,
 ) -> ImplicitEulerResult:
     """Perform one implicit Euler time step.
 
@@ -98,13 +104,27 @@ def implicit_euler_step(
     residual_norm = 0.0
     dt2_inv = 1.0 / (dt * dt)
 
+    # Plastic state: Newton uses the *frozen* eps_p_n from the start of the
+    # step (elastic-predictor / plastic-corrector pattern). After the
+    # iteration converges we re-assemble once at the converged x to commit
+    # eps_p_{n+1}. Inside Newton, eps_p_new returned by assemble_forces is
+    # discarded — only the projected force is consumed.
+    is_plastic = isinstance(material, CorotationalPlastic)
+    eps_p_n = eps_p if is_plastic else None
+
     for iteration in range(max_newton_iters):
         x_3d = x_new.reshape(-1, 3)
 
         # Internal forces + intermediates for stiffness reuse
-        result = assemble_forces(mesh, x_3d, material, dN_list, volumes,
-                                 return_intermediates=True)
-        f_int, F_all, R_all, S_all = result
+        if is_plastic:
+            f_int, F_all, R_all, S_all, _eps_p_trial = assemble_forces(
+                mesh, x_3d, material, dN_list, volumes,
+                return_intermediates=True, eps_p=eps_p_n,
+            )
+        else:
+            result = assemble_forces(mesh, x_3d, material, dN_list, volumes,
+                                     return_intermediates=True)
+            f_int, F_all, R_all, S_all = result
 
         # Residual: r = M/dt^2 * (x_new - x_pred) - f_int - f_ext
         inertia_term = M @ (x_new - x_pred) * dt2_inv
@@ -152,10 +172,21 @@ def implicit_euler_step(
     # Velocity update
     v_new = (x_new - x_flat) / dt
 
+    # Commit plastic strain at converged x: re-evaluate the constitutive
+    # model once with the converged configuration so eps_p_{n+1} reflects
+    # the projection actually consistent with x_{n+1}.
+    eps_p_new = None
+    if is_plastic:
+        f_int_final, _, _, _, eps_p_new = assemble_forces(
+            mesh, x_new.reshape(-1, 3), material, dN_list, volumes,
+            return_intermediates=True, eps_p=eps_p_n,
+        )
+
     return ImplicitEulerResult(
         x_new=x_new.reshape(-1, 3),
         v_new=v_new.reshape(-1, 3),
         newton_iters=iteration + 1,
         converged=converged,
         residual_norm=residual_norm,
+        eps_p_new=eps_p_new,
     )

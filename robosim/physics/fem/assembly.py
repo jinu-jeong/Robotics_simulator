@@ -17,7 +17,9 @@ from robosim.physics.fem.elements import (
     ElementType, NODES_PER_ELEMENT,
     compute_shape_derivatives, shape_function, gauss_rule,
 )
-from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
+from robosim.physics.fem.materials import (
+    CorotationalElastic, CorotationalPlastic, NeoHookean,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -236,6 +238,56 @@ def _batch_corotational_stress(F_all, R_all, S_all, mu, lam):
     return R_all @ T
 
 
+def _batch_corotational_plastic_stress(
+    F_all, R_all, S_all, eps_p_in, mu, lam, sigma_Y, hardening,
+):
+    """Vectorised J2 radial-return for an entire element batch.
+
+    Mirrors :meth:`CorotationalPlastic.compute_stress` element-wise but
+    operates on (ne, 3, 3) arrays without a Python loop.
+
+    Returns ``(P_all, eps_p_new)`` — first Piola stress per element and
+    the updated plastic strain (caller writes back to per-element store).
+    """
+    ne = F_all.shape[0]
+    I3 = np.eye(3)[np.newaxis]                         # (1, 3, 3)
+
+    # Trial elastic strain in corotated frame: sym(S - I) - eps_p.
+    eps_e_trial = 0.5 * (S_all + np.transpose(S_all, (0, 2, 1))) - I3 - eps_p_in
+    tr_e = np.trace(eps_e_trial, axis1=1, axis2=2)     # (ne,)
+    sigma_trial = (
+        2.0 * mu * eps_e_trial
+        + lam * tr_e[:, None, None] * I3
+    )
+
+    # Deviatoric trial stress and its Frobenius norm per element.
+    tr_sig = np.trace(sigma_trial, axis1=1, axis2=2)
+    dev = sigma_trial - (tr_sig / 3.0)[:, None, None] * I3
+    norm_dev = np.linalg.norm(dev, axis=(1, 2))        # (ne,)
+
+    # Effective yield radius (linear isotropic hardening).
+    eps_p_eq = np.sqrt(2.0 / 3.0) * np.linalg.norm(eps_p_in, axis=(1, 2))
+    sigma_Y_eff = sigma_Y + hardening * eps_p_eq
+    f = norm_dev - np.sqrt(2.0 / 3.0) * sigma_Y_eff    # (ne,)
+
+    yielded = (f > 0.0) & (norm_dev > 1e-16)
+
+    # Δγ and flow direction n; both zero where elastic.
+    safe_norm = np.where(norm_dev > 1e-16, norm_dev, 1.0)
+    dgamma = np.where(yielded, f / (2.0 * mu + 2.0 * hardening / 3.0), 0.0)
+    n = np.where(
+        yielded[:, None, None],
+        dev / safe_norm[:, None, None],
+        np.zeros_like(dev),
+    )
+
+    sigma_new = sigma_trial - 2.0 * mu * dgamma[:, None, None] * n
+    eps_p_new = eps_p_in + dgamma[:, None, None] * n
+
+    P_all = np.einsum("eij,ejk->eik", R_all, sigma_new)
+    return P_all, eps_p_new
+
+
 def _batch_neohookean_stress(F_all, mu, lam):
     ne = F_all.shape[0]
     P_all = np.zeros_like(F_all)
@@ -253,7 +305,7 @@ def _batch_neohookean_stress(F_all, mu, lam):
 
 def assemble_forces(
     mesh, x, material, dN_all, volumes,
-    return_intermediates=False,
+    return_intermediates=False, eps_p=None,
 ):
     """Assemble global internal force vector.
 
@@ -262,7 +314,26 @@ def assemble_forces(
     mesh : TetMesh or FEMesh
     dN_all : (ne,4,3) for Tet4  OR  ElementIntegrationData for Hex8/Tet10
     volumes : (ne,) for Tet4  OR  ignored for general (weights in dN_all)
+    eps_p : (ne, 3, 3) per-element plastic strain, REQUIRED if material is
+        CorotationalPlastic. The function returns the *updated* ``eps_p``
+        alongside the force vector (and intermediates) — caller decides
+        whether to commit it (Newton iters typically discard until
+        convergence).
+
+    Plastic Tet4 path returns ``(f, eps_p_new)`` or
+    ``(f, F_all, R_all, S_all, eps_p_new)`` with ``return_intermediates``.
+    Plastic with general/composite meshes is not yet wired (raises).
     """
+    if isinstance(material, CorotationalPlastic):
+        if isinstance(dN_all, (ElementIntegrationData, CompositeIntegrationData)):
+            raise NotImplementedError(
+                "CorotationalPlastic + general/composite mesh not wired yet. "
+                "Use TetMesh / Tet4 elements."
+            )
+        return _assemble_forces_tet4(
+            mesh, x, material, dN_all, volumes, return_intermediates,
+            eps_p_in=eps_p,
+        )
     if isinstance(dN_all, CompositeIntegrationData):
         return _assemble_forces_composite(mesh, x, material, dN_all, return_intermediates)
     if isinstance(dN_all, ElementIntegrationData):
@@ -270,15 +341,31 @@ def assemble_forces(
     return _assemble_forces_tet4(mesh, x, material, dN_all, volumes, return_intermediates)
 
 
-def _assemble_forces_tet4(mesh, x, material, dN_all, volumes, return_intermediates):
-    """Optimized Tet4 force assembly (single Gauss point, vectorized)."""
+def _assemble_forces_tet4(mesh, x, material, dN_all, volumes, return_intermediates,
+                          eps_p_in=None):
+    """Optimized Tet4 force assembly (single Gauss point, vectorized).
+
+    For :class:`CorotationalPlastic` materials, ``eps_p_in`` (per-element
+    3×3) must be supplied; the trial-elastic / radial-return projection
+    runs and the updated ``eps_p_new`` is returned alongside ``f``.
+    """
     ne = mesh.n_elements
     n_dof = mesh.n_nodes * 3
 
     F_all = _batch_deformation_gradients(x, mesh.elements, dN_all)
     R_all = S_all = None
+    eps_p_new = None
 
-    if isinstance(material, CorotationalElastic):
+    if isinstance(material, CorotationalPlastic):
+        if eps_p_in is None:
+            eps_p_in = np.zeros((ne, 3, 3), dtype=np.float64)
+        R_all, S_all = _batch_polar_decomposition(F_all)
+        P_all, eps_p_new = _batch_corotational_plastic_stress(
+            F_all, R_all, S_all, eps_p_in,
+            material.mu, material.lam,
+            material.yield_stress, material.hardening,
+        )
+    elif isinstance(material, CorotationalElastic):
         R_all, S_all = _batch_polar_decomposition(F_all)
         P_all = _batch_corotational_stress(F_all, R_all, S_all, material.mu, material.lam)
     else:
@@ -291,7 +378,11 @@ def _assemble_forces_tet4(mesh, x, material, dN_all, volumes, return_intermediat
         np.add.at(f.reshape(-1, 3), mesh.elements[:, a], -H_all[:, :, a])
 
     if return_intermediates:
+        if eps_p_new is not None:
+            return f, F_all, R_all, S_all, eps_p_new
         return f, F_all, R_all, S_all
+    if eps_p_new is not None:
+        return f, eps_p_new
     return f
 
 
@@ -369,7 +460,12 @@ def _assemble_stiffness_tet4(mesh, x, material, dN_all, volumes, R_all):
     ne = mesh.n_elements
     n_dof = mesh.n_nodes * 3
 
-    if isinstance(material, CorotationalElastic):
+    if isinstance(material, (CorotationalElastic, CorotationalPlastic)):
+        # Plastic uses the elastic tangent as a modified-Newton approximation:
+        # forces use the true projected stress (radial return), but the
+        # Hessian stays the constant elastic K. Loses quadratic Newton
+        # convergence inside the plastic zone but stays stable, and avoids
+        # the cost of the consistent C^{ep} tangent.
         if R_all is None:
             F_all = _batch_deformation_gradients(x, mesh.elements, dN_all)
             R_all, _ = _batch_polar_decomposition(F_all)

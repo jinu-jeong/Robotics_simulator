@@ -108,6 +108,54 @@ def test_pure_rotation_produces_no_plastic_flow():
     assert np.linalg.norm(eps_p_new) == 0.0
 
 
+def test_batch_matches_single_element():
+    """The vectorised _batch_corotational_plastic_stress must agree
+    element-wise with CorotationalPlastic.compute_stress under a mix of
+    elastic and yielded states."""
+    from robosim.physics.fem.assembly import _batch_corotational_plastic_stress
+    from robosim.physics.fem.elements import polar_decomposition
+
+    plastic = CorotationalPlastic(young=1e6, poisson=0.3,
+                                  yield_stress=2e3, hardening=5e4)
+
+    rng = np.random.default_rng(7)
+    ne = 12
+    # Random small-strain F with stretches in [0.97, 1.06] and rotations.
+    Fs = []
+    for _ in range(ne):
+        # random rotation via QR
+        Q, _ = np.linalg.qr(rng.standard_normal((3, 3)))
+        if np.linalg.det(Q) < 0:
+            Q[:, 0] *= -1
+        stretches = 1.0 + (rng.random(3) - 0.5) * 0.18
+        Fs.append(Q @ np.diag(stretches))
+    F_all = np.stack(Fs)
+
+    # Random pre-existing plastic strain (deviatoric).
+    eps_p_in = rng.standard_normal((ne, 3, 3)) * 0.005
+    eps_p_in = 0.5 * (eps_p_in + np.transpose(eps_p_in, (0, 2, 1)))
+    eps_p_in -= np.trace(eps_p_in, axis1=1, axis2=2)[:, None, None] / 3.0 * np.eye(3)
+
+    # Batch path
+    R_all = np.stack([polar_decomposition(F)[0] for F in F_all])
+    S_all = np.stack([polar_decomposition(F)[1] for F in F_all])
+    P_batch, eps_p_batch = _batch_corotational_plastic_stress(
+        F_all, R_all, S_all, eps_p_in,
+        plastic.mu, plastic.lam, plastic.yield_stress, plastic.hardening,
+    )
+
+    # Loop path
+    P_loop = np.zeros_like(F_all)
+    eps_p_loop = np.zeros_like(eps_p_in)
+    for e in range(ne):
+        P_e, _, eps_p_e = plastic.compute_stress(F_all[e], eps_p_in[e])
+        P_loop[e] = P_e
+        eps_p_loop[e] = eps_p_e
+
+    np.testing.assert_allclose(P_batch, P_loop, atol=1e-9, rtol=1e-9)
+    np.testing.assert_allclose(eps_p_batch, eps_p_loop, atol=1e-12, rtol=1e-9)
+
+
 def test_plastic_strain_is_isochoric():
     """tr(eps_p) ≈ 0 should hold across multiple loading directions."""
     plastic = CorotationalPlastic(young=1e6, poisson=0.3, yield_stress=1e3)
