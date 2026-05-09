@@ -38,10 +38,17 @@ Müller M. et al. (2002). Stable real-time deformations.  ACM SCA 2002.
 from __future__ import annotations
 
 import numpy as np
+import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from scipy.linalg import lu_factor, lu_solve  # kept for fallback
 
 from robosim.physics.fem.mesh import TetMesh, FEMesh
+
+try:
+    from robosim.physics.fem.partition import nested_dissection_order
+    _HAS_PYMETIS = True
+except ImportError:
+    _HAS_PYMETIS = False
 from robosim.physics.fem.materials import CorotationalElastic, NeoHookean
 from robosim.physics.fem.assembly import (
     precompute_element_data,
@@ -193,13 +200,49 @@ class CraigBamptonBody:
         print(f"[C-B '{self.name}']   fixed: {len(fixed_dofs)}  "
               f"boundary: {n_b}  interior: {n_i}")
 
+        # ── Interior block factorisation: dense vs sparse+ND ────────
+        # Both the constraint-mode solve and the fixed-interface eigsh
+        # shift-invert hit K_ii⁻¹. Strategy by interior size:
+        #   • n_i < ND_THRESHOLD: dense LU. BLAS-3 GEMM dominates; sparse
+        #     overhead is not worth it.
+        #   • n_i ≥ ND_THRESHOLD: sparse with METIS-ND permutation. 3-D
+        #     fill scales O(N · log N) instead of natural's O(N^{5/3}),
+        #     the difference between routine and unusable above a few
+        #     thousand DOFs.
+        # Crossover measured around n_i ~ 3000 on M1 (dense ↔ ND).
+        ND_THRESHOLD = 3000
+        K_ii_sp = K0[np.ix_(i_dofs_global, i_dofs_global)].tocsc()
+        nd_perm = None
+        K_ii_factor = None
+        if n_i > 0:
+            if _HAS_PYMETIS and n_i >= ND_THRESHOLD:
+                nd_perm = nested_dissection_order(K_ii_sp)
+                K_ii_perm = K_ii_sp[nd_perm, :][:, nd_perm]
+                K_ii_perm = K_ii_perm + sp.eye(n_i, format="csc") * 1e-12
+                K_ii_factor = spla.splu(K_ii_perm, permc_spec="NATURAL")
+            else:
+                # Small interior or pymetis unavailable → dense fallback.
+                K_ii_dense = K_ii_sp.toarray() + 1e-12 * np.eye(n_i)
+                K_ii_factor = ("dense", lu_factor(K_ii_dense))
+
+        def _solve_K_ii(rhs: np.ndarray) -> np.ndarray:
+            """K_ii⁻¹ @ rhs, applying the ND permutation transparently."""
+            if isinstance(K_ii_factor, tuple) and K_ii_factor[0] == "dense":
+                return lu_solve(K_ii_factor[1], rhs)
+            rhs_perm = rhs[nd_perm] if rhs.ndim == 1 else rhs[nd_perm, :]
+            x_perm = K_ii_factor.solve(rhs_perm)
+            x = np.empty_like(x_perm)
+            if x_perm.ndim == 1:
+                x[nd_perm] = x_perm
+            else:
+                x[nd_perm, :] = x_perm
+            return x
+
         # ── Constraint modes  Ψ_c = -K_ii⁻¹ K_ib ───────────────────
         if n_i > 0 and n_b > 0:
-            K_ii = K0[np.ix_(i_dofs_global, i_dofs_global)].toarray()
             K_ib = K0[np.ix_(i_dofs_global, b_dofs_global)].toarray()
             print(f"[C-B '{self.name}']   constraint modes ({n_i}×{n_b})...")
-            K_ii_reg = K_ii + 1e-12 * np.eye(n_i)
-            Psi_c = np.linalg.solve(K_ii_reg, -K_ib)   # (n_i, n_b)
+            Psi_c = _solve_K_ii(-K_ib)
         else:
             Psi_c = np.zeros((n_i, n_b))
 
@@ -210,10 +253,15 @@ class CraigBamptonBody:
         if n_modes_req > 0 and n_i > 0:
             print(f"[C-B '{self.name}']   {n_modes_req} fixed-interface modes...")
             M_ii = M0[np.ix_(i_dofs_global, i_dofs_global)]
-            K_ii_sp = K0[np.ix_(i_dofs_global, i_dofs_global)]
+            # Reuse the ND-permuted factor for shift-invert: eigsh's OPinv
+            # replaces its own (slower, COLAMD-based) factorisation with
+            # ours, so the reorder pays off twice.
+            OPinv = spla.LinearOperator(
+                K_ii_sp.shape, matvec=_solve_K_ii, dtype=np.float64,
+            )
             eigenvalues, evecs = spla.eigsh(
                 K_ii_sp, M=M_ii, k=n_modes_req, which="LM", sigma=0.0,
-                tol=1e-10, maxiter=5000,
+                OPinv=OPinv, tol=1e-10, maxiter=5000,
             )
             Phi_k = evecs[:, np.argsort(eigenvalues)]
         else:
