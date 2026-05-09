@@ -57,17 +57,24 @@ def make_material(kind: str):
     raise ValueError(kind)
 
 
-def build_solver(kind: str) -> MPMSolver:
+def build_solver(kind: str, backend: str = "numpy"):
     pts = sample_box_particles(CUBE_LOWER, CUBE_UPPER, N_PER_AXIS, DENSITY)
     pts.v[:] = INITIAL_KICK
     grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
+    bcs = [BoxBC(lower=DOMAIN_LOWER,
+                 upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
+                 mode="slip")]
+    if backend == "taichi":
+        from robosim.physics.mpm.taichi_solver import TaichiMPMSolver
+        return TaichiMPMSolver.from_numpy_setup(
+            particles=pts, grid=grid,
+            material=make_material(kind),
+            gravity=GRAVITY, bcs=bcs,
+        )
     return MPMSolver(
         particles=pts, grid=grid,
         material=make_material(kind),
-        gravity=GRAVITY,
-        bcs=[BoxBC(lower=DOMAIN_LOWER,
-                   upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
-                   mode="slip")],
+        gravity=GRAVITY, bcs=bcs,
     )
 
 
@@ -84,9 +91,9 @@ def _height_colors(z: np.ndarray) -> np.ndarray:
     return np.column_stack([0.3 + 0.5*t, 0.5 + 0.3*t, 1.0 - 0.4*t]).astype(np.float32)
 
 
-def run_headless(kind: str) -> None:
+def run_headless(kind: str, backend: str = "numpy") -> None:
     from robosim.util.fps import FPSCounter
-    solver = build_solver(kind)
+    solver = build_solver(kind, backend)
     pts = solver.particles
     print(f"[init] material={kind}, {pts.n} particles")
     fps = FPSCounter()
@@ -104,10 +111,10 @@ def run_headless(kind: str) -> None:
           f"last-window {fps.current:.1f} FPS)")
 
 
-def run_gui(kind: str) -> None:
+def run_gui(kind: str, backend: str = "numpy") -> None:
     from robosim.viz.viewer import SimViewer
 
-    solver = build_solver(kind)
+    solver = build_solver(kind, backend)
     pts = solver.particles
 
     viewer = SimViewer(
@@ -157,13 +164,16 @@ def main() -> None:
     ap.add_argument("--material", choices=["elastic", "metal", "sand"],
                     default="metal")
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--backend", choices=["numpy", "taichi"], default="numpy",
+                    help="numpy (default) or taichi (arch=metal, ~10× faster).")
     args = ap.parse_args()
-    if args.headless:
-        run_headless(args.material)
-    else:
+    if args.backend == "taichi" or not args.headless:
         import taichi as ti
         ti.init(arch=ti.metal)
-        run_gui(args.material)
+    if args.headless:
+        run_headless(args.material, args.backend)
+    else:
+        run_gui(args.material, args.backend)
 
 
 if __name__ == "__main__":

@@ -1,19 +1,18 @@
-"""Taichi-accelerated MLS-MPM solver (NeoHookean elastic only).
+"""Taichi-accelerated MLS-MPM solver.
 
 Mirrors :class:`robosim.physics.mpm.solver.MPMSolver` but pushes the
-hot loops (P2G, G2P, gravity, BC, F update, advection) into Taichi
-kernels — typically a 10-50× speedup on M1 Metal vs the NumPy
-reference, and the dominant path for any nontrivial particle count.
+hot loops (P2G, G2P, gravity, BC, F update, advection, plastic
+projection) into Taichi kernels — typically a 10-50× speedup on M1
+Metal vs the NumPy reference.
 
-Scope of the MVP:
-* NeoHookean elastic material (μ + λ Lamé constants).
-* Axis-aligned slip box BC (mirrors :func:`apply_box_bc` slip mode).
-* Single grid, single particle pool.
+Materials supported (selected via ``material_kind`` at construction):
+* ``"neo"``      — elastic NeoHookean (default).
+* ``"vm"``       — NeoHookean elasticity + Von-Mises J2 plasticity.
+* ``"dp"``       — NeoHookean elasticity + Drucker-Prager plasticity.
 
 Out-of-scope for now (use NumPy :class:`MPMSolver` instead):
-* Plastic materials (Von Mises, Drucker-Prager) — needs ti.svd in F update.
-* Damage models.
-* Kinematic colliders (KinematicBoxCollider).
+* Damage models (CD-MPM ``DamagedNeoHookean``).
+* Kinematic colliders (``KinematicBoxCollider``).
 
 Activation: caller must call ``ti.init(arch=ti.metal)`` (or another arch)
 before instantiating. The class registers Taichi fields with the
@@ -43,6 +42,11 @@ except ImportError as _exc:  # pragma: no cover
 class TaichiMPMSolver:
     """Taichi MLS-MPM solver. API mirrors :class:`MPMSolver`."""
 
+    # Material kind constants (used as ti.static keys in kernel branches).
+    MAT_NEO = 0
+    MAT_VM  = 1
+    MAT_DP  = 2
+
     def __init__(
         self,
         particles_x: np.ndarray,
@@ -57,7 +61,22 @@ class TaichiMPMSolver:
         gravity: Sequence[float] = (0.0, 0.0, -9.81),
         bc_lower: Optional[Sequence[float]] = None,
         bc_upper: Optional[Sequence[float]] = None,
+        material_kind: str = "neo",
+        yield_stress: float = 1e4,
+        friction_angle: float = 0.5236,   # 30 degrees
     ):
+        kind_map = {"neo": self.MAT_NEO, "vm": self.MAT_VM, "dp": self.MAT_DP}
+        if material_kind not in kind_map:
+            raise ValueError(
+                f"material_kind must be one of {list(kind_map)}, "
+                f"got {material_kind!r}"
+            )
+        self.material_kind = material_kind
+        self._mat_id = kind_map[material_kind]
+        self.yield_stress = float(yield_stress)
+        # Drucker-Prager slope α = √(2/3) · 2 sinφ / (3 − sinφ)
+        s = float(np.sin(friction_angle))
+        self.dp_alpha = float(np.sqrt(2.0 / 3.0) * 2.0 * s / (3.0 - s))
         self.P = int(particles_x.shape[0])
         nx, ny, nz = grid_shape
         self.shape = (nx, ny, nz)
@@ -195,10 +214,69 @@ class TaichiMPMSolver:
             self.v[p]  = v_new
             self.C_[p] = self.D_inv * C_new
 
+    @ti.func
+    def _project_vm(self, F_trial):
+        """Von-Mises radial return on Hencky principal strain. Volumetric
+        part untouched (isochoric flow), deviatoric scaled to yield."""
+        U, S, V = ti.svd(F_trial, ti.f32)
+        eps = ti.Vector([
+            ti.log(ti.max(S[0, 0], 1e-12)),
+            ti.log(ti.max(S[1, 1], 1e-12)),
+            ti.log(ti.max(S[2, 2], 1e-12)),
+        ])
+        eps_mean = (eps[0] + eps[1] + eps[2]) / 3.0
+        eps_dev = eps - ti.Vector([eps_mean, eps_mean, eps_mean])
+        norm_dev = eps_dev.norm()
+        yield_strain = self.yield_stress / (ti.sqrt(6.0) * self.mu)
+        scale = 1.0
+        if norm_dev > yield_strain:
+            scale = yield_strain / ti.max(norm_dev, 1e-16)
+        eps_new = eps_dev * scale + ti.Vector([eps_mean, eps_mean, eps_mean])
+        sigma_new = ti.Matrix([
+            [ti.exp(eps_new[0]), 0.0, 0.0],
+            [0.0, ti.exp(eps_new[1]), 0.0],
+            [0.0, 0.0, ti.exp(eps_new[2])],
+        ])
+        return U @ sigma_new @ V.transpose()
+
+    @ti.func
+    def _project_dp(self, F_trial):
+        """Drucker-Prager 3-case return on Hencky principal strain.
+        Tension → ε=0, cone-violation → radial return, elastic → unchanged."""
+        U, S, V = ti.svd(F_trial, ti.f32)
+        eps = ti.Vector([
+            ti.log(ti.max(S[0, 0], 1e-12)),
+            ti.log(ti.max(S[1, 1], 1e-12)),
+            ti.log(ti.max(S[2, 2], 1e-12)),
+        ])
+        trace = eps[0] + eps[1] + eps[2]
+        eps_hat = eps - ti.Vector([trace, trace, trace]) / 3.0
+        norm_hat = eps_hat.norm()
+        coef = (3.0 * self.lam + 2.0 * self.mu) / (2.0 * self.mu)
+        dgamma = norm_hat + coef * trace * self.dp_alpha
+        eps_new = eps
+        if trace > 0.0:
+            eps_new = ti.Vector([0.0, 0.0, 0.0])
+        elif dgamma > 0.0:
+            safe_norm = ti.max(norm_hat, 1e-16)
+            eps_new = eps - (dgamma / safe_norm) * eps_hat
+        sigma_new = ti.Matrix([
+            [ti.exp(eps_new[0]), 0.0, 0.0],
+            [0.0, ti.exp(eps_new[1]), 0.0],
+            [0.0, 0.0, ti.exp(eps_new[2])],
+        ])
+        return U @ sigma_new @ V.transpose()
+
     @ti.kernel
     def _update_F_advect(self, dt: ti.f32):
         for p in range(self.P):
-            self.F[p] = (ti.Matrix.identity(ti.f32, 3) + dt * self.C_[p]) @ self.F[p]
+            F_trial = (ti.Matrix.identity(ti.f32, 3) + dt * self.C_[p]) @ self.F[p]
+            if ti.static(self._mat_id == self.MAT_NEO):
+                self.F[p] = F_trial
+            elif ti.static(self._mat_id == self.MAT_VM):
+                self.F[p] = self._project_vm(F_trial)
+            elif ti.static(self._mat_id == self.MAT_DP):
+                self.F[p] = self._project_dp(F_trial)
             self.x[p] = self.x[p] + dt * self.v[p]
 
     # ── public step ───────────────────────────────────────────────────
@@ -252,8 +330,22 @@ class TaichiMPMSolver:
         """
         if not hasattr(material, "young"):
             raise TypeError(
-                f"TaichiMPMSolver only supports elastic NeoHookean-style "
-                f"materials (with .young/.poisson); got {type(material).__name__}"
+                f"TaichiMPMSolver requires a NeoHookean-derived material "
+                f"(with .young/.poisson); got {type(material).__name__}"
+            )
+        cls_name = type(material).__name__
+        kind = "neo"
+        yield_stress = 1e4
+        friction_angle = 0.5236
+        if cls_name == "VonMisesPlastic":
+            kind = "vm"
+            yield_stress = float(getattr(material, "yield_stress", 1e4))
+        elif cls_name == "DruckerPragerPlastic":
+            kind = "dp"
+            friction_angle = float(getattr(material, "friction_angle", 0.5236))
+        elif cls_name == "DamagedNeoHookean":
+            raise NotImplementedError(
+                "DamagedNeoHookean (CD-MPM) not yet supported by Taichi backend"
             )
         bc_lower = None
         bc_upper = None
@@ -274,6 +366,9 @@ class TaichiMPMSolver:
             gravity=tuple(gravity),
             bc_lower=bc_lower,
             bc_upper=bc_upper,
+            material_kind=kind,
+            yield_stress=yield_stress,
+            friction_angle=friction_angle,
         )
 
 
