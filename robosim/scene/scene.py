@@ -51,10 +51,28 @@ class Scene:
         dt:       float = 0.001,
         gravity:  list | np.ndarray | None = None,
         substeps: int = 10,
+        contact_solver: str = "penalty",
     ):
+        """Build an empty scene.
+
+        ``contact_solver`` selects the contact response algorithm:
+
+        * ``"penalty"`` (default) — explicit penalty + regularised
+          kinetic Coulomb. Fast. ``Scene.grip(...)`` provides static
+          holding via kinematic lock + finger-PD freeze.
+        * ``"constraint"`` — Coulomb cone with stick/slip. Static
+          friction holds objects without a kinematic lock; calls to
+          ``Scene.grip(...)`` are silently ignored (with a warning) in
+          this mode because they would conflict with the friction grasp.
+        """
+        if contact_solver not in ("penalty", "constraint"):
+            raise ValueError(
+                f"contact_solver must be 'penalty' or 'constraint', got {contact_solver!r}"
+            )
         self.dt       = dt
         self.gravity  = np.asarray(gravity if gravity is not None else [0.0, 0.0, -9.81])
         self.substeps = substeps
+        self._contact_solver_kind = contact_solver
 
         # Registered objects
         self._robot_handles: dict[str, RobotHandle]  = {}
@@ -77,10 +95,21 @@ class Scene:
         self._grip_state:     dict[str, dict]      = {}
         self._grip_active:    dict[str, bool]       = {}
         self._grip_palm_pos0: dict[str, np.ndarray] = {}
+        self._grip_palm_rot0: dict[str, np.ndarray] = {}   # palm rotation
+                                                           # at grip activation
+        self._grip_q_lock:    dict[str, float]      = {}   # finger joint q
+                                                           # frozen at grip time
+                                                           # (prevents PD from
+                                                           # driving deeper)
         self._grip_body_x0:   dict[str, np.ndarray] = {}
         self._grip_box_pos0:  dict[str, np.ndarray] = {}
+        self._grip_box_rot0:  dict[str, np.ndarray] = {}
         self._grip_offset:    dict[str, np.ndarray] = {}
         self._grip_prev_palm: dict[str, np.ndarray] = {}
+
+        # Step API (used by gymnasium wrapper / interactive control loops)
+        self._runner: SimRunner | None = None
+        self._initial_state: dict | None = None
 
     # ══════════════════════════════════════════════════════════════════════════
     # add()
@@ -293,6 +322,16 @@ class Scene:
         lift_start_t : earliest simulation time grip can activate [s].
                        Defaults to the start of the last trajectory phase.
         """
+        if self._contact_solver_kind == "constraint":
+            import warnings
+            warnings.warn(
+                "scene.grip() ignored under contact_solver='constraint': "
+                "static Coulomb friction holds the object without a kinematic "
+                "lock. Remove the .grip() call to silence this warning.",
+                stacklevel=2,
+            )
+            return
+
         if lift_start_t is None:
             lift_start_t = 0.0   # runner can override from trajectory
 
@@ -348,6 +387,123 @@ class Scene:
             headless=headless,
             on_step=on_step,
         )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Step API — single-control-step advance for gym envs / interactive loops
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def reset_runtime(self) -> None:
+        """Initialise (or restore) physics state for ``step()``-based control.
+
+        First call: builds contact, initialises solvers, snapshots initial
+        state. Subsequent calls: restores the snapshot in-place (no rebuild).
+        """
+        if self._runner is None:
+            self._build_contact()
+            self._runner = SimRunner(scene=self, dt=self.dt, substeps=self.substeps)
+            self._runner._init_physics(self.dt)
+            self._runner._time = 0.0
+            self._initial_state = self._snapshot_state()
+        else:
+            self._restore_state(self._initial_state)
+            self._runner._time = 0.0
+
+    def step(self) -> float:
+        """Advance physics by ``substeps`` substeps. Returns current sim time.
+
+        Caller is responsible for setting controller targets (via
+        ``robot.set_target(...)``) before calling ``step()``.
+        """
+        if self._runner is None:
+            self.reset_runtime()
+        runner = self._runner
+        dt = self.dt
+        for _ in range(self.substeps):
+            for rh in self._robot_handles.values():
+                runner._step_robot(rh, dt)
+            for bh in self._body_handles.values():
+                runner._step_body(bh, dt)
+            runner._time += dt
+        return runner._time
+
+    def render(self) -> bool:
+        """Open a viewer (lazy on first call) and draw current state.
+
+        Returns ``False`` once the user closes the window, ``True`` otherwise.
+        Pair with :meth:`step` for headed control loops::
+
+            scene.reset_runtime()
+            while scene.render():
+                robot.set_target(policy(obs))
+                scene.step()
+        """
+        if self._runner is None:
+            self.reset_runtime()
+        if self._runner._viewer_ctx is None:
+            self._runner._viewer_ctx = self._runner._init_viewer()
+        return self._runner._update_viewer(self._runner._viewer_ctx, [])
+
+    @property
+    def time(self) -> float:
+        return self._runner._time if self._runner is not None else 0.0
+
+    def _snapshot_state(self) -> dict:
+        from robosim.scene.handles import (
+            FEMBodyHandle, CBBodyHandle, RigidBodyHandle,
+        )
+        snap: dict = {"robots": {}, "bodies": {}, "grip": {}}
+        for rh in self._robot_handles.values():
+            snap["robots"][rh.name] = (rh._model.q.copy(), rh._model.qd.copy())
+        for bh in self._body_handles.values():
+            if isinstance(bh, RigidBodyHandle):
+                snap["bodies"][bh.name] = ("rigid",
+                                           bh._model.q.copy(),
+                                           bh._model.qd.copy())
+            elif isinstance(bh, FEMBodyHandle):
+                snap["bodies"][bh.name] = ("fem",
+                                           bh._body.x.copy(),
+                                           bh._body.v.copy())
+            elif isinstance(bh, CBBodyHandle):
+                snap["bodies"][bh.name] = ("cb",
+                                           bh._body.x.copy(),
+                                           bh._body.v.copy(),
+                                           bh._body.q_r.copy(),
+                                           bh._body.qd_r.copy() if hasattr(bh._body, "qd_r") else None)
+        return snap
+
+    def _restore_state(self, snap: dict) -> None:
+        from robosim.scene.handles import (
+            FEMBodyHandle, CBBodyHandle, RigidBodyHandle,
+        )
+        for rh in self._robot_handles.values():
+            q0, qd0 = snap["robots"][rh.name]
+            rh._model.q[:]  = q0
+            rh._model.qd[:] = qd0
+            if hasattr(rh._model, "enforce_mimic"):
+                rh._model.enforce_mimic()
+        for bh in self._body_handles.values():
+            entry = snap["bodies"][bh.name]
+            kind = entry[0]
+            if kind == "rigid":
+                bh._model.q[:]  = entry[1]
+                bh._model.qd[:] = entry[2]
+            elif kind == "fem":
+                bh._body.x[:] = entry[1]
+                bh._body.v[:] = entry[2]
+            elif kind == "cb":
+                bh._body.x[:]   = entry[1]
+                bh._body.v[:]   = entry[2]
+                bh._body.q_r[:] = entry[3]
+                if entry[4] is not None and hasattr(bh._body, "qd_r"):
+                    bh._body.qd_r[:] = entry[4]
+        # Reset grip state
+        for name in list(self._grip_active.keys()):
+            self._grip_active[name] = False
+        self._grip_palm_pos0.clear()
+        self._grip_body_x0.clear()
+        self._grip_box_pos0.clear()
+        self._grip_offset.clear()
+        self._grip_prev_palm.clear()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Item access and display
@@ -431,13 +587,26 @@ class Scene:
     def _build_contact(self) -> None:
         from robosim.physics.contact.detection import GroundPlane
         from robosim.physics.contact.response import ContactParams
-        from robosim.physics.contact.solver import ContactSolver
 
         g_height = self._ground.height if self._ground else 0.0
-        self._contact = ContactSolver(
-            ground=GroundPlane(height=g_height),
-            params=ContactParams(stiffness=1e3, damping=50, friction_mu=0.0),
+        params = ContactParams(
+            stiffness=1e3, damping=50,
+            friction_mu=0.5, friction_eps=1e-3,
+            max_penetration=0.01,
         )
+        if self._contact_solver_kind == "constraint":
+            from robosim.physics.contact.constraint_solver import ConstraintContactSolver
+            self._contact = ConstraintContactSolver(
+                ground=GroundPlane(height=g_height),
+                params=params,
+                dt=self.dt,
+            )
+        else:
+            from robosim.physics.contact.solver import PenaltyContactSolver
+            self._contact = PenaltyContactSolver(
+                ground=GroundPlane(height=g_height),
+                params=params,
+            )
 
     def _auto_detect_contact_links(self, robot: RobotHandle) -> list[str]:
         """Return robot link names that have box collision geometry (likely fingers)."""

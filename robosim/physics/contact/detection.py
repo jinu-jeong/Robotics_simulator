@@ -247,11 +247,21 @@ class ContactDetector:
         """
         results: list[tuple[ContactPoint, int, int]] = []
 
+        # AABBs are needed by both ground-skip and body-body broad phase.
+        # Compute once and share.
+        aabbs = [compute_aabb(b.geometry, b.transform) for b in self.bodies]
+
         # ── Ground contacts ──
         if self.ground is not None:
             gh = self.ground.height
             gn = self.ground.normal
-            for body in self.bodies:
+            # Axis-aligned-up ground: skip bodies whose AABB minimum Z is
+            # above ground.  Saves O(8) corner checks per body when nothing
+            # near the floor (typical during free flight / grasping).
+            up_z = (gn[0] == 0.0 and gn[1] == 0.0 and gn[2] > 0.0)
+            for k, body in enumerate(self.bodies):
+                if up_z and aabbs[k].min_pt[2] > gh:
+                    continue
                 contacts = self._narrow_ground(body, gh, gn)
                 for cp in contacts:
                     results.append((cp, body.body_id, -1))
@@ -259,19 +269,27 @@ class ContactDetector:
         # ── Body-body contacts (BVH broad + narrow) ──
         n = len(self.bodies)
         if n > 1:
-            aabbs = [compute_aabb(b.geometry, b.transform) for b in self.bodies]
             body_ids = [b.body_id for b in self.bodies]
 
-            if n <= 4:
-                # For very small scenes brute force avoids BVH construction cost
+            if n <= 16:
+                # For small scenes brute force is faster than BVH construction.
+                # For grasping setups (≤16 collision bodies) this branch is hit
+                # and the per-substep BVH rebuild cost vanishes.
                 candidate_pairs: list[tuple[int, int]] = []
                 for i in range(n):
+                    aabb_i_min = aabbs[i].min_pt
+                    aabb_i_max = aabbs[i].max_pt
                     for j in range(i + 1, n):
                         bi, bj = body_ids[i], body_ids[j]
                         fp = (min(bi, bj), max(bi, bj))
                         if fp in self._filter_pairs:
                             continue
-                        if aabbs[i].overlaps(aabbs[j]):
+                        # Inlined AABB overlap (avoids method dispatch + np.all).
+                        aabb_j_min = aabbs[j].min_pt
+                        aabb_j_max = aabbs[j].max_pt
+                        if (aabb_i_min[0] <= aabb_j_max[0] and aabb_j_min[0] <= aabb_i_max[0] and
+                            aabb_i_min[1] <= aabb_j_max[1] and aabb_j_min[1] <= aabb_i_max[1] and
+                            aabb_i_min[2] <= aabb_j_max[2] and aabb_j_min[2] <= aabb_i_max[2]):
                             candidate_pairs.append((i, j))
             else:
                 # BVH traversal — O(N log N) average

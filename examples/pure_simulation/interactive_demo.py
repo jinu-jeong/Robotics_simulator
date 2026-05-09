@@ -138,6 +138,9 @@ def run_pendulum():
 
     substeps = 5
 
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
+
     def step_callback(step):
         nonlocal E0
 
@@ -175,6 +178,8 @@ def run_pendulum():
             fk = robot.forward_kinematics()
             joint_overlay.update(robot, fk)
 
+        fps_counter.tick()
+
         # Status
         E = solver.total_energy()
         drift = abs(E - E0) / max(abs(E0), 1e-6) * 100
@@ -185,6 +190,7 @@ def run_pendulum():
             f"PE={solver.potential_energy():.3f}  "
             f"E={E:.3f} J",
             f"Drift: {drift:.4f}%",
+            fps_counter.format(),
         ])
 
         # Render UI
@@ -267,11 +273,14 @@ def run_drop():
 
     max_height = drop_h
     substeps = 10
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
 
     def step_callback(step):
         nonlocal max_height
         import time as _t
         panel.playback.update_fps(_t.time())
+        fps_counter.tick()
 
         # Apply UI parameters to contact
         contact.params.stiffness = panel.get("Stiffness")
@@ -310,6 +319,7 @@ def run_drop():
             f"Velocity: {vz:+.3f} m/s",
             f"Max height: {max_height:.3f} m",
             f"Contacts: {n_c}",
+            fps_counter.format(),
         ])
 
         panel.render(viewer._window)
@@ -420,10 +430,13 @@ def run_arm():
     joint_overlay = JointAxisOverlay(viewer, length=0.12)
 
     substeps = 5
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
 
     def step_callback(step):
         import time as _t
         panel.playback.update_fps(_t.time())
+        fps_counter.tick()
 
         # Read gains
         kp_val = panel.get("Kp")
@@ -465,6 +478,7 @@ def run_arm():
             f"qd: [{robot.qd[0]:+.2f}, {robot.qd[1]:+.2f}] rad/s",
             f"EE: ({ee[0]:+.3f}, {ee[1]:+.3f}, {ee[2]:+.3f})",
             f"Kp={kp_val:.0f}  Kd={kd_val:.0f}",
+            fps_counter.format(),
         ])
 
         # Update displayed joint values

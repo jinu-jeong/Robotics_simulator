@@ -30,8 +30,29 @@ class Transform:
         self.translation = np.asarray(self.translation, dtype=np.float64).reshape(3)
 
     @staticmethod
+    def _fast(rotation: np.ndarray, translation: np.ndarray) -> Transform:
+        """Skip-validation constructor for hot paths.
+
+        Caller MUST pass rotation as (3,3) float64 and translation as (3,)
+        float64. Bypasses ``__post_init__`` (no asarray / reshape).
+        """
+        t = Transform.__new__(Transform)
+        t.rotation = rotation
+        t.translation = translation
+        return t
+
+    _IDENTITY_ROT = None  # set after class definition
+    _IDENTITY_TRANS = None
+
+    @staticmethod
     def identity() -> Transform:
-        return Transform()
+        # Fresh object every call (callers may mutate), but reuse pre-built
+        # immutable identity arrays via copy() — avoids np.eye(3)/zeros(3)
+        # construction cost.
+        return Transform._fast(
+            Transform._IDENTITY_ROT.copy(),
+            Transform._IDENTITY_TRANS.copy(),
+        )
 
     @staticmethod
     def from_matrix(mat: np.ndarray) -> Transform:
@@ -64,14 +85,31 @@ class Transform:
     @staticmethod
     def from_axis_angle(axis: np.ndarray, angle: float) -> Transform:
         """Create from axis-angle rotation (Rodrigues' formula)."""
-        axis = np.asarray(axis, dtype=np.float64)
-        norm = np.linalg.norm(axis)
-        if norm < 1e-12:
+        # Hot path: assume axis is already (3,) float64 (the joint axis stored
+        # on Joint is normalised at URDF parse time).
+        if axis.dtype != np.float64 or axis.shape != (3,):
+            axis = np.asarray(axis, dtype=np.float64).reshape(3)
+        x, y, z = axis[0], axis[1], axis[2]
+        n2 = x*x + y*y + z*z
+        if n2 < 1e-24:
             return Transform.identity()
-        axis = axis / norm
-        K = skew(axis)
-        R = np.eye(3) + math.sin(angle) * K + (1.0 - math.cos(angle)) * (K @ K)
-        return Transform(rotation=R)
+        if abs(n2 - 1.0) > 1e-9:
+            inv = 1.0 / math.sqrt(n2)
+            x *= inv; y *= inv; z *= inv
+        s, c = math.sin(angle), math.cos(angle)
+        C = 1.0 - c
+        # Rodrigues: R = I + sin(θ)[k]× + (1-cos θ)[k]×²  expanded
+        R = np.empty((3, 3), dtype=np.float64)
+        R[0, 0] = c + x*x*C
+        R[0, 1] = x*y*C - z*s
+        R[0, 2] = x*z*C + y*s
+        R[1, 0] = y*x*C + z*s
+        R[1, 1] = c + y*y*C
+        R[1, 2] = y*z*C - x*s
+        R[2, 0] = z*x*C - y*s
+        R[2, 1] = z*y*C + x*s
+        R[2, 2] = c + z*z*C
+        return Transform._fast(R, np.zeros(3))
 
     @staticmethod
     def from_quaternion(q: np.ndarray) -> Transform:
@@ -143,7 +181,7 @@ class Transform:
         """Compose transforms: self * other (apply other first, then self)."""
         R = self.rotation @ other.rotation
         t = self.rotation @ other.translation + self.translation
-        return Transform(rotation=R, translation=t)
+        return Transform._fast(R, t)
 
     def __matmul__(self, other: Transform) -> Transform:
         """T1 @ T2 = compose."""
@@ -151,9 +189,9 @@ class Transform:
 
     def inverse(self) -> Transform:
         """Compute the inverse transform."""
-        R_inv = self.rotation.T
+        R_inv = np.ascontiguousarray(self.rotation.T)
         t_inv = -R_inv @ self.translation
-        return Transform(rotation=R_inv, translation=t_inv)
+        return Transform._fast(R_inv, t_inv)
 
     def apply_point(self, p: np.ndarray) -> np.ndarray:
         """Transform a point: R @ p + t."""
@@ -170,6 +208,24 @@ class Transform:
             f"Transform(rpy=[{math.degrees(r):.1f}, {math.degrees(p):.1f}, "
             f"{math.degrees(y):.1f}]°, t=[{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}])"
         )
+
+
+# Initialise Transform identity templates (read-only; copied on each .identity() call).
+Transform._IDENTITY_ROT = np.eye(3, dtype=np.float64)
+Transform._IDENTITY_TRANS = np.zeros(3, dtype=np.float64)
+
+
+def cross3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Fast 3-vector cross product.
+
+    ~10× faster than ``np.cross`` for plain 3-vectors because it skips
+    NumPy's generic-dimension dispatch (``moveaxis`` / ``normalize_axis_tuple``).
+    """
+    return np.array([
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0],
+    ])
 
 
 def skew(v: np.ndarray) -> np.ndarray:

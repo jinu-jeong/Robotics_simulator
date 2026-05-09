@@ -7,7 +7,7 @@ runs the MPM solver under one of three materials:
 * ``--material metal``    — Von Mises J2, keeps a permanent flatten.
 * ``--material sand``     — Drucker-Prager, collapses into a granular heap.
 
-Uses :class:`SimViewer` (same Taichi GGUI style as grasp_demo).
+Uses :class:`SimViewer` (Taichi GGUI).
 
 Usage
 -----
@@ -85,18 +85,23 @@ def _height_colors(z: np.ndarray) -> np.ndarray:
 
 
 def run_headless(kind: str) -> None:
+    from robosim.util.fps import FPSCounter
     solver = build_solver(kind)
     pts = solver.particles
     print(f"[init] material={kind}, {pts.n} particles")
+    fps = FPSCounter()
     for step in range(N_STEPS + 1):
+        if step < N_STEPS:
+            solver.step(DT)
+        fps.tick()
         if step % 100 == 0:
             com = pts.x.mean(axis=0)
             xy_ext = np.ptp(pts.x[:, :2], axis=0).mean()
             vcom_z = float((pts.m * pts.v[:, 2]).sum() / pts.m.sum())
             print(f"t={step*DT:5.3f}s  com_z={com[2]:.3f}  xy_ext={xy_ext:.3f}"
-                  f"  v_com_z={vcom_z:+.3f}")
-        if step < N_STEPS:
-            solver.step(DT)
+                  f"  v_com_z={vcom_z:+.3f}  {fps.format()}")
+    print(f"\nFrames    : {fps.n_frames}  (avg {fps.average:.1f} FPS, "
+          f"last-window {fps.current:.1f} FPS)")
 
 
 def run_gui(kind: str) -> None:
@@ -118,6 +123,8 @@ def run_gui(kind: str) -> None:
                          per_vertex_color=_height_colors(pts.x[:, 2]))
 
     step_count = [0]
+    from robosim.util.fps import FPSCounter
+    fps = FPSCounter()
 
     def step(frame: int) -> None:
         for _ in range(SUBSTEPS_PER_FRAME):
@@ -128,12 +135,14 @@ def run_gui(kind: str) -> None:
             step_count[0] += 1
         viewer.update_particles("mpm", pts.x,
                                 per_vertex_color=_height_colors(pts.x[:, 2]))
+        fps.tick()
         com = pts.x.mean(axis=0)
         xy_ext = float(np.ptp(pts.x[:, :2], axis=0).mean())
         z_lo, z_hi = float(pts.x[:, 2].min()), float(pts.x[:, 2].max())
         t_sim = step_count[0] * DT
         viewer.add_text(
             f"t = {t_sim:6.3f} s   step {step_count[0]}   [{kind.upper()}]\n"
+            f"{fps.format()}\n"
             f"CoM   : ({com[0]:+.3f}, {com[1]:+.3f}, {com[2]:+.3f})\n"
             f"z range: [{z_lo:+.3f}, {z_hi:+.3f}]   xy extent: {xy_ext:.3f}\n"
             f"[LDrag=orbit  Scroll=zoom  ESC=quit]"

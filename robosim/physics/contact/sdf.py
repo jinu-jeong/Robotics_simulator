@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,37 +41,64 @@ def sphere_ground(
                         normal=n, penetration=penetration)
 
 
+_BOX_CORNER_SIGNS = np.array([
+    [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+    [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],
+], dtype=np.float64)
+_GROUND_UP_Z = np.array([0.0, 0.0, 1.0])
+
+
 def box_ground(
     center: np.ndarray, rotation: np.ndarray, half_extents: np.ndarray,
     ground_height: float = 0.0, ground_normal: np.ndarray | None = None,
 ) -> list[ContactPoint]:
     """Box vs ground plane — returns contact for each penetrating vertex."""
-    if ground_normal is None:
-        ground_normal = np.array([0.0, 0.0, 1.0])
+    if ground_normal is None or ground_normal is _GROUND_UP_Z:
+        # Axis-aligned ground (the common case): only Z matters.
+        local_verts = _BOX_CORNER_SIGNS * half_extents       # (8, 3)
+        world_verts = local_verts @ rotation.T + center      # (8, 3) — no transpose-back
+        z = world_verts[:, 2]
+        below = z < ground_height
+        if not below.any():
+            return []
+        contacts = []
+        for k in np.where(below)[0]:
+            v = world_verts[k]
+            dist = float(z[k] - ground_height)
+            point_b = v.copy()
+            point_b[2] = ground_height
+            contacts.append(ContactPoint(
+                point_a=v.copy(), point_b=point_b,
+                normal=_GROUND_UP_Z, penetration=-dist,
+            ))
+        return contacts
+
     n = ground_normal / np.linalg.norm(ground_normal)
-    hx, hy, hz = half_extents
-
-    # 8 corner vertices in local frame
-    signs = np.array([
-        [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
-        [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],
-    ], dtype=np.float64)
-    local_verts = signs * half_extents  # (8, 3)
-
-    # Transform to world
-    world_verts = (rotation @ local_verts.T).T + center  # (8, 3)
+    local_verts = _BOX_CORNER_SIGNS * half_extents
+    world_verts = local_verts @ rotation.T + center
 
     contacts = []
     for v in world_verts:
-        dist = np.dot(v, n) - ground_height
+        dist = float(np.dot(v, n)) - ground_height
         if dist < 0:
-            point_a = v.copy()
-            point_b = v - dist * n
             contacts.append(ContactPoint(
-                point_a=point_a, point_b=point_b,
+                point_a=v.copy(), point_b=v - dist * n,
                 normal=n, penetration=-dist,
             ))
     return contacts
+
+
+_CYL_RING_CACHE: dict[int, np.ndarray] = {}
+
+
+def _cyl_ring_unit(n_ring: int) -> np.ndarray:
+    cached = _CYL_RING_CACHE.get(n_ring)
+    if cached is not None:
+        return cached
+    angles = 2 * np.pi * np.arange(n_ring) / n_ring
+    ring = np.column_stack([np.cos(angles), np.sin(angles), np.zeros(n_ring)])
+    _CYL_RING_CACHE[n_ring] = ring
+    return ring
 
 
 def cylinder_ground(
@@ -80,28 +108,42 @@ def cylinder_ground(
     n_ring: int = 8,
 ) -> list[ContactPoint]:
     """Cylinder vs ground — sample points on bottom/top ring edges."""
-    if ground_normal is None:
-        ground_normal = np.array([0.0, 0.0, 1.0])
-    n = ground_normal / np.linalg.norm(ground_normal)
+    # Build local ring vertices (top + bottom) in one shot.
+    unit_ring = _cyl_ring_unit(n_ring)         # (n_ring, 3) with z=0
+    local = np.empty((2 * n_ring, 3))
+    local[:n_ring, :2] = radius * unit_ring[:, :2]
+    local[:n_ring, 2]  = -half_length
+    local[n_ring:, :2] = radius * unit_ring[:, :2]
+    local[n_ring:, 2]  = +half_length
 
+    world = local @ rotation.T + center        # (2*n_ring, 3)
+
+    if ground_normal is None or ground_normal is _GROUND_UP_Z:
+        z = world[:, 2]
+        below = z < ground_height
+        if not below.any():
+            return []
+        contacts = []
+        for k in np.where(below)[0]:
+            v = world[k]
+            dist = float(z[k] - ground_height)
+            point_b = v.copy()
+            point_b[2] = ground_height
+            contacts.append(ContactPoint(
+                point_a=v.copy(), point_b=point_b,
+                normal=_GROUND_UP_Z, penetration=-dist,
+            ))
+        return contacts
+
+    n = ground_normal / np.linalg.norm(ground_normal)
     contacts = []
-    for z_sign in [-1.0, 1.0]:
-        for i in range(n_ring):
-            angle = 2 * np.pi * i / n_ring
-            local = np.array([
-                radius * np.cos(angle),
-                radius * np.sin(angle),
-                z_sign * half_length,
-            ])
-            world = rotation @ local + center
-            dist = np.dot(world, n) - ground_height
-            if dist < 0:
-                contacts.append(ContactPoint(
-                    point_a=world.copy(),
-                    point_b=world - dist * n,
-                    normal=n,
-                    penetration=-dist,
-                ))
+    for v in world:
+        dist = float(np.dot(v, n)) - ground_height
+        if dist < 0:
+            contacts.append(ContactPoint(
+                point_a=v.copy(), point_b=v - dist * n,
+                normal=n, penetration=-dist,
+            ))
     return contacts
 
 
@@ -186,24 +228,40 @@ def box_box(
     for i in range(3):
         axes.append(ax_b[i])
     for i in range(3):
+        ai = ax_a[i]
         for j in range(3):
-            c = np.cross(ax_a[i], ax_b[j])
-            nm = np.linalg.norm(c)
+            bj = ax_b[j]
+            c = np.array([
+                ai[1]*bj[2] - ai[2]*bj[1],
+                ai[2]*bj[0] - ai[0]*bj[2],
+                ai[0]*bj[1] - ai[1]*bj[0],
+            ])
+            nm = math.sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2])
             if nm > 0.01:           # skip near-parallel edge pairs
                 axes.append(c / nm)
 
     min_pen = np.inf
     min_axis = None
+    ha0, ha1, ha2 = half_a[0], half_a[1], half_a[2]
+    hb0, hb1, hb2 = half_b[0], half_b[1], half_b[2]
+    aa0, aa1, aa2 = ax_a[0], ax_a[1], ax_a[2]
+    ab0, ab1, ab2 = ax_b[0], ax_b[1], ax_b[2]
     for axis in axes:
-        proj_a = sum(half_a[i] * abs(np.dot(ax_a[i], axis)) for i in range(3))
-        proj_b = sum(half_b[i] * abs(np.dot(ax_b[i], axis)) for i in range(3))
-        dist = abs(np.dot(d, axis))
+        # Inlined sum-over-3 to skip generator overhead.
+        proj_a = (ha0 * abs(aa0[0]*axis[0] + aa0[1]*axis[1] + aa0[2]*axis[2]) +
+                  ha1 * abs(aa1[0]*axis[0] + aa1[1]*axis[1] + aa1[2]*axis[2]) +
+                  ha2 * abs(aa2[0]*axis[0] + aa2[1]*axis[1] + aa2[2]*axis[2]))
+        proj_b = (hb0 * abs(ab0[0]*axis[0] + ab0[1]*axis[1] + ab0[2]*axis[2]) +
+                  hb1 * abs(ab1[0]*axis[0] + ab1[1]*axis[1] + ab1[2]*axis[2]) +
+                  hb2 * abs(ab2[0]*axis[0] + ab2[1]*axis[1] + ab2[2]*axis[2]))
+        d_axis = d[0]*axis[0] + d[1]*axis[1] + d[2]*axis[2]
+        dist = abs(d_axis)
         pen  = proj_a + proj_b - dist
         if pen <= 0:
             return []               # separating axis found — no collision
         if pen < min_pen:
             min_pen = pen
-            min_axis = axis if np.dot(d, axis) < 0 else -axis  # B → A
+            min_axis = axis if d_axis < 0 else -axis  # B → A
 
     if min_axis is None:
         return []

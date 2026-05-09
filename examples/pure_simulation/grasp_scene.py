@@ -1,7 +1,13 @@
-"""Grasp demo — rewritten with the Scene API.
+"""Grasp demo via the Scene API.
 
-Same scenario as grasp_demo.py but expressed in ~40 lines of user code:
+Robot picks up a box (rigid / FEM / CB modes) in ~40 lines of user code:
   Scene → add robot + box → register contact/grip → build trajectory → run
+
+Uses penalty contact + kinematic grip lock (Scene's default). The
+constraint-based Coulomb-cone solver is also available — see
+``Scene(contact_solver="constraint")`` and tests/test_constraint_friction.py
+— but it's not exposed here because penalty + grip-lock is the cleaner
+visual for this demo.
 
 Usage:
   python examples/grasp_scene.py              # rigid mode, GUI
@@ -29,8 +35,13 @@ HOME_Q     = np.array([ 0.0, -1.571,  0.000, +1.571,  0.040, -0.040])
 FOLD_Q     = np.array([ 0.0, -1.400,  2.000, -0.600,  0.040, -0.040])
 APPROACH_Q = np.array([ 0.0, -0.365,  2.047, -1.682,  0.040, -0.040])
 NEAR_Q     = np.array([ 0.0, -0.370,  1.909, -1.539,  0.040, -0.040])
-CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.020,  0.020])
-LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.020,  0.020])
+# Finger target (q[4]=-0.011 with q[5]=+0.011 via mimic) puts the finger
+# inner face right at the box +Y surface for this CLOSE pose.  Going further
+# (e.g. -0.020) commands the PD to drive the fingers THROUGH the box →
+# visible "fork-skewer" penetration during LIFT.  -0.011 still triggers the
+# kinematic grip threshold (q[4] < 0.003) without overshooting.
+CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.011,  0.011])
+LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.011,  0.011])
 
 _LIFT_START_T = 1.5 + 1.2 + 2.5 + 1.5 + 1.5   # = 8.2 s
 
@@ -46,7 +57,12 @@ def _box_physics(mode: str):
     if mode == "fem":
         return FEM(young=1e5, poisson=0.45, mesh=(8, 8, 8), dt_scale=5)
     if mode == "cb":
-        return CB(young=1e5, poisson=0.45, mesh=(4, 4, 4), n_modes=10)
+        # mesh=(6,6,6) — at (4,4,4) the 20 mm node spacing is so coarse that
+        # only the finger's mid-row (z=4 cm) sits inside its 20 mm collision
+        # height, so the finger appears to skewer the box between rows.
+        # (6,6,6) gives 3 rows inside the slab (with the SLAB_PAD); (8,8,8)
+        # is similar but doubles the CB basis size for marginal gain.
+        return CB(young=1.1e5, poisson=0.45, mesh=(6, 6, 6), n_modes=10)
     return Rigid()
 
 
@@ -59,8 +75,13 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
     robot = scene.add(
         Robot(_URDF)
         .controller(JointPD(
-            kp=[280.0, 480.0, 200.0, 75.0, 5e4, 5e4],
-            kd=[ 35.0,  50.0,  20.0,  2.0, 100, 100],
+            # Arm joints stiff (large links, gravity-compensated load).
+            # Finger joints intentionally soft: a stiff finger PD overpowers
+            # the contact reaction and drives the fingertips visibly through
+            # the box mesh.  kp≈800 leaves enough grip force for the
+            # kinematic grip threshold to fire while keeping penetration <5 mm.
+            kp=[280.0, 480.0, 200.0, 75.0,  800,  800],
+            kd=[ 35.0,  50.0,  20.0,  2.0,   30,   30],
         ))
         .initial_q(HOME_Q)
         .name("arm")

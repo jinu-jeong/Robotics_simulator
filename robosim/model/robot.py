@@ -52,6 +52,29 @@ class Robot:
     _q: Optional[np.ndarray] = field(default=None, repr=False)
     _qd: Optional[np.ndarray] = field(default=None, repr=False)
 
+    # FK cache — invalidated when ``q`` changes.
+    _fk_cache: Optional[list] = field(default=None, repr=False)
+    _fk_q_snapshot: Optional[np.ndarray] = field(default=None, repr=False)
+
+    # Per-link world-frame spatial velocity cache: list of (omega, v_origin),
+    # where v_origin is the linear velocity of the link's frame origin.
+    # Recomputed lazily by :meth:`link_world_velocities` and invalidated when
+    # ``q`` or ``qd`` changes.
+    _vel_cache: Optional[list] = field(default=None, repr=False)
+    _vel_q_snapshot: Optional[np.ndarray] = field(default=None, repr=False)
+    _vel_qd_snapshot: Optional[np.ndarray] = field(default=None, repr=False)
+
+    # Per-joint local transform cache: list[Transform], one per joint.
+    # ABA / RNEA / gravity_torques each iterate every joint computing the
+    # same transform from the same q — this caches across those calls.
+    _jlt_cache: Optional[list] = field(default=None, repr=False)
+    _jlt_q_snapshot: Optional[np.ndarray] = field(default=None, repr=False)
+
+    # Per-joint spatial transform matrix cache (X = X(joint_local_transform^-1)).
+    # Filled on first request via a (Robot, j_idx) -> (6, 6) ndarray map.
+    _xspatial_cache: Optional[list] = field(default=None, repr=False)
+    _xspatial_q_snapshot: Optional[np.ndarray] = field(default=None, repr=False)
+
     def build(self) -> Robot:
         """Build internal data structures from links and joints. Call after loading."""
         self._link_name_to_idx = {link.name: i for i, link in enumerate(self.links)}
@@ -180,19 +203,48 @@ class Robot:
             raise NotImplementedError(f"Motion subspace for {j.joint_type}")
 
     def joint_local_transform(self, joint_idx: int) -> Transform:
-        """Get the transform across the joint: origin * joint_motion(q)."""
-        j = self.joints[joint_idx]
-        q_val = self.get_joint_q(joint_idx)
-        jtype = "revolute" if j.joint_type in (JointType.REVOLUTE, JointType.CONTINUOUS) else j.joint_type.value
-        T_joint = joint_transform(jtype, j.axis, q_val)
-        return j.origin.compose(T_joint)
+        """Get the transform across the joint: origin * joint_motion(q).
+
+        Cached across joints + reused while ``q`` is unchanged.
+        """
+        cache = self._jlt_cache
+        if cache is not None and self._jlt_q_snapshot is not None:
+            snap = self._jlt_q_snapshot
+            q = self._q
+            if snap.shape == q.shape and (snap == q).all():
+                return cache[joint_idx]
+            cache = None  # stale
+
+        # Rebuild full cache (cheap and avoids per-joint snapshot bookkeeping)
+        n_joints = len(self.joints)
+        new_cache = [None] * n_joints
+        for j_idx in range(n_joints):
+            j = self.joints[j_idx]
+            q_val = self.get_joint_q(j_idx)
+            jtype = ("revolute" if j.joint_type in (JointType.REVOLUTE, JointType.CONTINUOUS)
+                     else j.joint_type.value)
+            T_joint = joint_transform(jtype, j.axis, q_val)
+            new_cache[j_idx] = j.origin.compose(T_joint)
+        self._jlt_cache = new_cache
+        self._jlt_q_snapshot = self._q.copy()
+        return new_cache[joint_idx]
 
     def forward_kinematics(self) -> list[Transform]:
         """Compute world-frame transforms for all links.
 
-        Returns a list of Transform objects, one per link, representing
-        the transform from link frame to world frame.
+        Cached against the current ``q``: subsequent calls without a
+        configuration change reuse the result. Callers that mutate the
+        returned Transforms should call :meth:`invalidate_fk_cache`.
         """
+        # Cache hit: q unchanged since last computation.  Fast path uses
+        # ``ndarray.tobytes()`` equality which beats ``np.array_equal``
+        # (which spends ~6 µs/call on dispatch overhead alone).
+        if self._fk_cache is not None and self._fk_q_snapshot is not None:
+            snap = self._fk_q_snapshot
+            q = self._q
+            if snap.shape == q.shape and (snap == q).all():
+                return self._fk_cache
+
         T_world = [Transform.identity() for _ in range(self.n_links)]
 
         # BFS from root
@@ -213,7 +265,128 @@ class Robot:
                 T_world[child_idx] = T_world[link_idx].compose(T_local)
                 queue.append(child_idx)
 
+        self._fk_cache = T_world
+        self._fk_q_snapshot = self._q.copy() if self._q is not None else None
         return T_world
+
+    def invalidate_fk_cache(self) -> None:
+        """Force the next ``forward_kinematics()`` call to recompute.
+
+        Use after directly mutating an FK Transform returned by an earlier
+        call. Mutating ``robot.q`` does not require an explicit invalidation
+        — the cache compares ``q`` snapshots automatically.
+        """
+        self._fk_cache = None
+        self._fk_q_snapshot = None
+        self._vel_cache = None
+        self._vel_q_snapshot = None
+        self._vel_qd_snapshot = None
+        self._jlt_cache = None
+        self._jlt_q_snapshot = None
+        self._xspatial_cache = None
+        self._xspatial_q_snapshot = None
+
+    def joint_spatial_transforms(self) -> list[np.ndarray]:
+        """Return cached ``X(joint_local_transform^-1)`` for every joint.
+
+        ABA, RNEA, and CRBA each rebuild this transform per joint per call.
+        Cache it across calls (within an unchanged ``q``) since they all run
+        in the same substep on the same ``q``.
+        """
+        cache = self._xspatial_cache
+        if cache is not None and self._xspatial_q_snapshot is not None:
+            snap = self._xspatial_q_snapshot
+            q = self._q
+            if snap.shape == q.shape and (snap == q).all():
+                return cache
+
+        # Build for every joint.  Imported here to avoid circular import at
+        # module load time.
+        from robosim.physics.rbd.algorithms import _spatial_transform_matrix
+
+        n_joints = len(self.joints)
+        new_cache: list[np.ndarray] = [None] * n_joints  # type: ignore
+        for j_idx in range(n_joints):
+            T_local = self.joint_local_transform(j_idx)
+            T_inv = T_local.inverse()
+            new_cache[j_idx] = _spatial_transform_matrix(T_inv)
+        self._xspatial_cache = new_cache
+        self._xspatial_q_snapshot = self._q.copy()
+        return new_cache
+
+    def link_world_velocities(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Per-link world-frame spatial velocity (omega, v_origin).
+
+        Returns ``[(omega_i, v_origin_i)]`` for each link i, where
+        ``omega_i`` is the link's angular velocity in the world frame and
+        ``v_origin_i`` is the linear velocity of the link's frame origin.
+
+        Cached against ``(q, qd)``.  Use the velocity at a body-fixed point
+        ``p_world`` via ``v = v_origin + omega × (p_world - link_origin)``.
+        """
+        from robosim.model.joint import JointType
+
+        if (self._vel_cache is not None
+                and self._vel_q_snapshot is not None
+                and self._vel_qd_snapshot is not None):
+            qs, qds = self._vel_q_snapshot, self._vel_qd_snapshot
+            q, qd = self._q, self._qd
+            if (qs.shape == q.shape and (qs == q).all()
+                    and qds.shape == qd.shape and (qds == qd).all()):
+                return self._vel_cache
+
+        fk = self.forward_kinematics()
+        n = self.n_links
+        result: list[tuple[np.ndarray, np.ndarray]] = [None] * n  # type: ignore
+
+        # BFS from root, propagating spatial velocity outward.
+        from collections import deque
+        roots = [i for i in range(n) if self._parent[i] == -1]
+        for r in roots:
+            result[r] = (np.zeros(3), np.zeros(3))
+        queue = deque(roots)
+
+        while queue:
+            link_idx = queue.popleft()
+            omega_p, v_origin_p = result[link_idx]
+            origin_p = fk[link_idx].translation
+            for child_idx in self._children[link_idx]:
+                origin_c = fk[child_idx].translation
+                # Propagate from parent: v_c = v_p + ω_p × (origin_c - origin_p)
+                d = origin_c - origin_p
+                v_c = v_origin_p + np.array([
+                    omega_p[1]*d[2] - omega_p[2]*d[1],
+                    omega_p[2]*d[0] - omega_p[0]*d[2],
+                    omega_p[0]*d[1] - omega_p[1]*d[0],
+                ])
+                omega_c = omega_p
+
+                j_idx = self._joint_for_link[child_idx]
+                if j_idx >= 0:
+                    joint = self.joints[j_idx]
+                    jt = joint.joint_type
+                    if jt != JointType.FIXED:
+                        dof_idx = self._dof_index[j_idx]
+                        qd_j = float(self._qd[dof_idx])
+                        # Joint axis in WORLD frame uses the CHILD link transform
+                        axis_world = fk[child_idx].rotation @ joint.axis
+                        if jt in (JointType.REVOLUTE, JointType.CONTINUOUS):
+                            omega_c = omega_p + qd_j * axis_world
+                        elif jt == JointType.PRISMATIC:
+                            v_c = v_c + qd_j * axis_world
+
+                result[child_idx] = (omega_c, v_c)
+                queue.append(child_idx)
+
+        # Fallback: any link without an explicit parent (disconnected) gets zero.
+        for i in range(n):
+            if result[i] is None:
+                result[i] = (np.zeros(3), np.zeros(3))
+
+        self._vel_cache = result
+        self._vel_q_snapshot = self._q.copy()
+        self._vel_qd_snapshot = self._qd.copy()
+        return result
 
     def enforce_mimic(self):
         """Synchronize mimic (follower) joints to their leader joints.

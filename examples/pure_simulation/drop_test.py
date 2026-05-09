@@ -564,7 +564,8 @@ def run_rbd_drop(num_boxes: int, tilt_deg: float, seed: int) -> None:
         viewer.add_mesh(f"box_{i}", (R_init @ bv.T).T + t_init, bf,
                         color=_color(i))
 
-    frame_times: list[float] = []
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
     sim_time = [0.0]
 
     def step_callback(_step):
@@ -593,15 +594,13 @@ def run_rbd_drop(num_boxes: int, tilt_deg: float, seed: int) -> None:
             R_i, t_i = mat[:3, :3], mat[:3, 3]
             viewer.update_mesh_vertices(f"box_{i}", (R_i @ bv.T).T + t_i)
 
-        frame_ms = (time.perf_counter() - t0) * 1000
-        frame_times.append(frame_ms)
-        fps = 1000 / np.mean(frame_times[-30:]) if frame_times else 0
+        fps_counter.tick()
 
         zs = [r.q[2] for r in robots]
         info = (
             f"[RBD]  {num_boxes} boxes\n"
             f"t = {sim_time[0]:.3f}s\n"
-            f"FPS: {fps:.1f}  phys: {phys_ms:.1f}ms\n"
+            f"{fps_counter.format()}  phys: {phys_ms:.1f}ms\n"
             f"Z min: {min(zs):.4f}m"
         )
         viewer.add_text(info)
@@ -610,10 +609,9 @@ def run_rbd_drop(num_boxes: int, tilt_deg: float, seed: int) -> None:
     print(f"RBD drop — {num_boxes} box(es), tilt={'random' if num_boxes>1 else tilt_deg}°"
           f" — ESC to quit")
     viewer.show()
-
-    avg_fps = 1000 / np.mean(frame_times) if frame_times else 0
-    print(f"\n[RBD] {num_boxes} boxes  Avg FPS: {avg_fps:.1f}  "
-          f"({np.mean(frame_times):.1f} ms/frame)")
+    print(f"\n[RBD] {num_boxes} boxes  Frames: {fps_counter.n_frames}  "
+          f"Avg FPS: {fps_counter.average:.1f}  "
+          f"last-window: {fps_counter.current:.1f}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -707,7 +705,8 @@ def run_deformable_drop(mode: str, num_boxes: int,
     for i, (body, stri) in enumerate(zip(bodies, surface_tris)):
         viewer.add_mesh(f"box_{i}", body.x.copy(), stri, color=_color(i))
 
-    frame_times: list[float] = []
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
 
     def step_callback(_step):
         t0 = time.perf_counter()
@@ -734,9 +733,7 @@ def run_deformable_drop(mode: str, num_boxes: int,
             vm_max_all = max(vm_max_all, vm_max)
             viewer.update_mesh_color(f"box_{i}", _stress_color(vm, vm_max))
 
-        frame_ms = (time.perf_counter() - t0) * 1000
-        frame_times.append(frame_ms)
-        fps = 1000 / np.mean(frame_times[-30:]) if frame_times else 0
+        fps_counter.tick()
 
         z_mins = [body.x[:, 2].min() for body in bodies]
         extra = ""
@@ -747,7 +744,7 @@ def run_deformable_drop(mode: str, num_boxes: int,
         info = (
             f"[{mode_str}]  {num_boxes} boxes\n"
             f"t = {solver.time:.3f}s\n"
-            f"FPS: {fps:.1f}  phys: {phys_ms:.1f}ms\n"
+            f"{fps_counter.format()}  phys: {phys_ms:.1f}ms\n"
             f"Z min: {min(z_mins):.4f}m  stress: {vm_max_all:.0f}Pa"
             + extra
         )
@@ -757,10 +754,9 @@ def run_deformable_drop(mode: str, num_boxes: int,
     print(f"{mode_str} drop — {num_boxes} box(es), "
           f"tilt={'random' if num_boxes>1 else tilt_deg}° — ESC to quit")
     viewer.show()
-
-    avg_fps = 1000 / np.mean(frame_times) if frame_times else 0
-    print(f"\n[{mode_str}] {num_boxes} boxes  Avg FPS: {avg_fps:.1f}  "
-          f"({np.mean(frame_times):.1f} ms/frame)")
+    print(f"\n[{mode_str}] {num_boxes} boxes  Frames: {fps_counter.n_frames}  "
+          f"Avg FPS: {fps_counter.average:.1f}  "
+          f"last-window: {fps_counter.current:.1f}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -850,7 +846,8 @@ def run_rbd_bunny_drop(num_bunnies: int, tilt_deg: float, seed: int) -> None:
         viewer.add_mesh(f"bunny_{i}", w_verts.astype(np.float32), faces,
                         color=_color(i))
 
-    frame_times: list[float] = []
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
     sim_time = [0.0]
 
     def step_callback(_step):
@@ -873,15 +870,13 @@ def run_rbd_bunny_drop(num_bunnies: int, tilt_deg: float, seed: int) -> None:
             viewer.update_mesh_vertices(
                 f"bunny_{i}", ((R_i @ verts.T).T + t_i).astype(np.float32))
 
-        frame_ms = (time.perf_counter() - t0) * 1000
-        frame_times.append(frame_ms)
-        fps = 1000 / np.mean(frame_times[-30:]) if frame_times else 0
+        fps_counter.tick()
 
         zs = [r.q[2] for r in robots]
         info = (
             f"[RBD-Bunny]  {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'}\n"
             f"t = {sim_time[0]:.3f}s\n"
-            f"FPS: {fps:.1f}  phys: {phys_ms:.1f}ms\n"
+            f"{fps_counter.format()}  phys: {phys_ms:.1f}ms\n"
             f"Z min: {min(zs):.4f}m"
         )
         viewer.add_text(info)
@@ -889,10 +884,9 @@ def run_rbd_bunny_drop(num_bunnies: int, tilt_deg: float, seed: int) -> None:
     viewer.add_callback(step_callback)
     print(f"RBD-Bunny drop — {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'} — ESC to quit")
     viewer.show()
-
-    avg_fps = 1000 / np.mean(frame_times) if frame_times else 0
-    print(f"\n[RBD-Bunny] {num_bunnies}  Avg FPS: {avg_fps:.1f}  "
-          f"({np.mean(frame_times):.1f} ms/frame)")
+    print(f"\n[RBD-Bunny] {num_bunnies}  Frames: {fps_counter.n_frames}  "
+          f"Avg FPS: {fps_counter.average:.1f}  "
+          f"last-window: {fps_counter.current:.1f}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -1002,7 +996,8 @@ def run_fem_bunny_drop(mode: str, num_bunnies: int,
     for i, (body, stri) in enumerate(zip(bodies, disp_tris)):
         viewer.add_mesh(f"bunny_{i}", body.x.copy(), stri, color=_color(i))
 
-    frame_times: list[float] = []
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
 
     def step_callback(_step):
         t0 = time.perf_counter()
@@ -1027,9 +1022,7 @@ def run_fem_bunny_drop(mode: str, num_bunnies: int,
             vm_max_all = max(vm_max_all, vm_max)
             viewer.update_mesh_color(f"bunny_{i}", _stress_color(vm, vm_max))
 
-        frame_ms = (time.perf_counter() - t0) * 1000
-        frame_times.append(frame_ms)
-        fps = 1000 / np.mean(frame_times[-30:]) if frame_times else 0
+        fps_counter.tick()
 
         z_mins  = [body.x[:, 2].min() for body in bodies]
         extra = ""
@@ -1039,7 +1032,7 @@ def run_fem_bunny_drop(mode: str, num_bunnies: int,
         info = (
             f"[{mode_str}]  {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'}\n"
             f"t = {solver.time:.3f}s\n"
-            f"FPS: {fps:.1f}  phys: {phys_ms:.1f}ms\n"
+            f"{fps_counter.format()}  phys: {phys_ms:.1f}ms\n"
             f"Z min: {min(z_mins):.4f}m  stress: {vm_max_all:.0f}Pa"
             + extra
         )
@@ -1048,10 +1041,9 @@ def run_fem_bunny_drop(mode: str, num_bunnies: int,
     viewer.add_callback(step_callback)
     print(f"{mode_str} drop — {num_bunnies} bun{'nies' if num_bunnies>1 else 'ny'} — ESC to quit")
     viewer.show()
-
-    avg_fps = 1000 / np.mean(frame_times) if frame_times else 0
-    print(f"\n[{mode_str}] {num_bunnies}  Avg FPS: {avg_fps:.1f}  "
-          f"({np.mean(frame_times):.1f} ms/frame)")
+    print(f"\n[{mode_str}] {num_bunnies}  Frames: {fps_counter.n_frames}  "
+          f"Avg FPS: {fps_counter.average:.1f}  "
+          f"last-window: {fps_counter.current:.1f}")
 
 
 # ═══════════════════════════════════════════════════════

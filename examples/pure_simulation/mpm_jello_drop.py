@@ -1,6 +1,6 @@
 """Standalone MPM demo — elastic jello cube dropped onto a floor.
 
-Taichi GGUI live view via :class:`SimViewer` (same style as grasp_demo).
+Taichi GGUI live view via :class:`SimViewer`.
 Headless mode prints diagnostics.
 
 Usage
@@ -41,9 +41,19 @@ N_STEPS      = 1200
 SUBSTEPS_PER_FRAME = 4
 
 
-def build_solver() -> MPMSolver:
+def build_solver(backend: str = "numpy"):
     pts  = sample_box_particles(CUBE_LOWER, CUBE_UPPER, N_PER_AXIS, DENSITY)
     grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
+    if backend == "taichi":
+        from robosim.physics.mpm.taichi_solver import TaichiMPMSolver
+        bc_upper = np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0])
+        return TaichiMPMSolver(
+            particles_x=pts.x.copy(), particles_v=pts.v.copy(),
+            particles_m=pts.m.copy(), particles_V0=pts.V0.copy(),
+            grid_origin=grid.origin, grid_dx=grid.dx, grid_shape=grid.shape,
+            young=YOUNG, poisson=POISSON, gravity=GRAVITY,
+            bc_lower=DOMAIN_LOWER, bc_upper=bc_upper,
+        )
     return MPMSolver(
         particles=pts, grid=grid,
         material=NeoHookean(young=YOUNG, poisson=POISSON),
@@ -54,7 +64,22 @@ def build_solver() -> MPMSolver:
     )
 
 
-# ── Ground-plane mesh + grid lines (matches grasp_demo aesthetic) ────────────
+def _solver_x(solver) -> np.ndarray:
+    """Return particle positions as numpy from either backend."""
+    return solver.particles_x() if hasattr(solver, "particles_x") else solver.particles.x
+
+
+def _solver_v(solver) -> np.ndarray:
+    return solver.particles_v() if hasattr(solver, "particles_v") else solver.particles.v
+
+
+def _solver_m(solver) -> np.ndarray:
+    if hasattr(solver, "m_p"):
+        return solver.m_p.to_numpy()
+    return solver.particles.m
+
+
+# ── Ground-plane mesh + grid lines ────────────────────────────────────────────
 
 def _ground_mesh(size: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
     s = size / 2.0
@@ -77,23 +102,33 @@ def elastic_energy(solver: MPMSolver) -> float:
     return float((psi * p.V0).sum())
 
 
-def run_headless() -> None:
-    solver = build_solver()
-    pts = solver.particles
-    print(f"[init] {pts.n} particles, grid {solver.grid.shape}")
+def run_headless(backend: str = "numpy") -> None:
+    import time
+    from robosim.util.fps import FPSCounter
+    solver = build_solver(backend)
+    n_p = (_solver_x(solver)).shape[0]
+    print(f"[init] backend={backend}  {n_p} particles")
+    fps = FPSCounter()
+    t_wall = time.perf_counter()
     for step in range(N_STEPS + 1):
-        if step % 60 == 0:
-            com = pts.x.mean(axis=0)
-            vcom_z = float((pts.m * pts.v[:, 2]).sum() / pts.m.sum())
-            KE, PE = kinetic_energy(solver), elastic_energy(solver)
-            print(f"t={step*DT:5.3f}s  com_z={com[2]:.3f}  v_com_z={vcom_z:+.3f}"
-                  f"  KE={KE:.3e}  PE={PE:.3e}  total={KE+PE:.3e}")
         if step < N_STEPS:
             solver.step(DT)
+        fps.tick()
+        if step % 60 == 0:
+            x = _solver_x(solver); v = _solver_v(solver); m = _solver_m(solver)
+            com = x.mean(axis=0)
+            vcom_z = float((m * v[:, 2]).sum() / m.sum())
+            print(f"t={step*DT:5.3f}s  com_z={com[2]:.3f}  v_com_z={vcom_z:+.3f}  "
+                  f"{fps.format()}")
+    elapsed = time.perf_counter() - t_wall
+    print(f"\nWall time: {elapsed:.2f} s  ({N_STEPS*DT/elapsed:.2f}× real-time)")
+    print(f"Frames    : {fps.n_frames}  (avg {fps.average:.1f} FPS, "
+          f"last-window {fps.current:.1f} FPS)")
 
 
 def run_gui() -> None:
     from robosim.viz.viewer import SimViewer
+    from robosim.util.fps import FPSCounter
 
     solver = build_solver()
     pts = solver.particles
@@ -113,6 +148,7 @@ def run_gui() -> None:
     )
 
     step_count = [0]
+    fps = FPSCounter()
 
     def step(frame: int) -> None:
         for _ in range(SUBSTEPS_PER_FRAME):
@@ -123,12 +159,14 @@ def run_gui() -> None:
             step_count[0] += 1
         viewer.update_particles("mpm", pts.x,
                                 per_vertex_color=_height_colors(pts.x[:, 2]))
+        fps.tick()
         com = pts.x.mean(axis=0)
         vcom_z = float((pts.m * pts.v[:, 2]).sum() / pts.m.sum())
         KE, PE = kinetic_energy(solver), elastic_energy(solver)
         t_sim = step_count[0] * DT
         viewer.add_text(
             f"t = {t_sim:6.3f} s   step {step_count[0]}\n"
+            f"{fps.format()}\n"
             f"CoM z  : {com[2]:+.3f} m   v_com_z: {vcom_z:+.3f} m/s\n"
             f"KE = {KE:8.2e}  PE = {PE:8.2e}  total = {KE+PE:8.2e}\n"
             f"[LDrag=orbit  Scroll=zoom  ESC=quit]"
@@ -146,12 +184,16 @@ def _height_colors(z: np.ndarray) -> np.ndarray:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--backend", choices=["numpy", "taichi"], default="numpy",
+                    help="numpy (default, single-thread CPU) or taichi "
+                         "(arch=metal on M-series Macs, 20-40× faster).")
     args = ap.parse_args()
-    if args.headless:
-        run_headless()
-    else:
+    if args.backend == "taichi" or not args.headless:
         import taichi as ti
         ti.init(arch=ti.metal)
+    if args.headless:
+        run_headless(backend=args.backend)
+    else:
         run_gui()
 
 

@@ -12,9 +12,9 @@
           joint_elbow    (revolute Y)  → link_3  (forearm    0.38 m)
             joint_wrist    (revolute Y)  → link_4  (tool flange 0.12 m)
               joint_palm     (fixed)        → palm_link  (gripper base)
-                joint_left   (prismatic +Y) → left_finger  (box 40×14×40 mm)
+                joint_left   (prismatic +Y) → left_finger  (box 80×10×40 mm)
                 joint_right  (prismatic +Y, mimic joint_left×-1)
-                              → right_finger (box 40×14×40 mm)
+                              → right_finger (box 80×10×40 mm)
 
   Shoulder frame (joint_shoulder) is at world z = 0.25 m.
   Upper arm extends along local +X, elbow/wrist in the XZ plane.
@@ -196,16 +196,16 @@
     <inertial>
       <origin xyz="0.020 0 0.020"/>
       <mass value="0.12"/>
-      <inertia ixx="0.0000050" ixy="0" ixz="0" iyy="0.0000680" iyz="0" izz="0.0000650"/>
+      <inertia ixx="0.0000170" ixy="0" ixz="0" iyy="0.0000800" iyz="0" izz="0.0000650"/>
     </inertial>
     <visual>
       <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
-      <geometry><box size="0.080 0.010 0.020"/></geometry>
+      <geometry><box size="0.080 0.010 0.040"/></geometry>
       <material name="orange"><color rgba="0.9 0.50 0.10 1"/></material>
     </visual>
     <collision>
       <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
-      <geometry><box size="0.080 0.010 0.020"/></geometry>
+      <geometry><box size="0.080 0.010 0.040"/></geometry>
     </collision>
   </link>
 
@@ -214,16 +214,16 @@
     <inertial>
       <origin xyz="0.020 0 0.020"/>
       <mass value="0.12"/>
-      <inertia ixx="0.0000050" ixy="0" ixz="0" iyy="0.0000680" iyz="0" izz="0.0000650"/>
+      <inertia ixx="0.0000170" ixy="0" ixz="0" iyy="0.0000800" iyz="0" izz="0.0000650"/>
     </inertial>
     <visual>
       <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
-      <geometry><box size="0.080 0.010 0.020"/></geometry>
+      <geometry><box size="0.080 0.010 0.040"/></geometry>
       <material name="orange"><color rgba="0.9 0.50 0.10 1"/></material>
     </visual>
     <collision>
       <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
-      <geometry><box size="0.080 0.010 0.020"/></geometry>
+      <geometry><box size="0.080 0.010 0.040"/></geometry>
     </collision>
   </link>
 

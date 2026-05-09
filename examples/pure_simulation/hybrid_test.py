@@ -164,6 +164,8 @@ def run(use_gravity=True):
     # Boundary node markers (small green dots)
     boundary_verts = body.x[top_nodes].copy()
 
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
     frame_count = 0
     sim_time = 0.0
 
@@ -206,11 +208,14 @@ def run(use_gravity=True):
         actual = body.x[bmap.fem_boundary_nodes]
         drift = np.linalg.norm(targets - actual, axis=1).max()
 
+        fps_counter.tick()
+
         # HUD
         com = body.x.mean(axis=0)
         q_deg = np.degrees(robot.q[0])
         info = (
             f"t = {sim_time:.3f}s\n"
+            f"{fps_counter.format()}\n"
             f"Joint q = {q_deg:+.1f} deg  qd = {robot.qd[0]:+.2f} rad/s\n"
             f"FEM CoM: ({com[0]:+.3f}, {com[1]:+.3f}, {com[2]:+.3f})\n"
             f"Boundary drift: {drift:.4f} m\n"
@@ -226,7 +231,9 @@ def run(use_gravity=True):
     viewer.show()
 
     # Final report
-    print(f"\nSimulated {sim_time:.2f}s in {frame_count} frames")
+    print(f"\nSimulated {sim_time:.2f}s in {frame_count} frames  "
+          f"(avg {fps_counter.average:.1f} FPS, last-window "
+          f"{fps_counter.current:.1f} FPS)")
     print(f"Final joint angle: {np.degrees(robot.q[0]):.1f} deg")
     print(f"FEM CoM: {body.x.mean(axis=0)}")
     print(f"NaN check: positions={'OK' if np.all(np.isfinite(body.x)) else 'FAIL'}, "

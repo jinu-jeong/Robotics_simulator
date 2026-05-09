@@ -36,21 +36,21 @@ def _get_motion_subspace(robot: Robot, j_idx: int) -> np.ndarray:
 def _spatial_transform_matrix(T: Transform) -> np.ndarray:
     """Compute the 6x6 spatial motion transform X such that v_A = X @ v_B.
 
-    For a transform T: A <- B (T maps points from B to A),
-    the spatial motion transform is:
-    X = | R     0 |
-        | [p]x R  R |
-
-    where R is the rotation and p is the translation.
+    Inlined skew product for the (3:6, 0:3) block to avoid a separate
+    skew() allocation + matmul (this is the hottest matrix builder in
+    ABA/RNEA, called O(n_links) times per substep).
     """
     R = T.rotation
     p = T.translation
-    from robosim.math.transforms import skew
-    px = skew(p)
     X = np.zeros((6, 6))
     X[:3, :3] = R
-    X[3:, :3] = px @ R
     X[3:, 3:] = R
+    # px @ R where px = [[0,-p2,p1],[p2,0,-p0],[-p1,p0,0]]
+    p0, p1, p2 = p[0], p[1], p[2]
+    R0 = R[0]; R1 = R[1]; R2 = R[2]
+    X[3, :3] = -p2 * R1 + p1 * R2
+    X[4, :3] =  p2 * R0 - p0 * R2
+    X[5, :3] = -p1 * R0 + p0 * R1
     return X
 
 
@@ -148,14 +148,12 @@ def rnea(
             a[i] = a_grav.copy()
 
     # --- Pass 1: Forward recursion (compute velocities and accelerations) ---
+    Xs = robot.joint_spatial_transforms()
     for i in order:
         parent_idx = robot.parent_index(i)
         j_idx = robot.joint_index_for_link(i)
 
-        # Transform from parent to this link
-        T_local = robot.joint_local_transform(j_idx)
-        T_inv = T_local.inverse()
-        Xi = _spatial_transform_matrix(T_inv)
+        Xi = Xs[j_idx]
         X_parent[i] = Xi
 
         # Motion subspace and joint velocity
@@ -262,13 +260,12 @@ def aba(
         I_A[i] = robot.links[i].inertial.to_matrix().copy()
 
     # --- Pass 1: Forward recursion (velocities, bias forces) ---
+    Xs = robot.joint_spatial_transforms()
     for i in order:
         parent_idx = robot.parent_index(i)
         j_idx = robot.joint_index_for_link(i)
 
-        T_local = robot.joint_local_transform(j_idx)
-        T_inv = T_local.inverse()
-        Xi = _spatial_transform_matrix(T_inv)
+        Xi = Xs[j_idx]
         X_parent[i] = Xi
 
         S = _get_motion_subspace(robot, j_idx)
@@ -382,11 +379,10 @@ def crba(
     for i in range(n_links):
         I_C[i] = robot.links[i].inertial.to_matrix().copy()
 
+    Xs = robot.joint_spatial_transforms()
     for i in order:
         j_idx = robot.joint_index_for_link(i)
-        T_local = robot.joint_local_transform(j_idx)
-        T_inv = T_local.inverse()
-        X_parent[i] = _spatial_transform_matrix(T_inv)
+        X_parent[i] = Xs[j_idx]
 
     # Backward pass: accumulate composite inertias
     for i in reversed(order):

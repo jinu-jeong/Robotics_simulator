@@ -14,7 +14,13 @@ class JointPD(Controller):
     ----------
     kp : proportional gain — scalar or per-dof (n_dof,) array
     kd : derivative gain   — scalar or per-dof (n_dof,) array
-    max_torque : symmetric torque clamp applied per-joint (N·m or N)
+    max_torque : symmetric torque clamp — scalar (applied to all joints)
+        or per-dof (n_dof,) array. A per-finger cap turns the position
+        PD into an *impedance / force-limited* controller for that
+        joint: the PD pushes up to the cap then saturates, so a finger
+        commanded past a contact surface stops at the contact instead
+        of driving deeper. Recommended for friction-grasping (constraint
+        contact mode) where unbounded PD overrides contact reaction.
 
     Usage::
 
@@ -28,12 +34,13 @@ class JointPD(Controller):
         self,
         kp: float | list | np.ndarray = 200.0,
         kd: float | list | np.ndarray = 30.0,
-        max_torque: float = 500.0,
+        max_torque: float | list | np.ndarray = 500.0,
         gravity_comp: bool = True,
     ):
         self._kp_raw = kp
         self._kd_raw = kd
-        self.max_torque = max_torque
+        self._max_torque_raw = max_torque
+        self.max_torque = max_torque       # back-compat: scalar attribute remains valid
         self.gravity_comp = gravity_comp
 
         self.target_q:  np.ndarray | None = None
@@ -49,8 +56,10 @@ class JointPD(Controller):
     def _init_gains(self, n_dof: int) -> None:
         kp = np.atleast_1d(np.asarray(self._kp_raw, dtype=float))
         kd = np.atleast_1d(np.asarray(self._kd_raw, dtype=float))
+        mt = np.atleast_1d(np.asarray(self._max_torque_raw, dtype=float))
         self._kp = np.broadcast_to(kp, (n_dof,)).copy()
         self._kd = np.broadcast_to(kd, (n_dof,)).copy()
+        self._max_torque_arr = np.broadcast_to(mt, (n_dof,)).copy()
 
     # ── Controller interface ───────────────────────────────────────────────────
 
@@ -70,7 +79,7 @@ class JointPD(Controller):
             from robosim.physics.rbd.algorithms import gravity_torques
             tau = tau + gravity_torques(self._robot, q)
 
-        return np.clip(tau, -self.max_torque, self.max_torque)
+        return np.clip(tau, -self._max_torque_arr, self._max_torque_arr)
 
     def reset(self) -> None:
         pass

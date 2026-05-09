@@ -89,10 +89,16 @@ class SimRunner:
     """
 
     def __init__(self, scene: "Scene", dt: float = 0.001, substeps: int = 10):
+        from robosim.util.fps import FPSCounter
         self._scene     = scene
         self._dt        = dt
         self._substeps  = substeps
         self._time      = 0.0
+        self._viewer_ctx: dict | None = None
+        # FPS = one tick per outer loop iteration (after substeps + viewer
+        # update). Accessible from user on_step callbacks via
+        # scene._runner._fps for custom display.
+        self._fps       = FPSCounter(smoothing=20)
 
     # ── public entry point ────────────────────────────────────────────────────
 
@@ -148,6 +154,12 @@ class SimRunner:
                 for traj in trajs:
                     traj._step(dt)
 
+                # ── re-pin finger PD targets for any active grip ──
+                # (must run AFTER trajectory updates target_q, BEFORE PD reads
+                #  it in _step_robot, otherwise the trajectory wins and the
+                #  finger drives through the kinematically-locked body).
+                self._apply_grip_locks()
+
                 # ── step all robots (applies CACHED contact reactions before stepping) ──
                 for rh in self._scene._robot_handles.values():
                     self._step_robot(rh, dt)
@@ -155,6 +167,14 @@ class SimRunner:
                 # ── step all bodies (computes NEW contact reactions, caches for next tick) ──
                 for bh in self._scene._body_handles.values():
                     self._step_body(bh, dt)
+
+                # NOTE: ConstraintContactSolver also exposes
+                # project_free_body_penetrations() for non-grasp scenarios
+                # (e.g. a free box bouncing off an arm link), but it is
+                # NOT called from the runner: for a symmetric two-finger
+                # grasp the per-finger pushes cancel and the projection
+                # cannot reduce the residual pen without a proper coupled
+                # LCP/PGS solver.
 
                 self._time += dt
 
@@ -167,6 +187,9 @@ class SimRunner:
                 alive = self._update_viewer(_viewer_ctx, trajs)
                 if not alive:
                     break   # user closed the window
+
+            # ── frame timing (after the frame's heavy work) ──
+            self._fps.tick()
 
         t_wall = time.time() - t_wall0
 
@@ -219,7 +242,10 @@ class SimRunner:
         from robosim.scene.handles import RigidBodyHandle
         for bh in self._scene._body_handles.values():
             if isinstance(bh, RigidBodyHandle):
-                contact.register_rbd(bh._solver, robot_id=bh.name)
+                # Free-floating RBD body — flag it so constraint-mode
+                # contact can position-project it out of arm penetration.
+                contact.register_rbd(bh._solver, robot_id=bh.name,
+                                     is_free_body=True)
                 # links[-1] is the terminal body link (carries collision geometry);
                 # links[0] is the massless base anchor.
                 body_link_name = bh._model.links[-1].name
@@ -238,6 +264,38 @@ class SimRunner:
 
     # ── robot step ────────────────────────────────────────────────────────────
 
+    def _apply_grip_locks(self) -> None:
+        """Re-pin every active grip's trigger joint (and its mimic followers)
+        to the q value captured when the grip snapped on.
+
+        Called once per substep AFTER the trajectory advances ``target_q``
+        and BEFORE PD reads it.  Without this, the trajectory's LIFT-phase
+        target keeps driving the finger inward; since contact is bypassed
+        once the body is kinematically locked, the finger then accelerates
+        through the body (the "fork through tofu" failure mode).
+        """
+        scene = self._scene
+        for body_name, q_lock in scene._grip_q_lock.items():
+            if not scene._grip_active.get(body_name, False):
+                continue
+            state = scene._grip_state.get(body_name)
+            if state is None:
+                continue
+            rh = state["robot"]
+            ctrl = rh._controller
+            if ctrl is None or getattr(ctrl, "target_q", None) is None:
+                continue
+            trigger_q = state["trigger_q_idx"]
+            ctrl.target_q = ctrl.target_q.copy()
+            ctrl.target_q[trigger_q] = q_lock
+            model = rh._model
+            mimic_map = getattr(model, "_mimic_map", None)
+            if mimic_map:
+                for f_idx, (l_idx, mult, off) in mimic_map.items():
+                    if model._dof_index[l_idx] == trigger_q:
+                        f_dof = model._dof_index[f_idx]
+                        ctrl.target_q[f_dof] = mult * q_lock + off
+
     def _step_robot(self, rh: "RobotHandle", dt: float) -> None:
         rh._solver.clear_external_forces()
 
@@ -252,7 +310,7 @@ class SimRunner:
         for li, w in wrenches.items():
             rh._solver.set_external_force(li, w)
 
-        # Cached FEM/CB contact reactions (1-step lag, same pattern as grasp_demo.py).
+        # Cached FEM/CB contact reactions (1-step lag).
         # Computed by _step_body() in the PREVIOUS substep; applied here BEFORE step().
         for cp in self._scene._contact_pairs:
             if cp.robot is not rh:
@@ -382,6 +440,7 @@ class SimRunner:
         fk       = robot_handle._model.forward_kinematics()
         palm_idx = robot_handle._model.link_index("palm_link")
         palm_pos = fk[palm_idx].translation.copy()
+        palm_rot = fk[palm_idx].rotation.copy()
 
         grip_active = self._scene._grip_active.get(bh.name, False)
         q_fing = robot_handle._model.q[trigger_q]
@@ -389,20 +448,42 @@ class SimRunner:
         if not grip_active and self._time >= lift_start_t and q_fing < trigger_val:
             self._scene._grip_active[bh.name]    = True
             self._scene._grip_palm_pos0[bh.name] = palm_pos.copy()
+            self._scene._grip_palm_rot0[bh.name] = palm_rot.copy()
             self._scene._grip_body_x0[bh.name]   = bh._body.x.copy()
+            # Freeze the finger PD target at the q reached when the grip
+            # snapped on.  Without this, the LIFT-phase target keeps driving
+            # the finger inward — but contact is now bypassed, so the finger
+            # accelerates THROUGH the kinematically-locked body, producing the
+            # "fork through tofu" appearance.
+            self._scene._grip_q_lock[bh.name] = float(q_fing)
             grip_active = True
 
         if grip_active:
             palm_pos0 = self._scene._grip_palm_pos0[bh.name]
+            palm_rot0 = self._scene._grip_palm_rot0[bh.name]
             body_x0   = self._scene._grip_body_x0[bh.name]
-            delta      = palm_pos - palm_pos0
 
-            prev = self._scene._grip_prev_palm.get(bh.name)
-            palm_vel = (palm_pos - prev) / dt if prev is not None else np.zeros(3)
+            # Rigid transform from grip-time palm pose to current palm pose:
+            #   x_new = palm_pos + (palm_rot @ palm_rot0.T) @ (body_x0 - palm_pos0)
+            # Body translates AND rotates with the palm so the fingers do not
+            # skewer further into the body during a curved lift trajectory.
+            R_delta = palm_rot @ palm_rot0.T
+            offsets = body_x0 - palm_pos0           # (N, 3)
+            bh._body.x = palm_pos + offsets @ R_delta.T
 
-            bh._body.x = body_x0 + delta
-            if palm_vel[2] > 0.0:
-                bh._body.v[:] = palm_vel
+            # Velocity = palm linear velocity + omega × (x - palm_pos)
+            # Use the cached spatial velocity built during the contact step.
+            try:
+                omega, v_origin = robot_handle._model.link_world_velocities()[palm_idx]
+            except Exception:
+                omega = np.zeros(3); v_origin = np.zeros(3)
+            r = bh._body.x - palm_pos                # (N, 3)
+            cross = np.column_stack([
+                omega[1]*r[:, 2] - omega[2]*r[:, 1],
+                omega[2]*r[:, 0] - omega[0]*r[:, 2],
+                omega[0]*r[:, 1] - omega[1]*r[:, 0],
+            ])
+            bh._body.v = v_origin + cross
 
         self._scene._grip_prev_palm[bh.name] = palm_pos.copy()
 
@@ -429,6 +510,7 @@ class SimRunner:
             self._scene._grip_palm_pos0[bh.name] = palm_pos.copy()
             self._scene._grip_box_pos0[bh.name]  = bh._model.q[:3].copy()
             self._scene._grip_offset[bh.name]    = (bh._model.q[:3] - palm_pos).copy()
+            self._scene._grip_q_lock[bh.name]    = float(robot_handle._model.q[trigger_q])
             grip_active = True
 
         if grip_active:
@@ -454,7 +536,13 @@ class SimRunner:
         body,
         dt: float,
     ) -> None:
-        """Post-step position projection: push penetrating nodes to finger surface."""
+        """Post-step position projection: push penetrating nodes to finger surface.
+
+        Operates in the finger's LINK frame so the projection direction (the
+        finger's inner-face normal) follows the gripper as the arm rotates.
+        """
+        SLAB_PAD = 0.012   # tangent-axis padding so nodes between mesh rows
+                           # can still register contact (see CB contact for context).
         M_diag  = body._M.diagonal()
         m_nodes = M_diag[0::3]
 
@@ -464,47 +552,45 @@ class SimRunner:
 
             T_link     = fk[li_idx]
             T_link_inv = T_link.inverse()
-            p_center   = T_link.translation + geom_off  # center of collision box in world
-
+            R_link     = T_link.rotation
             hx, hy, hz = half_ext
 
-            # Contact axis: perpendicular to the "inner face" of the finger
-            # For +Y-axis fingers, the inner face normal is ±Y in world frame.
-            # We determine it from the joint axis of the finger link's parent joint.
-            # Heuristic: left finger → inner face in -Y direction; right → +Y.
             is_left = "left" in link_name.lower()
-            sign    = +1.0 if is_left else -1.0  # +1: inner face is -Y of left finger
+            push_sign = -1.0 if is_left else +1.0
+            push_dir  = R_link[:, 1] * push_sign
 
-            # inner face Y position (world frame)
-            inner_y = p_center[1] - sign * hy
+            p_center   = T_link.translation + R_link @ geom_off
+            inner_face = p_center + push_dir * hy
 
+            # Vectorised slab + penetration test (matches CB contact).
+            rel = (body.x - T_link.translation) @ R_link - geom_off
+            slab = (np.abs(rel[:, 0]) <= hx + SLAB_PAD) & \
+                   (np.abs(rel[:, 2]) <= hz + SLAB_PAD)
+            pen = (inner_face - body.x) @ push_dir
+            active = slab & (pen > 0.0) & (pen < 2.0 * hy)
+            if not active.any():
+                cp._cached_wrenches[li_idx] = np.zeros(6)
+                continue
+            idx = np.where(active)[0]
+            pen_a = pen[idx]
+            mi_a = m_nodes[idx]
+
+            # Project nodes onto inner face (push along +push_dir by pen).
+            body.x[idx] = body.x[idx] + pen_a[:, None] * push_dir[None, :]
+            # Kill the inward component of velocity at projected nodes.
+            v_old = body.v[idx].copy()
+            v_into = -(v_old @ push_dir)
+            kill = np.maximum(v_into, 0.0)
+            body.v[idx] = v_old + kill[:, None] * push_dir[None, :]
+            dv = body.v[idx] - v_old
+
+            f_world = -mi_a[:, None] * dv / dt          # (k, 3)
+            f_link  = f_world @ R_link
+            p_link  = (body.x[idx] - T_link.translation) @ R_link
+            tau_link = np.cross(p_link, f_link)
             w = np.zeros(6)
-            for i in range(body.x.shape[0]):
-                xi = body.x[i]
-                # Node inside the XZ slab?
-                if not (abs(xi[0] - p_center[0]) < hx
-                        and abs(xi[2] - p_center[2]) < hz):
-                    continue
-
-                mi    = m_nodes[i]
-                pen_y = sign * (xi[1] - inner_y)   # >0 means node is inside finger
-                if pen_y <= 0.0:
-                    continue
-
-                # Project node to finger surface
-                body.x[i, 1]  = inner_y
-                v_old         = body.v[i, 1]
-                body.v[i, 1]  = min(v_old, 0.0) if is_left else max(v_old, 0.0)
-                dv            = body.v[i, 1] - v_old
-
-                # Newton 3rd-law reaction wrench on arm link
-                f_world  = np.array([0.0, -mi * dv / dt, 0.0])
-                f_link   = T_link_inv.apply_vector(f_world)
-                p_link   = T_link_inv.apply_point(xi)
-                tau_link = np.cross(p_link, f_link)
-                w[:3]   += tau_link
-                w[3:]   += f_link
-
+            w[:3] = tau_link.sum(axis=0)
+            w[3:] = f_link.sum(axis=0)
             cp._cached_wrenches[li_idx] = w
 
     # ── CB penalty contact ────────────────────────────────────────────────────
@@ -515,7 +601,21 @@ class SimRunner:
         fk: list,
         body,
     ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        """Pre-step penalty forces for CB mode."""
+        """Pre-step penalty forces for CB mode.
+
+        Operates entirely in the finger's LINK frame so the finger geometry
+        (slab + inner-face direction) is interpreted correctly regardless of
+        how the arm is rotated.  An axial slab inflation (`SLAB_PAD`) lets
+        nodes between mesh rows still register a contact, which prevents the
+        "two-pinhole" visual where most box-face nodes ignore the finger.
+        """
+        # How much extra reach to allow along the finger's tangent axes when
+        # deciding whether a body node is "under" the finger.  Without this
+        # padding, mesh nodes that fall just outside the finger half-extents
+        # in X / Z register no contact — the finger appears to skewer the
+        # body between mesh rows.  Half a typical mesh spacing is enough.
+        SLAB_PAD = 0.012
+
         n     = body.x.shape[0]
         f_ext = np.zeros(n * 3)
         w_map: dict[str, np.ndarray] = {}
@@ -526,36 +626,59 @@ class SimRunner:
 
             T_link     = fk[li_idx]
             T_link_inv = T_link.inverse()
-            p_center   = T_link.translation + geom_off
+            R_link     = T_link.rotation
             hx, hy, hz = half_ext
 
+            # ``push_dir``: world-frame direction the finger pushes the body
+            # (away from the finger's interior, toward the body).
             is_left = "left" in link_name.lower()
-            sign    = +1.0 if is_left else -1.0
-            inner_y = p_center[1] - sign * hy
+            push_sign = -1.0 if is_left else +1.0
+            push_dir  = R_link[:, 1] * push_sign
 
+            p_center   = T_link.translation + R_link @ geom_off
+            inner_face = p_center + push_dir * hy
+
+            # Vectorised slab + penetration test.
+            # rel = R^T @ (x - link_origin) - geom_off
+            rel = (body.x - T_link.translation) @ R_link - geom_off  # (N,3)
+            slab = (np.abs(rel[:, 0]) <= hx + SLAB_PAD) & \
+                   (np.abs(rel[:, 2]) <= hz + SLAB_PAD)
+            if not slab.any():
+                w_map[link_name] = np.zeros(6)
+                continue
+
+            # Penetration: dot(inner_face - x, push_dir).
+            pen = (inner_face - body.x) @ push_dir   # (N,)
+            active = slab & (pen > 0.0) & (pen < 2.0 * hy)
+            if not active.any():
+                w_map[link_name] = np.zeros(6)
+                continue
+
+            idx = np.where(active)[0]
+            pen_a = pen[idx]
+            v_into_a = -(body.v[idx] @ push_dir)
+            fn_a = cp.k_contact * pen_a + cp.c_contact * np.maximum(v_into_a, 0.0)
+            keep = fn_a > 0.0
+            if not keep.any():
+                w_map[link_name] = np.zeros(6)
+                continue
+            idx = idx[keep]
+            fn_a = fn_a[keep]
+
+            f_world = fn_a[:, None] * push_dir[None, :]   # (k, 3)
+            # Scatter-add into f_ext (flattened (N*3,)).
+            f_view = f_ext.reshape(-1, 3)
+            np.add.at(f_view, idx, f_world)
+
+            # Newton-3 wrench on the finger link, in LINK frame.  Aggregate.
+            # ``p_link`` is the contact point position in the link frame
+            # (relative to the link origin) so the moment arm is correct.
+            f_link   = -f_world @ R_link        # link = R^T @ world (rows)
+            p_link   = (body.x[idx] - T_link.translation) @ R_link
+            tau_link = np.cross(p_link, f_link)
             w = np.zeros(6)
-            for i in range(n):
-                xi = body.x[i]
-                vi = body.v[i]
-                if not (abs(xi[0] - p_center[0]) < hx
-                        and abs(xi[2] - p_center[2]) < hz):
-                    continue
-                pen = sign * (xi[1] - inner_y)
-                if pen <= 0.0:
-                    continue
-
-                v_normal = sign * vi[1]
-                fn = cp.k_contact * pen + cp.c_contact * max(0.0, v_normal)
-
-                f_ext[i * 3 + 1] -= sign * fn
-
-                f_world  = np.array([0.0, sign * fn, 0.0])
-                f_link   = T_link_inv.apply_vector(f_world)
-                p_link   = T_link_inv.apply_point(xi)
-                tau_link = np.cross(p_link, f_link)
-                w[:3]   += tau_link
-                w[3:]   += f_link
-
+            w[:3] = tau_link.sum(axis=0)
+            w[3:] = f_link.sum(axis=0)
             w_map[link_name] = w
 
         return f_ext, w_map
@@ -657,7 +780,10 @@ class SimRunner:
         # HUD text
         phase_strs = [f"{traj.current_phase or 'DONE'}" for traj in trajs]
         phase_str  = " | ".join(phase_strs) if phase_strs else "–"
-        lines = [f"t = {self._time:.3f} s   phase: {phase_str}"]
+        lines = [
+            f"t = {self._time:.3f} s   phase: {phase_str}",
+            self._fps.format(),
+        ]
         for bh in scene._body_handles.values():
             c = bh.com
             lines.append(
@@ -688,6 +814,9 @@ class SimRunner:
         print(f"\n{'='*60}")
         print(f"Simulated  : {self._time:.2f} s")
         print(f"Wall time  : {wall_time:.2f} s  ({self._time/max(wall_time,1e-9):.2f}× real-time)")
+        print(f"Frames     : {self._fps.n_frames}  "
+              f"(avg {self._fps.average:.1f} FPS, "
+              f"last-window {self._fps.current:.1f} FPS)")
         for bh in self._scene._body_handles.values():
             c    = bh.com
             z_lo = bh.bottom_z

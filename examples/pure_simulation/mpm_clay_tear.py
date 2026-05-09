@@ -6,7 +6,7 @@ stretch, accumulate damage, and eventually stop transmitting stress —
 so the bar separates into two fragments.
 
 Colour encodes per-particle damage ``d ∈ [0, 1]`` (cool → hot).
-Rendering via :class:`SimViewer` (same Taichi GGUI style as grasp_demo).
+Rendering via :class:`SimViewer` (Taichi GGUI).
 
 Usage
 -----
@@ -84,17 +84,22 @@ def _damage_colors(d: np.ndarray) -> np.ndarray:
 
 
 def run_headless() -> None:
+    from robosim.util.fps import FPSCounter
     solver = build_solver()
     pts = solver.particles
     print(f"[init] {pts.n} particles, grid {solver.grid.shape}")
+    fps = FPSCounter()
     for step in range(N_STEPS + 1):
+        if step < N_STEPS:
+            solver.step(DT)
+        fps.tick()
         if step % 100 == 0:
             ext = float(np.ptp(pts.x[:, 0]))
             print(f"t={step*DT:5.3f}s  x_ext={ext:.3f}  "
                   f"d_max={pts.d.max():.3f}  d_mean={pts.d.mean():.3f}  "
-                  f"broken={float((pts.d > 0.99).mean()):.2%}")
-        if step < N_STEPS:
-            solver.step(DT)
+                  f"broken={float((pts.d > 0.99).mean()):.2%}  {fps.format()}")
+    print(f"\nFrames    : {fps.n_frames}  (avg {fps.average:.1f} FPS, "
+          f"last-window {fps.current:.1f} FPS)")
 
 
 def run_gui() -> None:
@@ -116,6 +121,8 @@ def run_gui() -> None:
                          per_vertex_color=_damage_colors(pts.d))
 
     step_count = [0]
+    from robosim.util.fps import FPSCounter
+    fps = FPSCounter()
 
     def step(frame: int) -> None:
         for _ in range(SUBSTEPS_PER_FRAME):
@@ -126,10 +133,12 @@ def run_gui() -> None:
             step_count[0] += 1
         viewer.update_particles("mpm", pts.x,
                                 per_vertex_color=_damage_colors(pts.d))
+        fps.tick()
         ext = float(np.ptp(pts.x[:, 0]))
         t_sim = step_count[0] * DT
         viewer.add_text(
             f"t = {t_sim:6.3f} s   step {step_count[0]}\n"
+            f"{fps.format()}\n"
             f"x extent : {ext:.3f} m\n"
             f"d_max = {pts.d.max():.3f}   d_mean = {pts.d.mean():.3f}\n"
             f"broken   : {float((pts.d > 0.99).mean()):.2%}\n"

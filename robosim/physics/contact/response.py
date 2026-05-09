@@ -1,4 +1,20 @@
-"""Contact response: penalty-based normal forces and Coulomb friction."""
+"""Contact response: penalty-based normal forces and Coulomb friction.
+
+Two friction models are exposed (selected per call):
+
+* ``"kinetic"`` — regularised kinetic Coulomb. ``f_t = −μ·f_n · v_t/|v_t|``
+  smoothed by ``v_t/eps`` near zero. **No static friction**: at
+  ``v_t → 0`` the force scales to zero, so a held object slides under
+  gravity. Used by :class:`PenaltyContactSolver`.
+
+* ``"stick_slip"`` — full Coulomb cone with stick/slip transition.
+  When tangential velocity is small enough that the impulse needed to
+  null it within one timestep stays inside the friction disk
+  (``|f_required| ≤ μ·f_n``), apply that exact force (stick). Otherwise
+  saturate at ``μ·f_n`` opposing motion (slip). Provides static friction
+  → grasp held purely by finger force, no kinematic lock needed. Used by
+  :class:`ConstraintContactSolver`.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +51,8 @@ def compute_contact_force(
     velocity_b: np.ndarray,
     params: ContactParams,
     effective_mass: float | None = None,
+    friction_model: str = "kinetic",
+    dt: float | None = None,
 ) -> ContactForce | None:
     """Compute penalty + friction force for a single contact.
 
@@ -46,6 +64,11 @@ def compute_contact_force(
     params : contact parameters
     effective_mass : if given, damping is capped at critical damping for
                      this mass to prevent energy injection on light nodes.
+                     Also required for ``friction_model="stick_slip"`` to
+                     size the impulse that nulls ``v_t`` within one step.
+    friction_model : ``"kinetic"`` (regularised kinetic Coulomb, default)
+                     or ``"stick_slip"`` (Coulomb cone with static friction).
+    dt : timestep, required when ``friction_model="stick_slip"``.
 
     Returns
     -------
@@ -75,14 +98,39 @@ def compute_contact_force(
 
     f_normal = fn_mag * n
 
-    # Coulomb friction (smoothed)
+    # Coulomb friction
     v_t = v_rel - v_n * n
     v_t_norm = np.linalg.norm(v_t)
+    f_max = params.friction_mu * fn_mag
+
+    if friction_model == "stick_slip":
+        # Stick/slip: force needed to null v_t within dt is m_eff·v_t/dt.
+        # If that fits inside the Coulomb disk (|·| ≤ μ·f_n) → stick;
+        # otherwise saturate at the disk boundary opposing v_t (slip).
+        if dt is None or dt <= 0.0 or effective_mass is None or effective_mass <= 0.0:
+            # Insufficient info for stick model — fall through to kinetic.
+            pass
+        else:
+            if v_t_norm > 1e-12:
+                f_required = -(effective_mass / dt) * v_t          # full stick force
+                f_req_mag  = np.linalg.norm(f_required)
+                if f_req_mag <= f_max:
+                    f_friction = f_required                        # static stick
+                else:
+                    f_friction = -f_max * (v_t / v_t_norm)         # kinetic slip
+            else:
+                f_friction = np.zeros(3)                           # already at rest
+            return ContactForce(
+                point=contact.point_a.copy(),
+                force=f_normal + f_friction,
+                normal_force=fn_mag,
+            )
+
+    # Kinetic-only Coulomb (regularised). Default model.
     if v_t_norm > 1e-12:
-        friction_mag = params.friction_mu * fn_mag
         # Smooth clamp: mu * N * v_t / max(|v_t|, eps)
         scale = min(1.0, v_t_norm / params.friction_eps)
-        f_friction = -friction_mag * scale * (v_t / v_t_norm)
+        f_friction = -f_max * scale * (v_t / v_t_norm)
     else:
         f_friction = np.zeros(3)
 

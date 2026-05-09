@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from robosim.math.transforms import Transform
+from robosim.math.transforms import Transform, cross3
 from robosim.model.geometry import GeometryType
 from robosim.physics.contact.sdf import ContactPoint, points_ground
 from robosim.physics.contact.detection import (
@@ -38,78 +38,40 @@ def _link_point_velocity(
 ) -> np.ndarray:
     """Compute world-frame velocity of a point attached to a link.
 
-    Uses joint velocity propagation through the kinematic chain.
-
-    Parameters
-    ----------
-    fk : optional pre-computed forward kinematics (avoids redundant FK).
+    Fast path: looks up the link's spatial velocity from the cache built
+    by :meth:`Robot.link_world_velocities` (which propagates joint
+    velocities once per ``(q, qd)`` snapshot, instead of per contact).
     """
-    from robosim.math.spatial import (
-        joint_transform,
-        motion_subspace_revolute,
-        motion_subspace_prismatic,
-    )
-    from robosim.model.joint import JointType
-
     if fk is None:
         fk = robot.forward_kinematics()
-    n_links = robot.n_links
-
-    # Propagate spatial velocities from root to link_idx
-    # Spatial velocity: [omega(3); v(3)] in world frame
-    omega = np.zeros(3)  # angular velocity in world frame
-    v_origin = np.zeros(3)  # linear velocity of link origin in world frame
-
-    # Build path from root to link_idx
-    path = []
-    idx = link_idx
-    while idx >= 0:
-        path.append(idx)
-        idx = robot.parent_index(idx)
-    path.reverse()
-
-    prev_origin = fk[path[0]].translation if path else np.zeros(3)
-
-    for i in path:
-        parent_idx = robot.parent_index(i)
-
-        # Propagate v_origin from parent to this link:
-        # v(child_origin) = v(parent_origin) + omega × (child - parent)
-        link_origin_i = fk[i].translation
-        if parent_idx >= 0:
-            v_origin += np.cross(omega, link_origin_i - prev_origin)
-        prev_origin = link_origin_i
-
-        # Add joint velocity contribution
-        j_idx = robot.joint_index_for_link(i)
-        if j_idx is not None:
-            joint = robot.joints[j_idx]
-            # Skip fixed joints (no DOF)
-            if joint.joint_type == JointType.FIXED:
-                continue
-            # Map joint index → DOF index (handles mimic joints)
-            dof_idx = robot._dof_index[j_idx]
-            qd_j = robot.qd[dof_idx]
-
-            # Joint axis in world frame
-            T_world_link = fk[i]
-            if joint.joint_type in (JointType.REVOLUTE, JointType.CONTINUOUS):
-                axis_world = T_world_link.rotation @ joint.axis
-                omega += qd_j * axis_world
-            elif joint.joint_type == JointType.PRISMATIC:
-                axis_world = T_world_link.rotation @ joint.axis
-                v_origin += qd_j * axis_world
-
-    # Velocity at point: v = v_origin + omega x (point - origin)
+    omega, v_origin = robot.link_world_velocities()[link_idx]
     link_origin = fk[link_idx].translation
     r = point_world - link_origin
-    v_point = v_origin + np.cross(omega, r)
-    return v_point
+    return v_origin + np.array([
+        omega[1]*r[2] - omega[2]*r[1],
+        omega[2]*r[0] - omega[0]*r[2],
+        omega[0]*r[1] - omega[1]*r[0],
+    ])
 
 
 @dataclass
-class ContactSolver:
-    """Manages contact detection and response."""
+class PenaltyContactSolver:
+    """Explicit penalty contact + regularized kinetic Coulomb friction.
+
+    Normal force: f_n = k * pen - c * v_n  (penalty spring with damping).
+    Friction:     |f_t| ≤ μ |f_n|, regularized via v_t / max(|v_t|, eps).
+
+    Limitations vs constraint-based contact:
+    * No static (stick) friction — at v_rel → 0 the regularizer scales
+      friction to zero, so a held object slides under gravity unless
+      held by a kinematic grip + finger-PD lock.
+    * Contacts are resolved independently per body, so multi-finger
+      grasping does not enforce a joint friction-cone constraint.
+
+    A future ConstraintContactSolver will solve all contacts jointly with
+    a full Coulomb cone (PGS / convex), which removes the need for the
+    kinematic grip workaround.
+    """
 
     detector: ContactDetector = field(default_factory=lambda: ContactDetector())
     params: ContactParams = field(default_factory=ContactParams)
@@ -130,23 +92,44 @@ class ContactSolver:
         self._robot_solvers = {}     # robot_id -> rbd_solver
         self._robot_body_ids = {}    # robot_id -> list[bid]
         self._solver_to_rid = {}     # id(solver) -> robot_id
+        self._free_body_ids = set()  # robot_ids registered as free-floating
         self._fem_colliders = []
 
     def _get_robot_id(self, rbd_solver) -> str:
         """Look up registered robot_id for a solver."""
         return self._solver_to_rid.get(id(rbd_solver), rbd_solver.robot.name)
 
-    def register_rbd(self, rbd_solver, robot_id: str | None = None) -> None:
+    # ── Friction strategy hook ──
+    # Penalty solver: regularised kinetic Coulomb (the long-standing default).
+    # ConstraintContactSolver overrides this hook to feed stick_slip + dt.
+    def _contact_force(self, contact, v_a, v_b, effective_mass=None):
+        return compute_contact_force(
+            contact, v_a, v_b, self.params, effective_mass=effective_mass,
+        )
+
+    def register_rbd(
+        self,
+        rbd_solver,
+        robot_id: str | None = None,
+        is_free_body: bool = False,
+    ) -> None:
         """Register collision geometries from robot links.
 
         Parameters
         ----------
         rbd_solver : RBDSolver to register
         robot_id : unique identifier for this robot (defaults to robot.name)
+        is_free_body : True for a free-floating single-body RBD (e.g. a box
+                       created by ``create_free_box``). Used by the
+                       constraint-mode solver to decide which side of a
+                       contact to position-project; the penalty solver
+                       ignores this flag.
         """
         robot = rbd_solver.robot
         if robot_id is None:
             robot_id = robot.name
+        if is_free_body:
+            self._free_body_ids.add(robot_id)
         fk = robot.forward_kinematics()
 
         self._robot_solvers[robot_id] = rbd_solver
@@ -337,9 +320,8 @@ class ContactSolver:
             if link_mass > 0:
                 eff_mass = link_mass / n_contacts
 
-            cf = compute_contact_force(
-                contact_pt, v_a, v_b, self.params,
-                effective_mass=eff_mass,
+            cf = self._contact_force(
+                contact_pt, v_a, v_b, effective_mass=eff_mass,
             )
             if cf is None:
                 continue
@@ -350,7 +332,7 @@ class ContactSolver:
             T_inv = fk[link_idx].inverse()
             f_link = T_inv.apply_vector(cf.force)
             p_link = T_inv.apply_point(cf.point)
-            tau_link = np.cross(p_link, f_link)
+            tau_link = cross3(p_link, f_link)
             wrench = np.concatenate([tau_link, f_link])
 
             if link_idx in wrenches:
@@ -458,9 +440,8 @@ class ContactSolver:
             v_node = fem_body.v[node_idx]
             node_mass = float(M_diag[node_idx * 3])
 
-            cf = compute_contact_force(
-                cp, v_node, np.zeros(3), self.params,
-                effective_mass=node_mass,
+            cf = self._contact_force(
+                cp, v_node, np.zeros(3), effective_mass=node_mass,
             )
             if cf is None:
                 continue
@@ -754,8 +735,8 @@ class ContactSolver:
                 eff_mass = link_mass / n_contacts
 
             for cpt, va, vb, fk in contact_list:
-                cf = compute_contact_force(
-                    cpt, va, vb, self.params, effective_mass=eff_mass,
+                cf = self._contact_force(
+                    cpt, va, vb, effective_mass=eff_mass,
                 )
                 if cf is None:
                     continue
@@ -764,7 +745,7 @@ class ContactSolver:
                 T_inv = fk[lidx].inverse()
                 f_link = T_inv.apply_vector(cf.force)
                 p_link = T_inv.apply_point(cf.point)
-                tau_link = np.cross(p_link, f_link)
+                tau_link = cross3(p_link, f_link)
                 wrench = np.concatenate([tau_link, f_link])
 
                 w_dict = all_wrenches[rid]
@@ -778,3 +759,9 @@ class ContactSolver:
     @property
     def last_forces(self) -> list[ContactForce]:
         return self._last_forces
+
+
+# Backward-compat alias. Existing code (Scene, demos, tests) imports
+# ``ContactSolver`` directly; the rename to PenaltyContactSolver is internal
+# until the constraint-based solver lands and an ABC is extracted.
+ContactSolver = PenaltyContactSolver

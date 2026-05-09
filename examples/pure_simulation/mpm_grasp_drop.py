@@ -1,6 +1,6 @@
 """MPM grasp-drop — robot picks a box and drops it on a clay pile.
 
-Same arm + grasp sequence as ``examples/grasp_demo.py``, with two extra
+Same arm + grasp sequence as ``grasp_scene.py``, with two extra
 phases after ``LIFT``:
 
   - ``MOVE``    — pan joint swings the lifted box over the clay pile.
@@ -60,9 +60,13 @@ HOME_Q     = np.array([ 0.0, -1.571,  0.000, +1.571,  0.040, -0.040])
 FOLD_Q     = np.array([ 0.0, -1.400,  2.000, -0.600,  0.040, -0.040])
 APPROACH_Q = np.array([ 0.0, -0.365,  2.047, -1.682,  0.040, -0.040])
 NEAR_Q     = np.array([ 0.0, -0.370,  1.909, -1.539,  0.040, -0.040])
-CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.020,  0.020])
-LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.020,  0.020])
-MOVE_Q     = np.array([-1.0, -0.878,  2.080, -1.202, -0.020,  0.020])
+# Finger target ±0.011 (mirrors grasp_scene.py): puts the inner face right
+# at the box surface for the CLOSE pose. Driving deeper (e.g. ±0.020)
+# commands the PD through the box geometry → "fork-skewer" penetration
+# during LIFT/MOVE since contact is bypassed once grip activates.
+CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.011,  0.011])
+LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.011,  0.011])
+MOVE_Q     = np.array([-1.0, -0.878,  2.080, -1.202, -0.011,  0.011])
 RELEASE_Q  = np.array([-1.0, -0.878,  2.080, -1.202,  0.040, -0.040])
 
 _PHASES = [
@@ -78,10 +82,14 @@ _PHASES = [
 _PHASE_NAMES = ["HOME", "FOLD", "APPROACH", "NEAR", "CLOSE", "LIFT",
                 "MOVE", "RELEASE", "SETTLE"]
 
-_KP = np.array([280.0, 480.0, 200.0,  75.0, 5e4,  5e4 ])
-_KD = np.array([ 35.0,  50.0,  20.0,   2.0, 100., 100.])
+# Finger PD intentionally soft (kp=800) — a stiff finger PD overpowers
+# contact reaction and drives the fingertips through the box mesh. 800 is
+# enough to reach the kinematic grip threshold while keeping penetration
+# under ~5 mm. Mirrors grasp_scene.py.
+_KP = np.array([280.0, 480.0, 200.0,  75.0,  800,  800 ])
+_KD = np.array([ 35.0,  50.0,  20.0,   2.0,  30.,  30. ])
 
-# Finger geometry (matches grasp_demo — must mirror the URDF collision box).
+# Finger geometry — must mirror the URDF collision box.
 _F_HX, _F_HY, _F_HZ = 0.040, 0.005, 0.010
 _K_FINGER = 1e4
 _C_FINGER = 50.0
@@ -137,7 +145,7 @@ def _height_colors(z: np.ndarray, zmax: float) -> np.ndarray:
 
 
 def _stress_color(vm: np.ndarray, vmax: float) -> np.ndarray:
-    """Jet colormap on von Mises stress (matches grasp_demo CB mode)."""
+    """Jet colormap on von Mises stress."""
     t = np.clip(vm / max(vmax, 1.0), 0, 1)
     r = np.clip(1.5 - np.abs(t - 0.75) * 4, 0, 1)
     g = np.clip(1.5 - np.abs(t - 0.50) * 4, 0, 1)
@@ -178,7 +186,7 @@ def _apply_ground_projection(body, mu: float = 0.9) -> None:
 def _compute_finger_forces(bx, bv, arm_fk, robot):
     """Per-node penalty contact between arm fingers and a CB box.
 
-    Mirrors grasp_demo._compute_finger_forces. Returns
+    Returns
     ``(f_fem, l_idx, w_left, r_idx, w_right)``.
     """
     n = bx.shape[0]
@@ -346,6 +354,7 @@ def run(mode: str = "rigid",
     _LIFT_START_T  = sum(d for _, d in _PHASES[:5])
     _RELEASE_START = sum(d for _, d in _PHASES[:7])
     grip_active       = [False]
+    grip_q_lock       = [None]                   # leader-finger q snapshot at grip activation
     grip_palm_pos0    = np.zeros(3)
     grip_palm_rot0    = np.eye(3)                # palm rotation at grip start
     grip_box_pos0     = np.zeros(3)
@@ -390,6 +399,22 @@ def run(mode: str = "rigid",
         nonlocal grip_palm_rot0
         nonlocal cached_w_left, cached_w_right
         advance_phases(sim_time[0])
+
+        # Finger PD target lock applied as a *floor* on q_target[4] (and
+        # mirrored on q_target[5] via mimic). Two effects:
+        #   (a) During LIFT/MOVE, traj wants q[4]=-0.011 < lock — floor
+        #       wins → no inward creep ("fork-skewer" prevention).
+        #   (b) During RELEASE, traj smoothsteps from -0.011 → +0.040.
+        #       While traj < lock, floor still holds (no PD snap-back when
+        #       lock is dropped). Once traj rises above lock, the floor
+        #       becomes redundant and we release it — smooth handoff with
+        #       no q_target discontinuity.
+        if grip_q_lock[0] is not None:
+            if q_target[4] >= grip_q_lock[0]:
+                grip_q_lock[0] = None    # traj has cleared the floor
+            else:
+                q_target[4] = grip_q_lock[0]
+                q_target[5] = -grip_q_lock[0]        # mimic: multiplier=-1, offset=0
 
         # ── Arm ──
         arm_solver.clear_external_forces()
@@ -437,6 +462,7 @@ def run(mode: str = "rigid",
             if gripping_now:
                 if not grip_active[0]:
                     grip_active[0]    = True
+                    grip_q_lock[0]    = float(robot.q[4])  # snapshot leader-finger q
                     grip_palm_pos0[:] = palm_pos
                     grip_palm_rot0    = palm_rot.copy()
                     grip_box_pos0     = box_robot.q[:3].copy()
@@ -471,6 +497,8 @@ def run(mode: str = "rigid",
                 box_robot.qd[3:6] = 0.0
             elif sim_time[0] >= _RELEASE_START and grip_active[0]:
                 grip_active[0] = False
+                # grip_q_lock[0] left intact — the floor logic auto-clears
+                # it once the trajectory rises above the snapshot.
 
         else:  # cb
             if gripping_now:
@@ -480,6 +508,7 @@ def run(mode: str = "rigid",
                 # release q_r_dot is wildly non-zero and the body flies off.
                 if not grip_active[0]:
                     grip_active[0]    = True
+                    grip_q_lock[0]    = float(robot.q[4])  # snapshot leader-finger q
                     grip_palm_pos0[:] = palm_pos
                     grip_palm_rot0    = palm_rot.copy()
                     # Freeze each node in the palm frame at grip start.
@@ -507,6 +536,7 @@ def run(mode: str = "rigid",
                 # a huge spurious impulse ejecting it sideways.
                 if sim_time[0] >= _RELEASE_START and grip_active[0]:
                     grip_active[0] = False
+                    # Lock floor auto-clears when traj rises above it.
                 if sim_time[0] < _RELEASE_START:
                     f_fem, l_i, w_l, r_i, w_r = _compute_finger_forces(
                         cb_body.x, cb_body.v, fk, robot,
@@ -545,12 +575,15 @@ def run(mode: str = "rigid",
 
     # ── Headless ─────────────────────────────────────────────────
     if headless:
+        from robosim.util.fps import FPSCounter
+        fps = FPSCounter()
         total_dur   = sum(d for _, d in _PHASES) + 2.0
         total_steps = int(total_dur / dt) + substeps
         t_wall0 = time.time()
         for fr in range(total_steps // substeps + 1):
             for _ in range(substeps):
                 step_once()
+            fps.tick()
             if fr % 200 == 0:
                 com = _box_com()
                 z_top = float(mpm_particles.x[:, 2].max())
@@ -558,8 +591,11 @@ def run(mode: str = "rigid",
                 ph = _PHASE_NAMES[min(phase_idx, len(_PHASE_NAMES) - 1)]
                 print(f"t={sim_time[0]:6.3f}s  phase={ph:<8}  "
                       f"box=({com[0]:+.3f},{com[1]:+.3f},{com[2]:+.3f})  "
-                      f"pile z_top={z_top:.3f}  xy_ext={xy_ext:.3f}")
+                      f"pile z_top={z_top:.3f}  xy_ext={xy_ext:.3f}  "
+                      f"{fps.format()}")
         print(f"\nWall time: {time.time()-t_wall0:.2f} s")
+        print(f"Frames    : {fps.n_frames}  (avg {fps.average:.1f} FPS, "
+              f"last-window {fps.current:.1f} FPS)")
         return
 
     # ── GUI ──────────────────────────────────────────────────────
@@ -590,9 +626,13 @@ def run(mode: str = "rigid",
         ),
     )
 
+    from robosim.util.fps import FPSCounter
+    fps = FPSCounter()
+
     def frame_step(frame: int) -> None:
         for _ in range(substeps):
             step_once()
+        fps.tick()
 
         arm_renderer.update()
         vm_max = 0.0
@@ -627,6 +667,7 @@ def run(mode: str = "rigid",
         viewer.add_text(
             f"t = {sim_time[0]:6.3f} s    Phase: {ph}    "
             f"[{mode.upper()} / {material.upper()}]\n"
+            f"{fps.format()}\n"
             f"Box CoM : ({com[0]:+.3f}, {com[1]:+.3f}, {com[2]:+.3f})\n"
             f"Pile z_top: {z_top:.3f}    xy extent: {xy_ext:.3f}"
             f"{stress_line}\n"

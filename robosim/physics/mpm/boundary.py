@@ -15,9 +15,23 @@ import numpy as np
 from robosim.physics.mpm.grid import Grid
 
 
-def apply_gravity(grid: Grid, dt: float, gravity: np.ndarray) -> None:
-    """Add gravity impulse to every node that carries mass."""
+def apply_gravity(
+    grid: Grid,
+    dt: float,
+    gravity: np.ndarray,
+    active_flat: np.ndarray | None = None,
+) -> None:
+    """Add gravity impulse to every node that carries mass.
+
+    ``active_flat``: 1-D flat indices of nodes known to be active (from
+    a prior P2G pass). When provided, the gravity ``+=`` runs on the
+    sparse subset only — typically <5 % of the grid for a localised
+    blob — instead of computing ``mask = grid.m > 0`` over every cell.
+    """
     g = np.asarray(gravity, dtype=np.float64).reshape(3)
+    if active_flat is not None:
+        grid.v.reshape(-1, 3)[active_flat] += dt * g
+        return
     mask = grid.m > 0.0
     grid.v[mask] += dt * g
 
@@ -27,6 +41,7 @@ def apply_box_bc(
     lower: np.ndarray,
     upper: np.ndarray,
     mode: str = "slip",
+    active_flat: np.ndarray | None = None,
 ) -> None:
     """Enforce axis-aligned walls at ``lower`` and ``upper``.
 
@@ -41,6 +56,36 @@ def apply_box_bc(
     upper = np.asarray(upper, dtype=np.float64).reshape(3)
 
     nx, ny, nz = grid.shape
+
+    # ── Sparse path: only inspect known-active nodes ──
+    if active_flat is not None and active_flat.size > 0:
+        # Decode flat → (i, j, k)
+        i = active_flat // (ny * nz)
+        rem = active_flat - i * (ny * nz)
+        j = rem // nz
+        k = rem - j * nz
+        x = grid.origin[0] + i * grid.dx
+        y = grid.origin[1] + j * grid.dx
+        z = grid.origin[2] + k * grid.dx
+        lo_x = x <= lower[0]; hi_x = x >= upper[0]
+        lo_y = y <= lower[1]; hi_y = y >= upper[1]
+        lo_z = z <= lower[2]; hi_z = z >= upper[2]
+        v_flat = grid.v.reshape(-1, 3)
+        if mode == "sticky":
+            wall = lo_x | hi_x | lo_y | hi_y | lo_z | hi_z
+            if wall.any():
+                v_flat[active_flat[wall]] = 0.0
+            return
+        # Slip: clamp inward normal per wall.
+        for axis, (lo, hi) in enumerate(((lo_x, hi_x), (lo_y, hi_y), (lo_z, hi_z))):
+            if lo.any():
+                sel = active_flat[lo]
+                v_flat[sel, axis] = np.maximum(v_flat[sel, axis], 0.0)
+            if hi.any():
+                sel = active_flat[hi]
+                v_flat[sel, axis] = np.minimum(v_flat[sel, axis], 0.0)
+        return
+
     xs = grid.origin[0] + np.arange(nx) * grid.dx
     ys = grid.origin[1] + np.arange(ny) * grid.dx
     zs = grid.origin[2] + np.arange(nz) * grid.dx

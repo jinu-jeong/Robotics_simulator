@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
+EXAMPLES_DIR = Path(__file__).parent.parent / "examples" / "pure_simulation"
 URDF_DIR = EXAMPLES_DIR / "urdf"
 
 

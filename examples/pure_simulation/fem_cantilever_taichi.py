@@ -214,6 +214,8 @@ def main():
     camera.lookat(0.5, 0.05, 0.0)
     camera.up(0, 0, 1)
 
+    from robosim.util.fps import FPSCounter
+    fps_counter = FPSCounter()
     frame_times = []
     vm_max = 1.0
 
@@ -273,12 +275,12 @@ def main():
         tip_dz = (body.x[tip_nodes, 2] - mesh.nodes[tip_nodes, 2]).mean()
         dt_ms = (time.perf_counter() - t0) * 1000
         frame_times.append(dt_ms)
-        avg_ms = np.mean(frame_times[-30:])
-        fps = 1000.0 / avg_ms if avg_ms > 0 else 0
+        fps_counter.tick()
 
         gui = window.get_gui()
         with gui.sub_window("Info", x=0.01, y=0.01, width=0.45, height=0.38):
-            gui.text(f"Solver: {solver_mode.upper()}  t={solver.time:.3f}s  FPS:{fps:.0f}")
+            gui.text(f"Solver: {solver_mode.upper()}  t={solver.time:.3f}s  "
+                     f"{fps_counter.format()}")
             gui.text(f"Tip: {tip_dz*1000:.2f}mm (analytical: {delta_analytical*1000:.1f}mm)")
             if need_stress:
                 gui.text(f"Stress: 0 ~ {vm_max:.0f} Pa")

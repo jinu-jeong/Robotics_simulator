@@ -33,6 +33,7 @@ class SpatialInertia:
     def __post_init__(self):
         self.com = np.asarray(self.com, dtype=np.float64).reshape(3)
         self.inertia = np.asarray(self.inertia, dtype=np.float64).reshape(3, 3)
+        self._cached_matrix: np.ndarray | None = None
 
     def to_matrix(self) -> np.ndarray:
         """Convert to 6x6 spatial inertia matrix about the body frame origin.
@@ -42,7 +43,12 @@ class SpatialInertia:
                     | m*[c]x^T                 m*I_3  |
 
         where [c]x is the skew-symmetric matrix of the CoM vector.
+        Cached after first call (SpatialInertia is conceptually immutable).
         """
+        cached = getattr(self, "_cached_matrix", None)
+        if cached is not None:
+            return cached
+
         m = self.mass
         c = self.com
         cx = skew(c)
@@ -53,6 +59,7 @@ class SpatialInertia:
         I_spatial[:3, 3:] = m * cx
         I_spatial[3:, :3] = m * cx.T
         I_spatial[3:, 3:] = m * np.eye(3)
+        self._cached_matrix = I_spatial
         return I_spatial
 
     @staticmethod
@@ -113,20 +120,22 @@ def spatial_transform_motion(T: Transform) -> np.ndarray:
 def spatial_cross_motion(v: np.ndarray) -> np.ndarray:
     """Spatial cross product operator for motion vectors: [v]x.
 
-    crm(v) @ w = v x_m w (spatial motion cross product).
-
-    v = [omega; v_lin], result:
-    | [omega]x    0       |
-    | [v_lin]x    [omega]x|
+    Inlined skew construction to avoid two allocations + reshape per call.
     """
-    omega = v[:3]
-    v_lin = v[3:]
-    wx = skew(omega)
-    vx = skew(v_lin)
+    w0, w1, w2 = v[0], v[1], v[2]
+    l0, l1, l2 = v[3], v[4], v[5]
     X = np.zeros((6, 6))
-    X[:3, :3] = wx
-    X[3:, :3] = vx
-    X[3:, 3:] = wx
+    # [omega]x in upper-left and lower-right
+    X[0, 1] = -w2; X[0, 2] =  w1
+    X[1, 0] =  w2; X[1, 2] = -w0
+    X[2, 0] = -w1; X[2, 1] =  w0
+    X[3, 4] = -w2; X[3, 5] =  w1
+    X[4, 3] =  w2; X[4, 5] = -w0
+    X[5, 3] = -w1; X[5, 4] =  w0
+    # [v_lin]x in lower-left
+    X[3, 1] = -l2; X[3, 2] =  l1
+    X[4, 0] =  l2; X[4, 2] = -l0
+    X[5, 0] = -l1; X[5, 1] =  l0
     return X
 
 
