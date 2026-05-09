@@ -43,7 +43,7 @@ N_STEPS      = 900
 SUBSTEPS_PER_FRAME = 4
 
 
-def build_solver() -> MPMSolver:
+def build_solver(backend: str = "numpy"):
     xs = np.linspace(BAR_LOWER[0], BAR_UPPER[0], N_X)
     ys = np.linspace(BAR_LOWER[1], BAR_UPPER[1], N_YZ)
     zs = np.linspace(BAR_LOWER[2], BAR_UPPER[2], N_YZ)
@@ -58,12 +58,16 @@ def build_solver() -> MPMSolver:
     )
     pts.v[:, 0] = STRAIN_RATE * (pts.x[:, 0] - 0.5)
     grid = Grid.from_bounds(DOMAIN_LOWER, DOMAIN_UPPER, DX, pad=3)
-    return MPMSolver(
-        particles=pts, grid=grid,
-        material=DamagedNeoHookean(young=1.5e4, poisson=0.3,
-                                   stretch_c=1.05, softening=3.0),
-        gravity=np.zeros(3), bcs=[],
-    )
+    material = DamagedNeoHookean(young=1.5e4, poisson=0.3,
+                                 stretch_c=1.05, softening=3.0)
+    if backend == "taichi":
+        from robosim.physics.mpm.taichi_solver import TaichiMPMSolver
+        return TaichiMPMSolver.from_numpy_setup(
+            particles=pts, grid=grid, material=material,
+            gravity=(0, 0, 0), bcs=[],
+        )
+    return MPMSolver(particles=pts, grid=grid, material=material,
+                     gravity=np.zeros(3), bcs=[])
 
 
 def _ground_mesh(size: float = 1.2) -> tuple[np.ndarray, np.ndarray]:
@@ -83,9 +87,9 @@ def _damage_colors(d: np.ndarray) -> np.ndarray:
     return np.column_stack([r, g, b])
 
 
-def run_headless() -> None:
+def run_headless(backend: str = "numpy") -> None:
     from robosim.util.fps import FPSCounter
-    solver = build_solver()
+    solver = build_solver(backend)
     pts = solver.particles
     print(f"[init] {pts.n} particles, grid {solver.grid.shape}")
     fps = FPSCounter()
@@ -102,10 +106,10 @@ def run_headless() -> None:
           f"last-window {fps.current:.1f} FPS)")
 
 
-def run_gui() -> None:
+def run_gui(backend: str = "numpy") -> None:
     from robosim.viz.viewer import SimViewer
 
-    solver = build_solver()
+    solver = build_solver(backend)
     pts = solver.particles
 
     viewer = SimViewer(
@@ -152,13 +156,16 @@ def run_gui() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--backend", choices=["numpy", "taichi"], default="numpy",
+                    help="numpy (default) or taichi (arch=metal, ~5× faster).")
     args = ap.parse_args()
-    if args.headless:
-        run_headless()
-    else:
+    if args.backend == "taichi" or not args.headless:
         import taichi as ti
         ti.init(arch=ti.metal)
-        run_gui()
+    if args.headless:
+        run_headless(args.backend)
+    else:
+        run_gui(args.backend)
 
 
 if __name__ == "__main__":

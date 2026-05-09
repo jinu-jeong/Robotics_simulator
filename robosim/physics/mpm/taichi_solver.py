@@ -9,6 +9,10 @@ Materials supported (selected via ``material_kind`` at construction):
 * ``"neo"``      — elastic NeoHookean (default).
 * ``"vm"``       — NeoHookean elasticity + Von-Mises J2 plasticity.
 * ``"dp"``       — NeoHookean elasticity + Drucker-Prager plasticity.
+* ``"damaged"``  — NeoHookean elasticity + monotonic local tensile damage
+                  (CD-MPM, Wolper 2019). Stress degraded by ``(1-d)²``;
+                  ``d`` grows when the max principal stretch exceeds
+                  ``stretch_c``.
 
 Optional features:
 * ``enable_collider=True`` — single AABB ``KinematicBoxCollider``-equivalent;
@@ -48,9 +52,10 @@ class TaichiMPMSolver:
     """Taichi MLS-MPM solver. API mirrors :class:`MPMSolver`."""
 
     # Material kind constants (used as ti.static keys in kernel branches).
-    MAT_NEO = 0
-    MAT_VM  = 1
-    MAT_DP  = 2
+    MAT_NEO     = 0
+    MAT_VM      = 1
+    MAT_DP      = 2
+    MAT_DAMAGED = 3
 
     def __init__(
         self,
@@ -69,9 +74,14 @@ class TaichiMPMSolver:
         material_kind: str = "neo",
         yield_stress: float = 1e4,
         friction_angle: float = 0.5236,   # 30 degrees
+        stretch_c: float = 1.25,
+        softening: float = 2.0,
         enable_collider: bool = False,
     ):
-        kind_map = {"neo": self.MAT_NEO, "vm": self.MAT_VM, "dp": self.MAT_DP}
+        kind_map = {
+            "neo": self.MAT_NEO, "vm": self.MAT_VM,
+            "dp": self.MAT_DP, "damaged": self.MAT_DAMAGED,
+        }
         if material_kind not in kind_map:
             raise ValueError(
                 f"material_kind must be one of {list(kind_map)}, "
@@ -83,6 +93,8 @@ class TaichiMPMSolver:
         # Drucker-Prager slope α = √(2/3) · 2 sinφ / (3 − sinφ)
         s = float(np.sin(friction_angle))
         self.dp_alpha = float(np.sqrt(2.0 / 3.0) * 2.0 * s / (3.0 - s))
+        self.stretch_c = float(stretch_c)
+        self.softening = float(softening)
         self.P = int(particles_x.shape[0])
         nx, ny, nz = grid_shape
         self.shape = (nx, ny, nz)
@@ -111,6 +123,7 @@ class TaichiMPMSolver:
         self.C_ = ti.Matrix.field(3, 3, dtype=ti.f32, shape=self.P)
         self.m_p = ti.field(dtype=ti.f32, shape=self.P)
         self.V0  = ti.field(dtype=ti.f32, shape=self.P)
+        self.d   = ti.field(dtype=ti.f32, shape=self.P)  # damage ∈ [0, 1]
 
         self.grid_m = ti.field(dtype=ti.f32, shape=self.shape)
         self.grid_v = ti.Vector.field(3, dtype=ti.f32, shape=self.shape)
@@ -124,6 +137,10 @@ class TaichiMPMSolver:
         self.coll_center = ti.Vector.field(3, dtype=ti.f32, shape=())
         self.coll_half   = ti.Vector.field(3, dtype=ti.f32, shape=())
         self.coll_vel    = ti.Vector.field(3, dtype=ti.f32, shape=())
+
+        # Grid-shape stub so ``solver.grid.shape`` works in demos that
+        # share diagnostics across backends.
+        self.grid = _TiGridView(self.shape)
 
         # ── Initialise from numpy ─────────────────────────────────────
         self.x.from_numpy(particles_x.astype(np.float32))
@@ -165,6 +182,12 @@ class TaichiMPMSolver:
             J  = Fp.determinant()
             tau = (self.mu * (Fp @ Fp.transpose() - ti.Matrix.identity(ti.f32, 3))
                    + self.lam * ti.log(J) * ti.Matrix.identity(ti.f32, 3))
+            # CD-MPM damage softening: τ ← (1-d)² · τ. Fully damaged
+            # particles (d=1) carry mass + momentum but contribute zero
+            # stress, which is what lets a blob fragment.
+            if ti.static(self._mat_id == self.MAT_DAMAGED):
+                fac = (1.0 - self.d[p]) ** 2
+                tau = fac * tau
 
             # APIC affine: A = m·C − dt · (4/dx²) · V₀ · τ
             affine = self.m_p[p] * self.C_[p] - dt * self.D_inv * self.V0[p] * tau
@@ -315,7 +338,22 @@ class TaichiMPMSolver:
                 self.F[p] = self._project_vm(F_trial)
             elif ti.static(self._mat_id == self.MAT_DP):
                 self.F[p] = self._project_dp(F_trial)
+            elif ti.static(self._mat_id == self.MAT_DAMAGED):
+                self.F[p] = F_trial
             self.x[p] = self.x[p] + dt * self.v[p]
+
+    @ti.kernel
+    def _update_damage(self):
+        """CD-MPM damage growth (monotonic). λ_max = max singular value of F;
+        ratio = max(λ_max / stretch_c, 1); d_trial = 1 − ratio^(-softening);
+        d ← min(max(d, d_trial), 1)."""
+        for p in range(self.P):
+            U, S, V = ti.svd(self.F[p], ti.f32)
+            lam_max = ti.max(S[0, 0], ti.max(S[1, 1], S[2, 2]))
+            ratio = ti.max(lam_max / self.stretch_c, 1.0)
+            d_trial = 1.0 - ti.pow(ratio, -self.softening)
+            d_new = ti.min(ti.max(self.d[p], d_trial), 1.0)
+            self.d[p] = d_new
 
     # ── public step ───────────────────────────────────────────────────
     def step(self, dt: ti.f32) -> None:
@@ -327,6 +365,8 @@ class TaichiMPMSolver:
             self._apply_collider()
         self._g2p()
         self._update_F_advect(dt32)
+        if self._mat_id == self.MAT_DAMAGED:
+            self._update_damage()
 
     def set_collider_pose(
         self,
@@ -402,10 +442,12 @@ class TaichiMPMSolver:
         elif cls_name == "DruckerPragerPlastic":
             kind = "dp"
             friction_angle = float(getattr(material, "friction_angle", 0.5236))
-        elif cls_name == "DamagedNeoHookean":
-            raise NotImplementedError(
-                "DamagedNeoHookean (CD-MPM) not yet supported by Taichi backend"
-            )
+        stretch_c = 1.25
+        softening = 2.0
+        if cls_name == "DamagedNeoHookean":
+            kind = "damaged"
+            stretch_c = float(getattr(material, "stretch_c", 1.25))
+            softening = float(getattr(material, "softening", 2.0))
         bc_lower = None
         bc_upper = None
         if bcs:
@@ -443,6 +485,8 @@ class TaichiMPMSolver:
             material_kind=kind,
             yield_stress=yield_stress,
             friction_angle=friction_angle,
+            stretch_c=stretch_c,
+            softening=softening,
             enable_collider=enable_collider,
         )
         if coll is not None:
@@ -475,6 +519,8 @@ class _TiParticleView:
     @property
     def C(self) -> np.ndarray: return self._sv.C_.to_numpy()
     @property
+    def d(self) -> np.ndarray: return self._sv.d.to_numpy()
+    @property
     def n(self) -> int: return int(self._sv.P)
 
 
@@ -486,3 +532,12 @@ class _TiMaterialView:
     def __init__(self, mu: float, lam: float) -> None:
         self.mu = mu
         self.lam = lam
+
+
+class _TiGridView:
+    """Grid-shape stub for cross-backend diagnostics (``solver.grid.shape``)."""
+
+    __slots__ = ("shape",)
+
+    def __init__(self, shape: tuple[int, int, int]) -> None:
+        self.shape = shape
