@@ -232,7 +232,8 @@ def _compute_finger_forces(bx, bv, arm_fk, robot):
 def run(mode: str = "rigid",
         material: str = "clay",
         headless: bool = False,
-        n_modes: int = 10) -> None:
+        n_modes: int = 10,
+        backend: str = "numpy") -> None:
     assert mode in ("rigid", "cb"), f"unknown mode: {mode}"
     dt       = 0.001
     substeps = 10
@@ -322,15 +323,25 @@ def run(mode: str = "rigid",
         half_extent=BOX_SIZE * 0.5,
         velocity=np.zeros(3),
     )
-    mpm_solver = MPMSolver(
-        particles=mpm_particles, grid=mpm_grid,
-        material=make_material(material),
-        gravity=np.array([0.0, 0.0, -9.81]),
-        bcs=[BoxBC(lower=DOMAIN_LOWER,
-                   upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
-                   mode="slip")],
-        colliders=[mpm_collider],
-    )
+    mpm_bcs = [BoxBC(lower=DOMAIN_LOWER,
+                     upper=np.array([DOMAIN_UPPER[0], DOMAIN_UPPER[1], 10.0]),
+                     mode="slip")]
+    if backend == "taichi":
+        from robosim.physics.mpm.taichi_solver import TaichiMPMSolver
+        mpm_solver = TaichiMPMSolver.from_numpy_setup(
+            particles=mpm_particles, grid=mpm_grid,
+            material=make_material(material),
+            gravity=(0.0, 0.0, -9.81), bcs=mpm_bcs,
+            colliders=[mpm_collider],
+        )
+    else:
+        mpm_solver = MPMSolver(
+            particles=mpm_particles, grid=mpm_grid,
+            material=make_material(material),
+            gravity=np.array([0.0, 0.0, -9.81]),
+            bcs=mpm_bcs,
+            colliders=[mpm_collider],
+        )
 
     # ── Phase + grip state ───────────────────────────────────────
     phase_idx     = 0
@@ -562,6 +573,12 @@ def run(mode: str = "rigid",
         mpm_collider.velocity = (new_center - mpm_collider.center) / dt
         mpm_collider.center = new_center
         mpm_collider.half_extent = new_half
+        if backend == "taichi":
+            mpm_solver.set_collider_pose(
+                center=new_center,
+                velocity=mpm_collider.velocity,
+                half_extent=new_half,
+            )
         try:
             mpm_solver.step(dt)
         except (IndexError, np.linalg.LinAlgError):
@@ -586,8 +603,8 @@ def run(mode: str = "rigid",
             fps.tick()
             if fr % 200 == 0:
                 com = _box_com()
-                z_top = float(mpm_particles.x[:, 2].max())
-                xy_ext = float(np.ptp(mpm_particles.x[:, :2], axis=0).mean())
+                z_top = float(mpm_solver.particles.x[:, 2].max())
+                xy_ext = float(np.ptp(mpm_solver.particles.x[:, :2], axis=0).mean())
                 ph = _PHASE_NAMES[min(phase_idx, len(_PHASE_NAMES) - 1)]
                 print(f"t={sim_time[0]:6.3f}s  phase={ph:<8}  "
                       f"box=({com[0]:+.3f},{com[1]:+.3f},{com[2]:+.3f})  "
@@ -620,9 +637,9 @@ def run(mode: str = "rigid",
                         color=BOX_COLOR, opacity=1.0)
 
     viewer.add_particles(
-        "mpm", mpm_particles.x, radius=0.008,
+        "mpm", mpm_solver.particles.x, radius=0.008,
         per_vertex_color=_height_colors(
-            mpm_particles.x[:, 2], PILE_SIZE[2] * 2.0,
+            mpm_solver.particles.x[:, 2], PILE_SIZE[2] * 2.0,
         ),
     )
 
@@ -652,16 +669,16 @@ def run(mode: str = "rigid",
                 pass
 
         viewer.update_particles(
-            "mpm", mpm_particles.x,
+            "mpm", mpm_solver.particles.x,
             per_vertex_color=_height_colors(
-                mpm_particles.x[:, 2], PILE_SIZE[2] * 2.0,
+                mpm_solver.particles.x[:, 2], PILE_SIZE[2] * 2.0,
             ),
         )
 
         ph = _PHASE_NAMES[min(phase_idx, len(_PHASE_NAMES) - 1)]
         com = _box_com()
-        z_top = float(mpm_particles.x[:, 2].max())
-        xy_ext = float(np.ptp(mpm_particles.x[:, :2], axis=0).mean())
+        z_top = float(mpm_solver.particles.x[:, 2].max())
+        xy_ext = float(np.ptp(mpm_solver.particles.x[:, :2], axis=0).mean())
         stress_line = (f"\nsigma_vm peak: {vm_max:.0f} Pa"
                        if mode == "cb" and vm_max > 0 else "")
         viewer.add_text(
@@ -689,14 +706,17 @@ def main() -> None:
     ap.add_argument("--n-modes", type=int, default=10,
                     help="CB normal modes to keep (cb mode only)")
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--backend", choices=["numpy", "taichi"], default="numpy",
+                    help="MPM backend: numpy (default) or taichi (arch=metal).")
     args = ap.parse_args()
 
-    if not args.headless:
+    if args.backend == "taichi" or not args.headless:
         import taichi as ti
         ti.init(arch=ti.metal)
 
     run(mode=args.mode, material=args.material,
-        headless=args.headless, n_modes=args.n_modes)
+        headless=args.headless, n_modes=args.n_modes,
+        backend=args.backend)
 
 
 if __name__ == "__main__":

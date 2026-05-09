@@ -10,9 +10,14 @@ Materials supported (selected via ``material_kind`` at construction):
 * ``"vm"``       — NeoHookean elasticity + Von-Mises J2 plasticity.
 * ``"dp"``       — NeoHookean elasticity + Drucker-Prager plasticity.
 
+Optional features:
+* ``enable_collider=True`` — single AABB ``KinematicBoxCollider``-equivalent;
+  pose updated each substep via :meth:`set_collider_pose`. Slip projection
+  per Stomakhin et al. 2013 (push outward only along nearest face normal).
+
 Out-of-scope for now (use NumPy :class:`MPMSolver` instead):
 * Damage models (CD-MPM ``DamagedNeoHookean``).
-* Kinematic colliders (``KinematicBoxCollider``).
+* Multiple simultaneous colliders.
 
 Activation: caller must call ``ti.init(arch=ti.metal)`` (or another arch)
 before instantiating. The class registers Taichi fields with the
@@ -64,6 +69,7 @@ class TaichiMPMSolver:
         material_kind: str = "neo",
         yield_stress: float = 1e4,
         friction_angle: float = 0.5236,   # 30 degrees
+        enable_collider: bool = False,
     ):
         kind_map = {"neo": self.MAT_NEO, "vm": self.MAT_VM, "dp": self.MAT_DP}
         if material_kind not in kind_map:
@@ -113,6 +119,11 @@ class TaichiMPMSolver:
         self.gravity = ti.Vector.field(3, dtype=ti.f32, shape=())
         self.bc_lo   = ti.Vector.field(3, dtype=ti.f32, shape=())
         self.bc_hi   = ti.Vector.field(3, dtype=ti.f32, shape=())
+
+        self._enable_collider = enable_collider
+        self.coll_center = ti.Vector.field(3, dtype=ti.f32, shape=())
+        self.coll_half   = ti.Vector.field(3, dtype=ti.f32, shape=())
+        self.coll_vel    = ti.Vector.field(3, dtype=ti.f32, shape=())
 
         # ── Initialise from numpy ─────────────────────────────────────
         self.x.from_numpy(particles_x.astype(np.float32))
@@ -186,6 +197,33 @@ class TaichiMPMSolver:
                 if pos[2] <= lo[2] and v[2] < 0.0: v[2] = 0.0
                 if pos[2] >= hi[2] and v[2] > 0.0: v[2] = 0.0
                 self.grid_v[I] = v
+
+    @ti.kernel
+    def _apply_collider(self):
+        """Stomakhin slip projection against an AABB box collider.
+        For each grid node inside the box, find the nearest face normal
+        and zero the inward component of (v_grid − v_box)."""
+        c   = self.coll_center[None]
+        h   = self.coll_half[None]
+        v_b = self.coll_vel[None]
+        for I in ti.grouped(self.grid_m):
+            if self.grid_m[I] > 0.0:
+                pos = self.origin[None] + ti.cast(I, ti.f32) * self.dx
+                d = pos - c
+                ad = ti.Vector([abs(d[0]), abs(d[1]), abs(d[2])])
+                if ad[0] <= h[0] and ad[1] <= h[1] and ad[2] <= h[2]:
+                    pen = h - ad
+                    # Pick axis with smallest penetration → nearest face.
+                    a = 0
+                    if pen[1] < pen[a]: a = 1
+                    if pen[2] < pen[a]: a = 2
+                    n = ti.Vector([0.0, 0.0, 0.0])
+                    sgn = 1.0 if d[a] >= 0.0 else -1.0
+                    n[a] = sgn
+                    v_rel = self.grid_v[I] - v_b
+                    v_n = v_rel.dot(n)
+                    if v_n < 0.0:
+                        self.grid_v[I] = self.grid_v[I] - v_n * n
 
     @ti.kernel
     def _g2p(self):
@@ -285,8 +323,26 @@ class TaichiMPMSolver:
         self._reset_grid()
         self._p2g_with_stress(dt32)
         self._normalise_grav_bc(dt32)
+        if self._enable_collider:
+            self._apply_collider()
         self._g2p()
         self._update_F_advect(dt32)
+
+    def set_collider_pose(
+        self,
+        center: Sequence[float],
+        velocity: Sequence[float],
+        half_extent: Optional[Sequence[float]] = None,
+    ) -> None:
+        """Update the kinematic AABB collider pose between substeps."""
+        if not self._enable_collider:
+            raise RuntimeError(
+                "set_collider_pose() requires enable_collider=True at construction"
+            )
+        self.coll_center.from_numpy(np.asarray(center, dtype=np.float32))
+        self.coll_vel.from_numpy(np.asarray(velocity, dtype=np.float32))
+        if half_extent is not None:
+            self.coll_half.from_numpy(np.asarray(half_extent, dtype=np.float32))
 
     # ── numpy bridges (read-only on hot path; copy out for diagnostics) ──
     def particles_x(self) -> np.ndarray:
@@ -321,12 +377,15 @@ class TaichiMPMSolver:
         material,
         gravity: Sequence[float] = (0.0, 0.0, -9.81),
         bcs: Optional[Sequence] = None,
+        colliders: Optional[Sequence] = None,
     ) -> "TaichiMPMSolver":
         """High-level constructor mirroring :class:`MPMSolver`.
 
         Caller must have called ``ti.init(arch=...)`` before this. Only the
-        first ``BoxBC`` in ``bcs`` is honoured (matches MVP scope);
-        colliders are not supported yet.
+        first ``BoxBC`` in ``bcs`` is honoured. If ``colliders`` contains a
+        single ``KinematicBoxCollider``, the Taichi collider is enabled and
+        seeded with its initial pose (update via
+        :meth:`set_collider_pose` between steps).
         """
         if not hasattr(material, "young"):
             raise TypeError(
@@ -353,7 +412,22 @@ class TaichiMPMSolver:
             bc = bcs[0]
             bc_lower = bc.lower
             bc_upper = bc.upper
-        return cls(
+        enable_collider = False
+        coll = None
+        if colliders:
+            if len(colliders) != 1:
+                raise NotImplementedError(
+                    f"TaichiMPMSolver supports at most 1 collider; "
+                    f"got {len(colliders)}"
+                )
+            coll = colliders[0]
+            if type(coll).__name__ != "KinematicBoxCollider":
+                raise NotImplementedError(
+                    f"TaichiMPMSolver only supports KinematicBoxCollider; "
+                    f"got {type(coll).__name__}"
+                )
+            enable_collider = True
+        sv = cls(
             particles_x=particles.x.copy(),
             particles_v=particles.v.copy(),
             particles_m=particles.m.copy(),
@@ -369,7 +443,15 @@ class TaichiMPMSolver:
             material_kind=kind,
             yield_stress=yield_stress,
             friction_angle=friction_angle,
+            enable_collider=enable_collider,
         )
+        if coll is not None:
+            sv.set_collider_pose(
+                center=coll.center,
+                velocity=coll.velocity,
+                half_extent=coll.half_extent,
+            )
+        return sv
 
 
 class _TiParticleView:
