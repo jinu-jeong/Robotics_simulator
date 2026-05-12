@@ -202,6 +202,44 @@ def rnea(
     return tau
 
 
+def _maybe_cpp_aba(robot, q, qd, tau, f_ext, gravity):
+    """Dispatch helper: returns qdd from C++ kernel, or None if not
+    available. Lazily builds + caches the C++ topology on the robot."""
+    if not getattr(robot, "_use_cpp_rbd", True):
+        return None
+    try:
+        from robosim.model._cpp_bridge import (
+            HAVE_CPP_RBD, build_rbd_topology, aba_via_cpp,
+        )
+    except ImportError:
+        return None
+    if not HAVE_CPP_RBD:
+        return None
+    if getattr(robot, "_cpp_rbd_topo", None) is None:
+        robot._cpp_rbd_topo = build_rbd_topology(robot)
+    if gravity is None:
+        gravity = robot.gravity
+    return aba_via_cpp(robot, robot._cpp_rbd_topo, q, qd, tau, gravity, f_ext)
+
+
+def _maybe_cpp_gravity_torques(robot, q, gravity):
+    if not getattr(robot, "_use_cpp_rbd", True):
+        return None
+    try:
+        from robosim.model._cpp_bridge import (
+            HAVE_CPP_RBD, build_rbd_topology, gravity_torques_via_cpp,
+        )
+    except ImportError:
+        return None
+    if not HAVE_CPP_RBD:
+        return None
+    if getattr(robot, "_cpp_rbd_topo", None) is None:
+        robot._cpp_rbd_topo = build_rbd_topology(robot)
+    if gravity is None:
+        gravity = robot.gravity
+    return gravity_torques_via_cpp(robot, robot._cpp_rbd_topo, q, gravity)
+
+
 def aba(
     robot: Robot,
     q: np.ndarray,
@@ -210,6 +248,10 @@ def aba(
     f_ext: dict[int, np.ndarray] | None = None,
     gravity: np.ndarray | None = None,
 ) -> np.ndarray:
+    # ── C++ dispatch ────────────────────────────────────────────────
+    qdd_cpp = _maybe_cpp_aba(robot, q, qd, tau, f_ext, gravity)
+    if qdd_cpp is not None:
+        return qdd_cpp
     """Articulated Body Algorithm — Forward Dynamics.
 
     Computes joint accelerations qdd given positions, velocities, torques.
@@ -438,5 +480,8 @@ def gravity_torques(
     gravity: np.ndarray | None = None,
 ) -> np.ndarray:
     """Compute gravity compensation torques: tau_g = RNEA(q, 0, 0)."""
+    tau_cpp = _maybe_cpp_gravity_torques(robot, q, gravity)
+    if tau_cpp is not None:
+        return tau_cpp
     n_dof = robot.n_dof
     return rnea(robot, q, np.zeros(n_dof), np.zeros(n_dof), gravity=gravity)

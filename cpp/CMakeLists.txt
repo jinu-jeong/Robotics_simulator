@@ -39,7 +39,9 @@ pybind11_add_module(_cpp MODULE
     bindings/module.cpp
     bindings/transform.cpp
     bindings/kinematics.cpp
+    bindings/rbd.cpp
     src/kinematics.cpp
+    src/rbd.cpp
 )
 
 target_include_directories(_cpp PRIVATE

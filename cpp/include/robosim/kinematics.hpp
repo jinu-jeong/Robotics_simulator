@@ -49,6 +49,29 @@ struct Topology {
     std::vector<int> root_links;
 };
 
+// Extension of Topology with the per-link spatial inertia + tree
+// traversal order needed by RBD (ABA, RNEA, gravity_torques).
+//
+// Built once from the Python Robot at first call; mutating the
+// model means rebuilding (same contract as the bare Topology).
+struct RbdTopology : public Topology {
+    // (n_links,) parent link index — -1 for roots.
+    std::vector<int> parent_link;
+    // (n_links,) joint index that has this link as its child — -1
+    // for roots (no inbound joint).
+    std::vector<int> joint_for_link;
+    // Tree order (BFS from each root, excluding root): the iteration
+    // order RBD's 3 passes follow. Reverse() of this is the backward
+    // pass.
+    std::vector<int> tree_order;
+    // (n_links,) 6×6 spatial inertia of each link's body in its own
+    // link frame. Row-major flatten so the bind code can hand us a
+    // numpy array with shape (n_links, 36) and avoid the per-row
+    // stride dance.
+    Eigen::Matrix<double, Eigen::Dynamic, 36, Eigen::RowMajor> link_inertias;
+};
+
+
 // Row-major dense buffers used for the per-link output. Row-major so
 // that ``R_out.row(l).data()`` is contiguous (length 9) and trivially
 // reshape-able to (3, 3) on the Python side.
