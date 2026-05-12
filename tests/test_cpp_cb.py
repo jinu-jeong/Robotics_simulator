@@ -130,18 +130,30 @@ def test_anchored_many_steps_parity(anchored_body, cpp):
 
 
 def test_free_one_step_parity(free_body, cpp):
+    """Free-body parity, *single step from rest*. The multi-step
+    free-body path is gated behind ``body._cpp_free_ok`` because the
+    Kabsch / centroid math accumulates a sign-convention noise that
+    can NaN under gravity over many steps — see commit notes."""
     body = free_body
     body.x = body.mesh.nodes.copy()
     body.v = np.zeros_like(body.mesh.nodes)
     x_save = body.x.copy(); v_save = body.v.copy()
 
+    # Need to explicitly enable both flags for the C++ path.
+    def _step_cpp():
+        from robosim.physics.fem.reduced import CraigBamptonSolver
+        sv = CraigBamptonSolver(bodies=[body])
+        sv.initialize(dt=5e-4)
+        body._use_cpp_cb = True
+        body._cpp_free_ok = True
+        body._cpp_cb_ready = False
+        sv.step(5e-4)
+        return body.x.copy(), body.v.copy()
+
     x_py, v_py = _checkpoint_then_step(body, None, 5e-4, use_cpp=False)
 
     body.x = x_save; body.v = v_save
-    x_cp, v_cp = _checkpoint_then_step(body, None, 5e-4, use_cpp=True)
+    x_cp, v_cp = _step_cpp()
 
-    # Free body has a Kabsch SVD whose sign convention can flip near
-    # the identity; we still hit float-precision agreement because at
-    # rest both paths produce R ≈ I.
     np.testing.assert_allclose(x_py, x_cp, atol=1e-10)
     np.testing.assert_allclose(v_py, v_cp, atol=1e-9)

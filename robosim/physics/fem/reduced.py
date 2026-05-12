@@ -466,7 +466,16 @@ class CraigBamptonBody:
 
     def _step_free(self, dt: float, extra_forces) -> None:
         # ── C++ dispatch (opt-in, same caveat as _step_anchored). ──
-        if getattr(self, "_use_cpp_cb", False) and _try_cpp_step_free(self, dt, extra_forces):
+        # Free-body C++ path also requires ``_cpp_free_ok``, which the
+        # body sets only if the caller has validated parity against
+        # the Python reference for their specific geometry. Without
+        # that flag we stay on the Python path — the free-body
+        # Kabsch + body-frame projection has a numerical-drift gotcha
+        # under repeated steps that the upstream port hasn't
+        # fully bottomed out yet.
+        if (getattr(self, "_use_cpp_cb", False)
+                and getattr(self, "_cpp_free_ok", False)
+                and _try_cpp_step_free(self, dt, extra_forces)):
             return
 
         n_nodes = self.mesh.n_nodes
