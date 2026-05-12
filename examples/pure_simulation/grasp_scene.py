@@ -42,8 +42,16 @@ NEAR_Q     = np.array([ 0.0, -0.370,  1.909, -1.539,  0.040, -0.040])
 # kinematic grip threshold (q[4] < 0.003) without overshooting.
 CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.011,  0.011])
 LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.011,  0.011])
+# RELEASE: same arm pose as the LIFT hold but fingers wide open (HOME
+# finger q = ±0.040). Crossing ``release_val=0.020`` snaps the kinematic
+# grip off and the box inherits the palm's velocity at that instant.
+RELEASE_Q  = np.array([ 0.0, -0.878,  2.080, -1.202,  0.040, -0.040])
 
 _LIFT_START_T = 1.5 + 1.2 + 2.5 + 1.5 + 1.5   # = 8.2 s
+# Trajectory totals: HOME+FOLD+APPROACH+NEAR+CLOSE+LIFT+RELEASE = 13.7 s.
+# After RELEASE the trajectory holds and physics runs free (box falls).
+_RELEASE_END_T = _LIFT_START_T + 3.0 + 0.5     # = 11.7 s
+_DROP_END_T    = _RELEASE_END_T + 2.5          # let the box settle
 
 # ── Physics mode → contact params ────────────────────────────────────────────
 _CONTACT_PARAMS = {
@@ -105,6 +113,10 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
         trigger_q=4,
         trigger_val=0.003,
         lift_start_t=_LIFT_START_T,
+        # Fingers must cross 20 mm back open before the grip drops; with
+        # the RELEASE trajectory target of 40 mm and a soft finger PD,
+        # this fires roughly midway through the RELEASE phase.
+        release_val=0.020,
     )
 
     # ── Trajectory ────────────────────────────────────────────────────────────
@@ -115,12 +127,15 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
     traj.phase("NEAR",     target=NEAR_Q,     duration=1.5)
     traj.phase("CLOSE",    target=CLOSE_Q,    duration=1.5)
     traj.phase("LIFT",     target=LIFT_Q,     duration=3.0)
+    # Open fingers — box drops onto the ground, bounces, settles.
+    traj.phase("RELEASE",  target=RELEASE_Q,  duration=0.5)
 
     # ── Run ───────────────────────────────────────────────────────────────────
     print(scene)
     scene.run(
         trajectories=traj,
-        duration=_LIFT_START_T + 3.2,
+        # Total run = lift_start + lift + release-ramp + free-fall settle.
+        duration=_DROP_END_T,
         viewer=not headless,
         headless=headless,
     )

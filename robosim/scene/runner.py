@@ -277,7 +277,8 @@ class SimRunner:
         through the body (the "fork through tofu" failure mode).
         """
         scene = self._scene
-        for body_name, q_lock in scene._grip_q_lock.items():
+        # iterate over a snapshot — we may clear entries below.
+        for body_name, q_lock in list(scene._grip_q_lock.items()):
             if not scene._grip_active.get(body_name, False):
                 continue
             state = scene._grip_state.get(body_name)
@@ -288,6 +289,24 @@ class SimRunner:
             if ctrl is None or getattr(ctrl, "target_q", None) is None:
                 continue
             trigger_q = state["trigger_q_idx"]
+
+            # Lock-as-floor semantics: never let the PD target go *below*
+            # the snapshot taken at grip activation. Two effects:
+            #   (a) During LIFT, the trajectory's negative finger target
+            #       can't drive the fingers further into the body — no
+            #       "fork through tofu" creep.
+            #   (b) During RELEASE, the trajectory's positive target
+            #       (opening the fingers) is *not* clamped — it overrides
+            #       the lock, the floor self-clears, and the fingers
+            #       actually open.
+            traj_target = float(ctrl.target_q[trigger_q])
+            if traj_target >= q_lock:
+                # Trajectory already commands a more-open finger ⇒ the
+                # floor is no longer doing anything. Drop it so the
+                # mimic-side override below also doesn't intercept.
+                scene._grip_q_lock.pop(body_name, None)
+                continue
+
             ctrl.target_q = ctrl.target_q.copy()
             ctrl.target_q[trigger_q] = q_lock
             model = rh._model
@@ -469,6 +488,7 @@ class SimRunner:
         lift_start_t = state["lift_start_t"]
         trigger_q    = state["trigger_q_idx"]  # joint index to check
         trigger_val  = state["trigger_q_val"]  # threshold
+        release_val  = state.get("release_val")
 
         fk       = robot_handle._model.forward_kinematics()
         palm_idx = robot_handle._model.link_index("palm_link")
@@ -477,6 +497,16 @@ class SimRunner:
 
         grip_active = self._scene._grip_active.get(bh.name, False)
         q_fing = robot_handle._model.q[trigger_q]
+
+        # Release path: fingers commanded back open ⇒ drop the kinematic
+        # lock and let the body inherit the palm's current velocity. The
+        # last per-step v assignment in the still-active branch below
+        # already mirrors palm linear+angular velocity, so v carries
+        # through correctly into the freely-falling next step.
+        if grip_active and release_val is not None and q_fing > release_val:
+            self._scene._grip_active[bh.name] = False
+            self._scene._grip_q_lock.pop(bh.name, None)
+            grip_active = False
 
         if not grip_active and self._time >= lift_start_t and q_fing < trigger_val:
             self._scene._grip_active[bh.name]    = True
@@ -530,15 +560,26 @@ class SimRunner:
         lift_start_t = state["lift_start_t"]
         trigger_q    = state["trigger_q_idx"]
         trigger_val  = state["trigger_q_val"]
+        release_val  = state.get("release_val")
 
         fk       = robot_handle._model.forward_kinematics()
         palm_idx = robot_handle._model.link_index("palm_link")
         palm_pos = fk[palm_idx].translation.copy()
 
         grip_active = self._scene._grip_active.get(bh.name, False)
+        q_fing = robot_handle._model.q[trigger_q]
+
+        # Release path: fingers re-open past release_val ⇒ release lock.
+        # The last per-step qd assignment (palm_vel) sticks on the box,
+        # so the box starts falling with the palm's linear velocity at
+        # the moment of release.
+        if grip_active and release_val is not None and q_fing > release_val:
+            self._scene._grip_active[bh.name] = False
+            self._scene._grip_q_lock.pop(bh.name, None)
+            grip_active = False
 
         if (not grip_active and self._time >= lift_start_t
-                and robot_handle._model.q[trigger_q] < trigger_val):
+                and q_fing < trigger_val):
             self._scene._grip_active[bh.name]    = True
             self._scene._grip_palm_pos0[bh.name] = palm_pos.copy()
             self._scene._grip_box_pos0[bh.name]  = bh._model.q[:3].copy()

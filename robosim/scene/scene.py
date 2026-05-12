@@ -400,6 +400,7 @@ class Scene:
         trigger_q:   int   = 4,
         trigger_val: float = 0.003,
         lift_start_t: float | None = None,
+        release_val: float | None = None,
     ) -> None:
         """Register a kinematic grip constraint.
 
@@ -414,6 +415,13 @@ class Scene:
         trigger_val  : threshold value (grip activates when q < trigger_val)
         lift_start_t : earliest simulation time grip can activate [s].
                        Defaults to the start of the last trajectory phase.
+        release_val  : optional opening threshold. When the grip is active
+                       and ``robot.q[trigger_q] > release_val``, the
+                       kinematic lock is released; the body inherits the
+                       palm's current linear + angular velocity at the
+                       release instant and falls under gravity from there.
+                       ``None`` (default) keeps the legacy "grip never
+                       releases" behaviour.
         """
         if self._contact_solver_kind == "constraint":
             import warnings
@@ -433,6 +441,7 @@ class Scene:
             "trigger_q_idx": trigger_q,
             "trigger_q_val": trigger_val,
             "lift_start_t":  lift_start_t,
+            "release_val":   release_val,
         }
 
     # ══════════════════════════════════════════════════════════════════════════
