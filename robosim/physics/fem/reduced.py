@@ -45,6 +45,93 @@ from scipy.linalg import lu_factor, lu_solve  # kept for fallback
 from robosim.physics.fem.mesh import TetMesh, FEMesh
 
 try:
+    from robosim import _cpp as _robosim_cpp
+    _HAVE_CPP_CB = hasattr(_robosim_cpp, "cb")
+except ImportError:
+    _robosim_cpp = None
+    _HAVE_CPP_CB = False
+
+
+def _cpp_cb_prepare(body) -> bool:
+    """Materialise C-contiguous float64 views of the precomputed CB
+    arrays on first use. Returns True if everything is ready (called
+    again after model rebuild → re-runs the prep)."""
+    if not _HAVE_CPP_CB:
+        return False
+    if getattr(body, "_cpp_cb_ready", False):
+        return True
+    if (body._Phi_CB is None or body._M_r is None
+            or body._A_r_inv is None or body._M_diag is None
+            or body.x is None):
+        return False
+    body._cpp_Phi_CB  = np.ascontiguousarray(body._Phi_CB,  dtype=np.float64)
+    body._cpp_M_r     = np.ascontiguousarray(body._M_r,     dtype=np.float64)
+    body._cpp_A_r_inv = np.ascontiguousarray(body._A_r_inv, dtype=np.float64)
+    body._cpp_M_diag  = np.ascontiguousarray(body._M_diag,  dtype=np.float64)
+    body._cpp_nodes   = np.ascontiguousarray(body.mesh.nodes, dtype=np.float64)
+    if body._anchored:
+        # C_q maps free DOFs → q_r. Stored on body.
+        body._cpp_C_q = np.ascontiguousarray(body._C_q, dtype=np.float64)
+        body._cpp_free_dofs  = np.ascontiguousarray(body._free_dofs,  dtype=np.int32)
+        body._cpp_fixed_dofs = np.ascontiguousarray(body._fixed_dofs, dtype=np.int32)
+    else:
+        body._cpp_x_ref_body = np.ascontiguousarray(body._x_ref_body, dtype=np.float64)
+    body._cpp_cb_ready = True
+    return True
+
+
+def _try_cpp_step_anchored(body, dt: float, extra_forces) -> bool:
+    """Run the C++ anchored step. Returns True on success."""
+    if not _cpp_cb_prepare(body):
+        return False
+    if not body._anchored:
+        return False
+    n_dof = body.mesh.n_nodes * 3
+    if extra_forces is not None and 0 in extra_forces:
+        f_ext = np.ascontiguousarray(extra_forces[0], dtype=np.float64).reshape(-1)
+    else:
+        f_ext = np.empty(0, dtype=np.float64)
+    grav = np.ascontiguousarray(body.gravity, dtype=np.float64).reshape(3)
+    x_in = np.ascontiguousarray(body.x, dtype=np.float64)
+    v_in = np.ascontiguousarray(body.v, dtype=np.float64)
+    x_new, v_new, q_r_new = _robosim_cpp.cb.step_anchored(
+        x_in, v_in, body._cpp_nodes,
+        body._cpp_Phi_CB, body._cpp_M_r, body._cpp_A_r_inv,
+        body._cpp_C_q, body._cpp_M_diag,
+        body._cpp_free_dofs, body._cpp_fixed_dofs,
+        grav, f_ext, float(dt), float(body.damping),
+    )
+    body.x = np.ascontiguousarray(x_new)
+    body.v = np.ascontiguousarray(v_new)
+    body.q_r = q_r_new
+    return True
+
+
+def _try_cpp_step_free(body, dt: float, extra_forces) -> bool:
+    """Run the C++ free-body step. Returns True on success."""
+    if not _cpp_cb_prepare(body):
+        return False
+    if body._anchored:
+        return False
+    if extra_forces is not None and 0 in extra_forces:
+        f_ext = np.ascontiguousarray(extra_forces[0], dtype=np.float64).reshape(-1)
+    else:
+        f_ext = np.empty(0, dtype=np.float64)
+    grav = np.ascontiguousarray(body.gravity, dtype=np.float64).reshape(3)
+    x_in = np.ascontiguousarray(body.x, dtype=np.float64)
+    v_in = np.ascontiguousarray(body.v, dtype=np.float64)
+    x_new, v_new, q_r_new = _robosim_cpp.cb.step_free(
+        x_in, v_in, body._cpp_x_ref_body,
+        body._cpp_Phi_CB, body._cpp_M_r, body._cpp_A_r_inv,
+        body._cpp_M_diag, grav, f_ext,
+        float(dt), float(body.damping), float(body._m_total),
+    )
+    body.x = np.ascontiguousarray(x_new)
+    body.v = np.ascontiguousarray(v_new)
+    body.q_r = q_r_new
+    return True
+
+try:
     from robosim.physics.fem.partition import nested_dissection_order
     _HAS_PYMETIS = True
 except ImportError:
@@ -378,6 +465,10 @@ class CraigBamptonBody:
     # ------------------------------------------------------------------
 
     def _step_free(self, dt: float, extra_forces) -> None:
+        # ── C++ dispatch (opt-in, same caveat as _step_anchored). ──
+        if getattr(self, "_use_cpp_cb", False) and _try_cpp_step_free(self, dt, extra_forces):
+            return
+
         n_nodes = self.mesh.n_nodes
         n_dof = n_nodes * 3
         dt2_inv = 1.0 / (dt * dt)
@@ -430,6 +521,18 @@ class CraigBamptonBody:
     # ------------------------------------------------------------------
 
     def _step_anchored(self, dt: float, extra_forces) -> None:
+        # ── C++ dispatch (opt-in: set ``body._use_cpp_cb = True``). ─
+        # CB matvecs are already BLAS so the speedup is modest
+        # (~1.4× on a 225 reduced-DOF anchored body) and the
+        # HybridCBPlasticBody REBUILD path mutates the precomputed
+        # basis at runtime without invalidating this body's C++
+        # cache — turning C++ dispatch on by default there can drift
+        # σ_eq slightly and confuse the state machine. Off by
+        # default; flip per-body via ``body._use_cpp_cb = True`` if
+        # you've checkpointed the basis or aren't using REBUILD.
+        if getattr(self, "_use_cpp_cb", False) and _try_cpp_step_anchored(self, dt, extra_forces):
+            return
+
         n_nodes = self.mesh.n_nodes
         n_dof = n_nodes * 3
         dt2_inv = 1.0 / (dt * dt)
