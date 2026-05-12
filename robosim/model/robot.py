@@ -235,6 +235,11 @@ class Robot:
         Cached against the current ``q``: subsequent calls without a
         configuration change reuse the result. Callers that mutate the
         returned Transforms should call :meth:`invalidate_fk_cache`.
+
+        Dispatch: if the C++ extension is available *and* the topology
+        was built (lazy on first call), the whole BFS runs inside one
+        ``robosim._cpp.kin.forward_kinematics`` call. Numerical result
+        is identical to the Python path within float64 round-off.
         """
         # Cache hit: q unchanged since last computation.  Fast path uses
         # ``ndarray.tobytes()`` equality which beats ``np.array_equal``
@@ -245,13 +250,29 @@ class Robot:
             if snap.shape == q.shape and (snap == q).all():
                 return self._fk_cache
 
+        # ── C++ dispatch ────────────────────────────────────────────────
+        if getattr(self, "_use_cpp_fk", True):
+            try:
+                from robosim.model._cpp_bridge import (
+                    HAVE_CPP, build_topology, forward_kinematics_via_cpp,
+                )
+            except ImportError:
+                HAVE_CPP = False
+            if HAVE_CPP:
+                if getattr(self, "_cpp_topo", None) is None:
+                    self._cpp_topo = build_topology(self)
+                T_world = forward_kinematics_via_cpp(self, self._cpp_topo)
+                self._fk_cache = T_world
+                self._fk_q_snapshot = (self._q.copy()
+                                       if self._q is not None else None)
+                return T_world
+
+        # ── Pure-Python fallback ───────────────────────────────────────
         T_world = [Transform.identity() for _ in range(self.n_links)]
 
-        # BFS from root
         from collections import deque
 
         queue = deque()
-        # Find root(s) — links with no parent
         for i in range(self.n_links):
             if self._parent[i] == -1:
                 T_world[i] = Transform.identity()

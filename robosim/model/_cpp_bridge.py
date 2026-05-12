@@ -1,0 +1,105 @@
+"""Bridge: build a :class:`robosim._cpp.kin.Topology` from a Python
+:class:`Robot` and dispatch :meth:`Robot.forward_kinematics` through it
+when the C++ extension is available.
+
+The C++ path is a *strict* drop-in for the pure-Python reference —
+same return shape (list of :class:`Transform`), same caching contract
+(invalidated by ``q`` change via the snapshot compare in
+:meth:`Robot.forward_kinematics`). Anything beyond FK still goes
+through Python.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from robosim.math.transforms import Transform
+from robosim.model.joint import JointType
+
+try:
+    from robosim import _cpp
+    HAVE_CPP = hasattr(_cpp, "kin")
+except ImportError:
+    _cpp = None
+    HAVE_CPP = False
+
+if TYPE_CHECKING:
+    from robosim.model.robot import Robot
+
+
+def _joint_kind(jt: JointType):
+    """Map our :class:`JointType` enum to the C++ ``JointKind``."""
+    if jt == JointType.FIXED:
+        return _cpp.kin.JointKind.FIXED
+    if jt in (JointType.REVOLUTE, JointType.CONTINUOUS):
+        return _cpp.kin.JointKind.REVOLUTE
+    if jt == JointType.PRISMATIC:
+        return _cpp.kin.JointKind.PRISMATIC
+    # Anything we don't know about (planar/floating/…): treat as fixed
+    # — Python FK would fail on these too in the joint_transform call,
+    # so the behaviour matches.
+    return _cpp.kin.JointKind.FIXED
+
+
+def build_topology(robot: "Robot"):
+    """Construct + return a :class:`Topology` mirroring the Robot.
+
+    Layout invariant the C++ FK relies on: joints are emitted in the
+    same order Python stores them, which (as built by ``Robot.build``)
+    already has parent links coming before children for any sane URDF.
+    The roots (no inbound joint) are seeded to identity inside the
+    C++ pass — no explicit traversal order is needed beyond
+    parent-before-child.
+    """
+    if not HAVE_CPP:
+        raise RuntimeError("robosim._cpp.kin not available")
+
+    topo = _cpp.kin.Topology()
+    topo.n_links = robot.n_links
+    topo.n_dof = robot.n_dof
+
+    js = []
+    for j_idx, joint in enumerate(robot.joints):
+        spec = _cpp.kin.JointSpec()
+        spec.parent_link = robot._link_name_to_idx[joint.parent_link]
+        spec.child_link = robot._link_name_to_idx[joint.child_link]
+        spec.kind = _joint_kind(joint.joint_type)
+        spec.dof_index = (robot._dof_index[j_idx]
+                          if joint.num_dof > 0 else -1)
+        # axis: store unit axis as float64 (3,)
+        axis = np.asarray(joint.axis, dtype=np.float64).reshape(3)
+        n2 = float(axis @ axis)
+        if n2 > 0 and abs(n2 - 1.0) > 1e-9:
+            axis = axis / np.sqrt(n2)
+        spec.axis = axis
+        spec.origin_R = np.ascontiguousarray(joint.origin.rotation,
+                                             dtype=np.float64)
+        spec.origin_t = np.ascontiguousarray(joint.origin.translation,
+                                             dtype=np.float64)
+        js.append(spec)
+
+    topo.joints = js
+
+    # Roots: every link that isn't pointed at by any joint.child_link.
+    parents = set(robot._link_name_to_idx[j.child_link] for j in robot.joints)
+    topo.root_links = [i for i in range(robot.n_links) if i not in parents]
+
+    return topo
+
+
+def forward_kinematics_via_cpp(robot: "Robot", topo) -> list[Transform]:
+    """Run the C++ FK kernel and wrap the (R, t) pair per link back
+    into Python :class:`Transform` objects."""
+    q = np.ascontiguousarray(robot.q, dtype=np.float64)
+    R_flat, t_arr = _cpp.kin.forward_kinematics(topo, q)
+    # R_flat: (n_links, 9) row-major flatten of each 3×3
+    # t_arr:  (n_links, 3)
+    out: list[Transform] = []
+    for l in range(robot.n_links):
+        R = R_flat[l].reshape(3, 3)
+        # Cheap path: skip Transform.__post_init__ validation.
+        out.append(Transform._fast(np.ascontiguousarray(R),
+                                   np.ascontiguousarray(t_arr[l])))
+    return out

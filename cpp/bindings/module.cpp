@@ -18,6 +18,7 @@ namespace py = pybind11;
 
 namespace robosim {
 void register_transform(py::module_& m);   // bindings/transform.cpp
+void register_kinematics(py::module_& m);  // bindings/kinematics.cpp
 }
 
 namespace robosim_cpp {
@@ -36,7 +37,7 @@ PYBIND11_MODULE(_cpp, m) {
               "Python-side entry points stay 1:1 with the pure-Python "
               "reference so tests can run on either backend.";
 
-    m.attr("__stage__") = 1;
+    m.attr("__stage__") = 2;
     m.def("add", &robosim_cpp::add,
           "Stage-0 smoke test: scalar addition.",
           py::arg("a"), py::arg("b"));
@@ -45,4 +46,5 @@ PYBIND11_MODULE(_cpp, m) {
           py::arg("x"));
 
     robosim::register_transform(m);
+    robosim::register_kinematics(m);
 }
