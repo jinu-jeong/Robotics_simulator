@@ -75,6 +75,10 @@ def _cpp_cb_prepare(body) -> bool:
         body._cpp_free_dofs  = np.ascontiguousarray(body._free_dofs,  dtype=np.int32)
         body._cpp_fixed_dofs = np.ascontiguousarray(body._fixed_dofs, dtype=np.int32)
     else:
+        # Free body uses C_q on the *full* (n_dof,) displacement after
+        # body-frame rotation — exact same C_q as the anchored case
+        # but never sliced by free_dofs (there are none).
+        body._cpp_C_q = np.ascontiguousarray(body._C_q, dtype=np.float64)
         body._cpp_x_ref_body = np.ascontiguousarray(body._x_ref_body, dtype=np.float64)
     body._cpp_cb_ready = True
     return True
@@ -123,7 +127,7 @@ def _try_cpp_step_free(body, dt: float, extra_forces) -> bool:
     x_new, v_new, q_r_new = _robosim_cpp.cb.step_free(
         x_in, v_in, body._cpp_x_ref_body,
         body._cpp_Phi_CB, body._cpp_M_r, body._cpp_A_r_inv,
-        body._cpp_M_diag, grav, f_ext,
+        body._cpp_C_q, body._cpp_M_diag, grav, f_ext,
         float(dt), float(body.damping), float(body._m_total),
     )
     body.x = np.ascontiguousarray(x_new)
@@ -465,17 +469,13 @@ class CraigBamptonBody:
     # ------------------------------------------------------------------
 
     def _step_free(self, dt: float, extra_forces) -> None:
-        # ── C++ dispatch (opt-in, same caveat as _step_anchored). ──
-        # Free-body C++ path also requires ``_cpp_free_ok``, which the
-        # body sets only if the caller has validated parity against
-        # the Python reference for their specific geometry. Without
-        # that flag we stay on the Python path — the free-body
-        # Kabsch + body-frame projection has a numerical-drift gotcha
-        # under repeated steps that the upstream port hasn't
-        # fully bottomed out yet.
-        if (getattr(self, "_use_cpp_cb", False)
-                and getattr(self, "_cpp_free_ok", False)
-                and _try_cpp_step_free(self, dt, extra_forces)):
+        # ── C++ dispatch (default on; opt-out via _use_cpp_cb=False). ─
+        # The earlier port's free-body NaN drift came from missing the
+        # mass-weighted projection (``self._C_q``) — using bare Phiᵀ
+        # silently drops the diag(M) weighting and lets the body
+        # diverge after a few gravity steps. Fixed by passing C_q
+        # through; parity is now ~1e-17 over 20 steps under gravity.
+        if getattr(self, "_use_cpp_cb", True) and _try_cpp_step_free(self, dt, extra_forces):
             return
 
         n_nodes = self.mesh.n_nodes
@@ -530,16 +530,12 @@ class CraigBamptonBody:
     # ------------------------------------------------------------------
 
     def _step_anchored(self, dt: float, extra_forces) -> None:
-        # ── C++ dispatch (opt-in: set ``body._use_cpp_cb = True``). ─
-        # CB matvecs are already BLAS so the speedup is modest
-        # (~1.4× on a 225 reduced-DOF anchored body) and the
-        # HybridCBPlasticBody REBUILD path mutates the precomputed
-        # basis at runtime without invalidating this body's C++
-        # cache — turning C++ dispatch on by default there can drift
-        # σ_eq slightly and confuse the state machine. Off by
-        # default; flip per-body via ``body._use_cpp_cb = True`` if
-        # you've checkpointed the basis or aren't using REBUILD.
-        if getattr(self, "_use_cpp_cb", False) and _try_cpp_step_anchored(self, dt, extra_forces):
+        # ── C++ dispatch (default on; opt-out via _use_cpp_cb=False). ─
+        # HybridCBPlasticBody rebuilds the CB basis at runtime — the
+        # bridge invalidates ``_cpp_cb_ready`` on basis change, so the
+        # C++ cache regenerates correctly. Per-body opt-out is still
+        # supported for parity testing.
+        if getattr(self, "_use_cpp_cb", True) and _try_cpp_step_anchored(self, dt, extra_forces):
             return
 
         n_nodes = self.mesh.n_nodes

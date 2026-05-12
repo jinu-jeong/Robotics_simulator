@@ -151,6 +151,7 @@ cb_step_free(const Eigen::Ref<const MatXRM>& x,
              const Eigen::Ref<const MatXRM>& Phi_CB,
              const Eigen::Ref<const MatXRM>& M_r,
              const Eigen::Ref<const MatXRM>& A_r_inv,
+             const Eigen::Ref<const MatXRM>& C_q,
              const Eigen::Ref<const Eigen::VectorXd>& M_diag,
              const Eigen::Ref<const Eigen::Vector3d>& gravity,
              const Eigen::Ref<const Eigen::VectorXd>& extra_force_flat,
@@ -174,25 +175,21 @@ cb_step_free(const Eigen::Ref<const MatXRM>& x,
     MatXRM u_body(n_nodes, 3);
     u_body.noalias() = x_centered * R - x_ref_body;
 
-    // q_r = Phi_CB^T · M_diag · u_body  (the C_q-style projection;
-    // matches the Python ref's Phi_CB^T @ u_body since C_q here just
-    // projects via the basis without extra mass weighting).
-    // Actually the Python ref does ``self._C_q @ u_body.reshape(-1)``
-    // for free body too — but C_q was originally defined for the
-    // anchored case where it operates on free DOFs. For free body
-    // it's used on the full (n_dof,) displacement after rotation.
-    // We replicate that: q_r = Phi_CB^T · u_body_flat.
+    // Mass-weighted reduction (matches Python ``self._C_q @ u_body``
+    // — C_q absorbs M_r⁻¹·Phiᵀ·diag(M_diag)). Earlier ports used
+    // bare Phiᵀ here which silently dropped the mass weighting; the
+    // integration then diverged after a few steps under gravity.
     Eigen::Map<const Eigen::VectorXd> u_body_flat(u_body.data(), n_dof);
-    Eigen::VectorXd q_r = Phi_CB.transpose() * u_body_flat;
+    Eigen::VectorXd q_r = C_q * u_body_flat;
 
-    // q_r_dot from rotated velocity
+    // q_r_dot from rotated velocity (same C_q projection).
     const Eigen::Vector3d t_dot = v.colwise().mean();
     MatXRM v_body(n_nodes, 3);
     for (int i = 0; i < n_nodes; ++i)
         v_body.row(i) = v.row(i) - t_dot.transpose();
     v_body = v_body * R;
     Eigen::Map<const Eigen::VectorXd> v_body_flat(v_body.data(), n_dof);
-    Eigen::VectorXd q_r_dot = Phi_CB.transpose() * v_body_flat;
+    Eigen::VectorXd q_r_dot = C_q * v_body_flat;
 
     // External force (world frame) → body frame via R
     Eigen::VectorXd f_ext = build_gravity_force(M_diag, gravity, extra_force_flat);

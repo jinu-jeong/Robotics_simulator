@@ -50,17 +50,18 @@ void register_cb(py::module_& m) {
              const Eigen::Ref<const MatXRM>& Phi_CB,
              const Eigen::Ref<const MatXRM>& M_r,
              const Eigen::Ref<const MatXRM>& A_r_inv,
+             const Eigen::Ref<const MatXRM>& C_q,
              const Eigen::Ref<const Eigen::VectorXd>& M_diag,
              const Eigen::Ref<const Eigen::Vector3d>& gravity,
              const Eigen::Ref<const Eigen::VectorXd>& extra_force_flat,
              double dt, double damping, double m_total) {
               return cb_step_free(x, v, x_ref_body, Phi_CB, M_r, A_r_inv,
-                                   M_diag, gravity, extra_force_flat,
+                                   C_q, M_diag, gravity, extra_force_flat,
                                    dt, damping, m_total);
           },
           py::arg("x"), py::arg("v"), py::arg("x_ref_body"),
           py::arg("Phi_CB"), py::arg("M_r"), py::arg("A_r_inv"),
-          py::arg("M_diag"), py::arg("gravity"),
+          py::arg("C_q"), py::arg("M_diag"), py::arg("gravity"),
           py::arg("extra_force_flat"),
           py::arg("dt"), py::arg("damping"), py::arg("m_total"),
           "Free-floating CB step (Kabsch rotation + centroid). "

@@ -63,6 +63,10 @@ cb_step_anchored(const Eigen::Ref<const MatXRM>& x,
 // centroid bookkeeping). Mirrors ``CraigBamptonBody._step_free``.
 //
 //   x_ref_body : (n_nodes, 3)  body-frame reference (mesh.nodes − t_ref)
+//   C_q        : (n_r, n_dof)  mass-weighted projection
+//                M_r⁻¹ · Phiᵀ · diag(M_diag). Required for q_r — using
+//                ``Phiᵀ`` instead drops the mass weighting and the
+//                free-body integration diverges over a few steps.
 //   m_total    : total mass for the centroid integrator
 std::tuple<MatXRM, MatXRM, Eigen::VectorXd>
 cb_step_free(const Eigen::Ref<const MatXRM>& x,
@@ -71,6 +75,7 @@ cb_step_free(const Eigen::Ref<const MatXRM>& x,
              const Eigen::Ref<const MatXRM>& Phi_CB,
              const Eigen::Ref<const MatXRM>& M_r,
              const Eigen::Ref<const MatXRM>& A_r_inv,
+             const Eigen::Ref<const MatXRM>& C_q,
              const Eigen::Ref<const Eigen::VectorXd>& M_diag,
              const Eigen::Ref<const Eigen::Vector3d>& gravity,
              const Eigen::Ref<const Eigen::VectorXd>& extra_force_flat,
