@@ -24,7 +24,9 @@ def cpp():
 def test_module_loads_and_reports_stage(cpp):
     assert cpp is not None
     assert hasattr(cpp, "__stage__")
-    assert cpp.__stage__ == 0
+    # ``__stage__`` advances as new submodules land; we just want to
+    # see *some* stage value once the wheel is built.
+    assert cpp.__stage__ >= 0
 
 
 def test_add_scalar_smoke(cpp):

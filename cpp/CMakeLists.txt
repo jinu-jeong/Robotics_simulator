@@ -37,6 +37,7 @@ message(STATUS "Eigen3 ${Eigen3_VERSION}: ${EIGEN3_INCLUDE_DIRS}")
 # ── Extension target ───────────────────────────────────────────────────────
 pybind11_add_module(_cpp MODULE
     bindings/module.cpp
+    bindings/transform.cpp
 )
 
 target_include_directories(_cpp PRIVATE
