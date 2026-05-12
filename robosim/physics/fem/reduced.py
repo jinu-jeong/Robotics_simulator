@@ -44,12 +44,24 @@ from scipy.linalg import lu_factor, lu_solve  # kept for fallback
 
 from robosim.physics.fem.mesh import TetMesh, FEMesh
 
-try:
-    from robosim import _cpp as _robosim_cpp
-    _HAVE_CPP_CB = hasattr(_robosim_cpp, "cb")
-except ImportError:
-    _robosim_cpp = None
-    _HAVE_CPP_CB = False
+def _load_cpp_for_cb():
+    """Same auto-build probe as the RBD bridge, but for the ``cb``
+    submodule. Triggered at module load so the dispatch check in
+    ``_step_anchored`` / ``_step_free`` is a simple attribute read."""
+    try:
+        from robosim import _cpp as _rc
+    except ImportError:
+        from robosim._build_helper import ensure_cpp_built
+        if not ensure_cpp_built(verbose=True):
+            return None, False
+        try:
+            from robosim import _cpp as _rc
+        except ImportError:
+            return None, False
+    return _rc, hasattr(_rc, "cb")
+
+
+_robosim_cpp, _HAVE_CPP_CB = _load_cpp_for_cb()
 
 
 def _cpp_cb_prepare(body) -> bool:

@@ -18,14 +18,25 @@ import numpy as np
 from robosim.math.transforms import Transform
 from robosim.model.joint import JointType
 
-try:
-    from robosim import _cpp
-    HAVE_CPP = hasattr(_cpp, "kin")
-    HAVE_CPP_RBD = hasattr(_cpp, "rbd")
-except ImportError:
-    _cpp = None
-    HAVE_CPP = False
-    HAVE_CPP_RBD = False
+def _import_cpp_with_autobuild():
+    """Probe ``robosim._cpp``; on first failure trigger the one-shot
+    in-place build via :func:`robosim.ensure_cpp_built`. Subsequent
+    calls are cheap (the helper caches its result)."""
+    try:
+        from robosim import _cpp
+        return _cpp, True
+    except ImportError:
+        pass
+    from robosim._build_helper import ensure_cpp_built
+    if ensure_cpp_built(verbose=True):
+        from robosim import _cpp
+        return _cpp, True
+    return None, False
+
+
+_cpp, _CPP_LOADED = _import_cpp_with_autobuild()
+HAVE_CPP = _CPP_LOADED and hasattr(_cpp, "kin")
+HAVE_CPP_RBD = _CPP_LOADED and hasattr(_cpp, "rbd")
 
 if TYPE_CHECKING:
     from robosim.model.robot import Robot

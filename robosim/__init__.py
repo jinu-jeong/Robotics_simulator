@@ -2,6 +2,8 @@
 
 __version__ = "0.1.0"
 
+from robosim._build_helper import ensure_cpp_built  # noqa: F401
+
 # ── Scene API (high-level) ────────────────────────────────────────────────────
 from robosim.scene.scene   import Scene
 from robosim.scene.objects import (
