@@ -1,6 +1,9 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.12",
+]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "robosim"
@@ -27,8 +30,38 @@ rl = [
     "gymnasium>=1.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["robosim*"]
+# ── scikit-build-core: drive CMake from ./cpp/ ────────────────────────────────
+# The C++ extension lives in ``cpp/`` and installs its ``_cpp`` shared
+# object into the ``robosim`` package (so ``from robosim import _cpp``
+# works). All pure-Python modules under ``robosim/`` are still picked
+# up via the wheel layout — no setuptools migration needed.
+
+[tool.scikit-build]
+cmake.source-dir = "cpp"
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["robosim"]
+wheel.exclude = [
+    "examples/**",
+    "tests/**",
+    "paper/**",
+    "research/**",
+    "runs/**",
+    "**/__pycache__",
+]
+sdist.exclude = [
+    "research/**",
+    "runs/**",
+    "imgui.ini",
+    "**/__pycache__",
+]
+# Editable installs DON'T auto-rebuild on ``import`` — that triggers a
+# ``cmake`` shell-out per process start which fails when PATH doesn't
+# include the conda env's CMake (common: launching from a bare shell,
+# IDE, or via ``-m pip``). After changing any C++ source, rerun
+# ``PATH=$CONDA_PREFIX/bin:$PATH pip install -e . --no-build-isolation``
+# (~3 s incremental).
+editable.rebuild = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
