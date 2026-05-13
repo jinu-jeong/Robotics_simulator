@@ -89,6 +89,7 @@ class SimRunner:
     """
 
     def __init__(self, scene: "Scene", dt: float = 0.001, substeps: int = 10):
+        import os
         from robosim.util.fps import FPSCounter
         self._scene     = scene
         self._dt        = dt
@@ -99,6 +100,12 @@ class SimRunner:
         # update). Accessible from user on_step callbacks via
         # scene._runner._fps for custom display.
         self._fps       = FPSCounter(smoothing=20)
+
+        # Stage-9 fast path: substep-level orchestration in C++. Built
+        # lazily on first run() and only when the scene is purely rigid
+        # (no FEM/CB/MPM bodies). Disable with ``ROBOSIM_NO_FAST_RIGID=1``.
+        self._fast_bundle: dict | None = None
+        self._fast_path_enabled = not os.environ.get("ROBOSIM_NO_FAST_RIGID")
 
     # ── public entry point ────────────────────────────────────────────────────
 
@@ -140,6 +147,22 @@ class SimRunner:
         if headless:
             self._print_banner()
 
+        # ── Try the Stage-9 fast path. Built once on first run() ──
+        if self._fast_path_enabled and self._fast_bundle is None:
+            from robosim.scene._fast_path import (
+                is_rigid_only, build_scene_step, _have_cpp_scene_step,
+            )
+            if _have_cpp_scene_step() and is_rigid_only(self._scene):
+                try:
+                    self._fast_bundle = build_scene_step(self._scene)
+                except Exception:
+                    # Not all rigid scenes are fast-path-eligible (mesh
+                    # geometry, exotic joint types, etc.). Fall back to
+                    # the Python orchestrator without complaining.
+                    self._fast_bundle = None
+
+        use_fast = self._fast_bundle is not None
+
         t_wall0     = time.time()
         total_steps = int(duration / dt) + self._substeps
 
@@ -160,13 +183,21 @@ class SimRunner:
                 #  finger drives through the kinematically-locked body).
                 self._apply_grip_locks()
 
-                # ── step all robots (applies CACHED contact reactions before stepping) ──
-                for rh in self._scene._robot_handles.values():
-                    self._step_robot(rh, dt)
+                if use_fast:
+                    # Stage-9 fast path: one C++ call advances FK + vel +
+                    # contact + ABA + integrate for every registered
+                    # rigid participant. Falls back to the Python path
+                    # for ground-hold / kinematic grip / mimic, which
+                    # still need per-substep granularity.
+                    self._fast_substep(dt)
+                else:
+                    # ── step all robots (applies CACHED contact reactions before stepping) ──
+                    for rh in self._scene._robot_handles.values():
+                        self._step_robot(rh, dt)
 
-                # ── step all bodies (computes NEW contact reactions, caches for next tick) ──
-                for bh in self._scene._body_handles.values():
-                    self._step_body(bh, dt)
+                    # ── step all bodies (computes NEW contact reactions, caches for next tick) ──
+                    for bh in self._scene._body_handles.values():
+                        self._step_body(bh, dt)
 
                 # NOTE: ConstraintContactSolver also exposes
                 # project_free_body_penetrations() for non-grasp scenarios
@@ -316,6 +347,38 @@ class SimRunner:
                     if model._dof_index[l_idx] == trigger_q:
                         f_dof = model._dof_index[f_idx]
                         ctrl.target_q[f_dof] = mult * q_lock + off
+
+    def _fast_substep(self, dt: float) -> None:
+        """Stage-9 fast substep — delegate FK/vel/contact/ABA/integrate
+        to the C++ ``RigidSceneStep``, then run the Python-side
+        bookkeeping (mimic enforcement, ground-hold suppression,
+        kinematic grip) that still needs per-substep granularity.
+        """
+        from robosim.scene._fast_path import fast_substep
+        from robosim.scene.handles import RigidBodyHandle
+
+        fast_substep(self._scene, self._fast_bundle, dt, self._time,
+                     n_substeps=1)
+
+        # Enforce mimic joints (gripper finger coupling).
+        for rh in self._scene._robot_handles.values():
+            if hasattr(rh._model, "enforce_mimic"):
+                rh._model.enforce_mimic()
+
+        # Body-side bookkeeping: ground-hold suppression + kinematic grip.
+        for bh in self._scene._body_handles.values():
+            if not isinstance(bh, RigidBodyHandle):
+                continue
+            # Ground-hold (mirror of _step_body's RigidBodyHandle branch).
+            if not self._scene._grip_active.get(bh.name, False):
+                half_z = bh._model.links[-1].collisions[0].geometry.size[2] / 2.0
+                if bh._model.q[2] < half_z * 1.2:
+                    bh._model.q[:2]  = self._scene._body_ground_xy[bh.name]
+                    bh._model.qd[:2] = 0.0
+                    bh._model.q[3:6] = 0.0
+                    bh._model.qd[3:6] = 0.0
+            # Kinematic grip update.
+            self._update_grip_rigid(bh, dt)
 
     def _step_robot(self, rh: "RobotHandle", dt: float) -> None:
         rh._solver.clear_external_forces()

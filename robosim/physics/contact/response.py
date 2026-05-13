@@ -22,7 +22,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from robosim.physics.contact.sdf import ContactPoint
+from robosim.physics.contact.sdf import (
+    ContactPoint, _USE_CPP_CONTACT, _cpp_mod,
+)
 
 
 @dataclass
@@ -76,6 +78,26 @@ def compute_contact_force(
     """
     if contact.penetration <= 0:
         return None
+
+    # Fast path: penalty + kinetic Coulomb in C++. Stick-slip stays in
+    # Python (small fraction of calls; needs dt + effective_mass logic).
+    if _USE_CPP_CONTACT and friction_model == "kinetic":
+        em = effective_mass if effective_mass is not None else -1.0
+        out = _cpp_mod.contact.contact_force_penalty(
+            contact.normal, velocity_a, velocity_b,
+            float(contact.penetration),
+            float(params.stiffness), float(params.damping),
+            float(params.friction_mu), float(params.friction_eps),
+            float(params.max_penetration),
+            float(em),
+        )
+        if out.shape[0] == 0:
+            return None
+        return ContactForce(
+            point=contact.point_a.copy(),
+            force=np.ascontiguousarray(out[0:3]),
+            normal_force=float(out[3]),
+        )
 
     n = contact.normal  # from B → A
     v_rel = velocity_a - velocity_b

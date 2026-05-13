@@ -93,4 +93,42 @@ void forward_kinematics(const Topology& topo,
                         Eigen::Ref<MatRMXd> R_out,
                         Eigen::Ref<MatRMXd> t_out);
 
+// Per-link world-frame spatial velocity (ω, v_origin).
+//
+// Uses an :class:`RbdTopology` for the per-link parent + joint-for-link
+// tables plus `tree_order`. Mirrors
+// ``robosim/model/robot.py::link_world_velocities`` exactly:
+//   v_c = v_p + ω_p × (origin_c − origin_p)
+//   ω_c = ω_p (+ qd · axis_world for revolute)
+//   v_c += qd · axis_world for prismatic
+//
+// Inputs:
+//   topo    : built RbdTopology
+//   qd      : (n_dof,)
+//   R_flat  : (n_links, 9) row-major flatten of FK rotations
+//   t_arr   : (n_links, 3) FK translations
+// Outputs (row-major, pre-sized):
+//   omega_out : (n_links, 3)
+//   v_out     : (n_links, 3)
+void link_world_velocities(const RbdTopology& topo,
+                           const Eigen::Ref<const Eigen::VectorXd>& qd,
+                           const Eigen::Ref<const MatRMXd>& R_flat,
+                           const Eigen::Ref<const MatRMXd>& t_arr,
+                           Eigen::Ref<MatRMXd> omega_out,
+                           Eigen::Ref<MatRMXd> v_out);
+
+// Batched: world-frame velocity of N body-fixed points.
+//   v[i] = v_origin[link_i] + omega[link_i] × (point_i − origin_link_i)
+// link_indices : (N,)  int32
+// points       : (N, 3)
+// omega/v_arr  : (n_links, 3) from link_world_velocities
+// t_arr        : (n_links, 3) from FK
+// Returns      : (N, 3) point velocities
+Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>
+batch_point_velocities(const Eigen::Ref<const Eigen::VectorXi>& link_indices,
+                       const Eigen::Ref<const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>>& points,
+                       const Eigen::Ref<const MatRMXd>& omega_arr,
+                       const Eigen::Ref<const MatRMXd>& v_origin_arr,
+                       const Eigen::Ref<const MatRMXd>& t_arr);
+
 }  // namespace robosim

@@ -12,11 +12,90 @@ Newton step:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+
+try:
+    from robosim import _cpp as _cpp_mod
+    _HAVE_CPP_FEM = hasattr(_cpp_mod, "fem")
+except ImportError:
+    _cpp_mod = None
+    _HAVE_CPP_FEM = False
+
+_USE_CPP_FEM = _HAVE_CPP_FEM and not os.environ.get("ROBOSIM_NO_CPP_FEM")
+
+
+def _cached_or_spsolve(A, b, factor_cache, x_warm=None):
+    """Solve A x = b via the supplied cached solver. Dispatches to:
+
+    * :class:`SparseCG`        — CG + diagonal precond + warm start
+    * :class:`SparseSPDFactor` — direct LDLT with pattern reuse
+
+    Either falls back to ``scipy.spsolve`` on error / cache miss.
+
+    The CG path expects ``x_warm`` from the previous solve (typically
+    the last Newton-iter ``dx``); empty/None warm guesses fall back
+    to zero.
+    """
+    if factor_cache is None or not _USE_CPP_FEM:
+        return _spsolve(A, b)
+    A_csr = A.tocsr() if not sp.isspmatrix_csr(A) else A
+    n = A_csr.shape[0]
+    indptr  = A_csr.indptr.astype(np.int32)
+    indices = A_csr.indices.astype(np.int32)
+    data    = A_csr.data.astype(np.float64)
+    sig = (n, int(indptr[-1]))
+    cached_sig = getattr(factor_cache, "_robosim_sig", None)
+    is_cg = type(factor_cache).__name__ == "SparseCG"
+    if not factor_cache.ready() or cached_sig != sig:
+        factor_cache.analyze(indptr, indices, data, int(n))
+        factor_cache._robosim_sig = sig
+    try:
+        if is_cg:
+            warm = (x_warm if x_warm is not None and x_warm.size == n
+                    else np.zeros(n))
+            x, iters, ok = factor_cache.solve(
+                data, np.ascontiguousarray(b, dtype=np.float64),
+                np.ascontiguousarray(warm, dtype=np.float64),
+                1e-8, 200,
+            )
+            if ok:
+                return x
+            # Non-converged — bail to scipy direct.
+            return _spsolve(A, b)
+        factor_cache.factorize(data)
+        return factor_cache.solve(np.ascontiguousarray(b, dtype=np.float64))
+    except Exception:
+        factor_cache._robosim_sig = None
+        return _spsolve(A, b)
+
+
+def _spsolve(A, b):
+    """Dispatch sparse solve to C++ SimplicialLDLT when available.
+
+    Falls back to ``scipy.sparse.linalg.spsolve`` (SuperLU) on shape
+    or factorisation issues. Mirrors the public spsolve signature
+    so call sites stay unchanged.
+    """
+    if _USE_CPP_FEM:
+        try:
+            A_csr = A.tocsr() if not sp.isspmatrix_csr(A) else A
+            n = A_csr.shape[0]
+            return _cpp_mod.fem.sparse_spd_solve(
+                A_csr.indptr.astype(np.int32),
+                A_csr.indices.astype(np.int32),
+                A_csr.data.astype(np.float64),
+                int(n),
+                np.ascontiguousarray(b, dtype=np.float64),
+            )
+        except Exception:
+            # SPD assumption violated or factor failure — bail to SuperLU.
+            pass
+    return spla.spsolve(A, b)
 
 from robosim.physics.fem.mesh import TetMesh
 from robosim.physics.fem.materials import (
@@ -59,6 +138,7 @@ def implicit_euler_step(
     tol: float = 1e-6,
     damping: float = 0.0,
     eps_p: np.ndarray | None = None,
+    factor_cache: "object | None" = None,
 ) -> ImplicitEulerResult:
     """Perform one implicit Euler time step.
 
@@ -103,6 +183,11 @@ def implicit_euler_step(
     converged = False
     residual_norm = 0.0
     dt2_inv = 1.0 / (dt * dt)
+
+    # Warm-start storage for the iterative CG solver. The previous
+    # Newton iter's ``dx`` is a good initial guess for the current one
+    # because A shifts only a little between iterations.
+    dx_warm: np.ndarray | None = None
 
     # Plastic state: Newton uses the *frozen* eps_p_n from the start of the
     # step (elastic-predictor / plastic-corrector pattern). After the
@@ -155,11 +240,13 @@ def implicit_euler_step(
         if fixed_dofs is not None and len(fixed_dofs) > 0:
             A_ff = A[np.ix_(free_dofs, free_dofs)]
             r_f = residual[free_dofs]
-            dx_f = spla.spsolve(A_ff, -r_f)
+            warm_f = (dx_warm[free_dofs] if dx_warm is not None else None)
+            dx_f = _cached_or_spsolve(A_ff, -r_f, factor_cache, x_warm=warm_f)
             dx = np.zeros(n_dof)
             dx[free_dofs] = dx_f
         else:
-            dx = spla.spsolve(A, -residual)
+            dx = _cached_or_spsolve(A, -residual, factor_cache, x_warm=dx_warm)
+        dx_warm = dx.copy()
 
         # Accept full Newton step (skip line search for small dt).
         # Line search only if residual grows.

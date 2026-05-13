@@ -7,10 +7,25 @@ is also supported.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
 import scipy.sparse as sp
+
+try:
+    from robosim import _cpp as _cpp_mod
+    _HAVE_CPP_FEM = hasattr(_cpp_mod, "fem")
+except ImportError:
+    _cpp_mod = None
+    _HAVE_CPP_FEM = False
+
+_USE_CPP_FEM = _HAVE_CPP_FEM and not os.environ.get("ROBOSIM_NO_CPP_FEM")
+
+# Cache for stiffness COO indices keyed by ``id(mesh.elements)``. These
+# arrays depend only on the element connectivity, which stays constant
+# across substeps — np.repeat / np.tile cost ~0.7s/14k calls otherwise.
+_STIFFNESS_IDX_CACHE: dict = {}
 
 from robosim.physics.fem.mesh import TetMesh, FEMesh, CompositeMesh, ElementBlock
 from robosim.physics.fem.elements import (
@@ -204,6 +219,15 @@ def _precompute_composite(mesh: CompositeMesh) -> CompositeIntegrationData:
 
 def _batch_deformation_gradients(x, elements, dN):
     """Compute F for all elements. dN is (ne, nodes_per_elem, 3)."""
+    if _USE_CPP_FEM and elements.shape[0] > 0:
+        ne, npe = elements.shape
+        F_flat = _cpp_mod.fem.batch_deformation_gradients(
+            np.ascontiguousarray(x, dtype=np.float64),
+            np.ascontiguousarray(elements, dtype=np.int32),
+            np.ascontiguousarray(dN.reshape(ne * npe, 3), dtype=np.float64),
+            int(npe),
+        )
+        return F_flat.reshape(ne, 3, 3)
     x_def = x[elements]                                    # (ne, npe, 3)
     F_all = np.einsum('eai,eaj->eij', x_def, dN)          # (ne, 3, 3)
     return F_all
@@ -212,6 +236,14 @@ def _batch_deformation_gradients(x, elements, dN):
 def _batch_polar_decomposition(F_all):
     """Polar decomposition F = R @ S (batch SVD)."""
     ne = F_all.shape[0]
+    if _USE_CPP_FEM and ne > 0:
+        # C++ batched SVD + det-flip + clip — same convention as numpy.
+        F_flat = np.ascontiguousarray(F_all.reshape(ne * 3, 3), dtype=np.float64)
+        R_flat, S_flat = _cpp_mod.fem.batch_polar(F_flat)
+        R_all = R_flat.reshape(ne, 3, 3)
+        S_all = S_flat.reshape(ne, 3, 3)
+        return R_all, S_all
+
     bad = ~np.all(np.isfinite(F_all.reshape(ne, -1)), axis=1)
     if np.any(bad):
         F_all[bad] = np.eye(3)
@@ -508,12 +540,22 @@ def _assemble_stiffness_general(mesh, x, material, edata: ElementIntegrationData
 
         Ke_all += Ke_g
 
-    # Build sparse matrix
-    elem_dofs = np.repeat(mesh.elements * 3, 3, axis=1) + np.tile([0, 1, 2], npe)
-    row_idx = np.repeat(elem_dofs[:, :, np.newaxis], ndof_e, axis=2)
-    col_idx = np.repeat(elem_dofs[:, np.newaxis, :], ndof_e, axis=1)
+    # Build sparse matrix. row/col index arrays only depend on the
+    # element connectivity → cache as a mesh attribute so successive
+    # substep calls skip the np.repeat / np.tile.
+    cache = getattr(mesh, "_robosim_stiffness_idx", None)
+    if cache is None or cache[0] != npe:
+        elem_dofs = np.repeat(mesh.elements * 3, 3, axis=1) + np.tile([0, 1, 2], npe)
+        row_idx = np.repeat(elem_dofs[:, :, np.newaxis], ndof_e, axis=2).ravel()
+        col_idx = np.repeat(elem_dofs[:, np.newaxis, :], ndof_e, axis=1).ravel()
+        try:
+            mesh._robosim_stiffness_idx = (npe, row_idx, col_idx)
+        except AttributeError:
+            pass   # frozen dataclass / __slots__ — skip the cache
+    else:
+        _, row_idx, col_idx = cache
 
-    K = sp.coo_matrix((Ke_all.ravel(), (row_idx.ravel(), col_idx.ravel())), shape=(n_dof, n_dof))
+    K = sp.coo_matrix((Ke_all.ravel(), (row_idx, col_idx)), shape=(n_dof, n_dof))
     return K.tocsr()
 
 
@@ -534,6 +576,14 @@ def _batch_corotational_stiffness(R_all, dN_all, weights, mu, lam, npe):
     """Corotational stiffness for any element (vectorized over elements)."""
     ne = R_all.shape[0]
     ndof_e = npe * 3
+    if _USE_CPP_FEM and ne > 0:
+        R_flat  = np.ascontiguousarray(R_all.reshape(ne * 3, 3), dtype=np.float64)
+        dN_flat = np.ascontiguousarray(dN_all.reshape(ne * npe, 3), dtype=np.float64)
+        w_vec   = np.ascontiguousarray(weights, dtype=np.float64)
+        Ke_flat = _cpp_mod.fem.batch_corotational_stiffness(
+            R_flat, dN_flat, w_vec, float(mu), float(lam), int(npe),
+        )
+        return Ke_flat.reshape(ne, ndof_e, ndof_e)
     Ke_all = np.zeros((ne, ndof_e, ndof_e))
 
     for a in range(npe):

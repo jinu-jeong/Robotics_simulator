@@ -57,6 +57,7 @@ _DROP_END_T    = _RELEASE_END_T + 2.5          # let the box settle
 _CONTACT_PARAMS = {
     "fem": dict(k=1e3,  c=30.0),
     "cb":  dict(k=1e4,  c=50.0),
+    "cb-coarse":  dict(k=1e4,  c=50.0),
     "rigid": {},
 }
 
@@ -71,6 +72,11 @@ def _box_physics(mode: str):
         # (6,6,6) gives 3 rows inside the slab (with the SLAB_PAD); (8,8,8)
         # is similar but doubles the CB basis size for marginal gain.
         return CB(young=1.1e5, poisson=0.45, mesh=(6, 6, 6), n_modes=10)
+    if mode == "cb-coarse":
+        # Same physics, coarser mesh. CB step scales cubically with
+        # n_nodes — (4,4,4) is ~7× faster than (6,6,6). Fidelity drops
+        # but RL workloads may not care.
+        return CB(young=1.1e5, poisson=0.45, mesh=(4, 4, 4), n_modes=10)
     return Rigid()
 
 
@@ -143,7 +149,8 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Grasp demo — Scene API")
-    parser.add_argument("--mode",     default="rigid", choices=["rigid", "fem", "cb"])
+    parser.add_argument("--mode",     default="rigid",
+                        choices=["rigid", "fem", "cb", "cb-coarse"])
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
     main(mode=args.mode, headless=args.headless)

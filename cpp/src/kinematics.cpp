@@ -97,4 +97,69 @@ void forward_kinematics(const Topology& topo,
     }
 }
 
+
+void link_world_velocities(const RbdTopology& topo,
+                           const Eigen::Ref<const Eigen::VectorXd>& qd,
+                           const Eigen::Ref<const MatRMXd>& R_flat,
+                           const Eigen::Ref<const MatRMXd>& t_arr,
+                           Eigen::Ref<MatRMXd> omega_out,
+                           Eigen::Ref<MatRMXd> v_out) {
+    const int n_links = topo.n_links;
+    omega_out.setZero();
+    v_out.setZero();
+
+    // tree_order: BFS from roots excluding roots → parent always
+    // processed before child (roots already have zero rows).
+    for (int child_idx : topo.tree_order) {
+        const int parent_idx = topo.parent_link[child_idx];
+        if (parent_idx < 0) continue;
+
+        Eigen::Vector3d omega_p = omega_out.row(parent_idx).transpose();
+        Eigen::Vector3d v_p     = v_out.row(parent_idx).transpose();
+        Eigen::Vector3d origin_p = t_arr.row(parent_idx).transpose();
+        Eigen::Vector3d origin_c = t_arr.row(child_idx).transpose();
+        Eigen::Vector3d d = origin_c - origin_p;
+        Eigen::Vector3d v_c = v_p + omega_p.cross(d);
+        Eigen::Vector3d omega_c = omega_p;
+
+        const int j_idx = topo.joint_for_link[child_idx];
+        if (j_idx >= 0) {
+            const JointSpec& joint = topo.joints[j_idx];
+            if (joint.kind != JointKind::FIXED) {
+                const double qd_j = qd[joint.dof_index];
+                Eigen::Matrix3d R_c = row_to_mat3(R_flat, child_idx);
+                Eigen::Vector3d axis_world = R_c * joint.axis;
+                if (joint.kind == JointKind::REVOLUTE)
+                    omega_c = omega_p + qd_j * axis_world;
+                else if (joint.kind == JointKind::PRISMATIC)
+                    v_c = v_c + qd_j * axis_world;
+            }
+        }
+        omega_out.row(child_idx) = omega_c.transpose();
+        v_out    .row(child_idx) = v_c.transpose();
+    }
+}
+
+
+Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>
+batch_point_velocities(const Eigen::Ref<const Eigen::VectorXi>& link_indices,
+                       const Eigen::Ref<const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>>& points,
+                       const Eigen::Ref<const MatRMXd>& omega_arr,
+                       const Eigen::Ref<const MatRMXd>& v_origin_arr,
+                       const Eigen::Ref<const MatRMXd>& t_arr) {
+    const int N = static_cast<int>(link_indices.size());
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> out(N, 3);
+    for (int i = 0; i < N; ++i) {
+        const int li = link_indices[i];
+        Eigen::Vector3d omega   = omega_arr   .row(li).transpose();
+        Eigen::Vector3d v_orig  = v_origin_arr.row(li).transpose();
+        Eigen::Vector3d origin  = t_arr       .row(li).transpose();
+        Eigen::Vector3d pt      = points      .row(i).transpose();
+        Eigen::Vector3d r = pt - origin;
+        Eigen::Vector3d v = v_orig + omega.cross(r);
+        out.row(i) = v.transpose();
+    }
+    return out;
+}
+
 }  // namespace robosim

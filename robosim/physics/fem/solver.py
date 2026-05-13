@@ -137,6 +137,28 @@ class FEMSolver:
             if extra_forces and body_idx in extra_forces:
                 f_ext += extra_forces[body_idx]
 
+            # Lazy: one cached sparse solver per body. Sparsity pattern
+            # is constant across substeps so analyzePattern only runs
+            # once per body lifetime.
+            #
+            # Default: CG with warm start (cheap per iter on small-to-
+            # medium meshes; converges in ~5 iter when Newton is near
+            # convergence).  Set ``ROBOSIM_FEM_DIRECT=1`` to force
+            # the direct SimplicialLDLT path instead.
+            if getattr(body, "_factor_cache", None) is None:
+                import os
+                try:
+                    from robosim import _cpp as _cpp_mod
+                    if hasattr(_cpp_mod, "fem"):
+                        if os.environ.get("ROBOSIM_FEM_DIRECT"):
+                            body._factor_cache = _cpp_mod.fem.SparseSPDFactor()
+                        else:
+                            body._factor_cache = _cpp_mod.fem.SparseCG()
+                    else:
+                        body._factor_cache = None
+                except ImportError:
+                    body._factor_cache = None
+
             result = implicit_euler_step(
                 mesh=body.mesh,
                 x=body.x,
@@ -151,6 +173,7 @@ class FEMSolver:
                 damping=self.damping,
                 max_newton_iters=self.max_newton_iters,
                 eps_p=body.eps_p,
+                factor_cache=body._factor_cache,
             )
 
             body.x = result.x_new

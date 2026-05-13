@@ -194,15 +194,19 @@ def gravity_torques_via_cpp(robot: "Robot", topo, q, gravity):
 
 def forward_kinematics_via_cpp(robot: "Robot", topo) -> list[Transform]:
     """Run the C++ FK kernel and wrap the (R, t) pair per link back
-    into Python :class:`Transform` objects."""
+    into Python :class:`Transform` objects.
+
+    Caches the packed (R_flat, t_arr) on the robot so downstream C++
+    kernels (e.g. ``link_world_velocities``) can consume them directly
+    without rebuilding from the Transform list.
+    """
     q = np.ascontiguousarray(robot.q, dtype=np.float64)
     R_flat, t_arr = _cpp.kin.forward_kinematics(topo, q)
-    # R_flat: (n_links, 9) row-major flatten of each 3×3
-    # t_arr:  (n_links, 3)
+    robot._cpp_R_flat = R_flat
+    robot._cpp_t_arr  = t_arr
     out: list[Transform] = []
     for l in range(robot.n_links):
         R = R_flat[l].reshape(3, 3)
-        # Cheap path: skip Transform.__post_init__ validation.
         out.append(Transform._fast(np.ascontiguousarray(R),
                                    np.ascontiguousarray(t_arr[l])))
     return out

@@ -23,6 +23,8 @@ from robosim.physics.contact.sdf import (
     mesh_box,
     mesh_ground,
     points_ground,
+    _USE_CPP_CONTACT,
+    _cpp_mod,
 )
 
 
@@ -160,16 +162,26 @@ def compute_aabb(geometry: Geometry, transform: Transform) -> AABB:
     t = transform.translation
 
     if geometry.geometry_type == GeometryType.SPHERE:
+        if _USE_CPP_CONTACT:
+            buf = _cpp_mod.contact.aabb_sphere(t, float(geometry.radius))
+            return AABB(np.ascontiguousarray(buf[0]), np.ascontiguousarray(buf[1]))
         r = geometry.radius
         return AABB(t - r, t + r)
 
     elif geometry.geometry_type == GeometryType.BOX:
+        if _USE_CPP_CONTACT:
+            buf = _cpp_mod.contact.aabb_box(R, t, geometry.size / 2.0)
+            return AABB(np.ascontiguousarray(buf[0]), np.ascontiguousarray(buf[1]))
         he = geometry.size / 2.0
         # Rotated AABB: project half-extents onto each world axis
         extent = np.abs(R) @ he
         return AABB(t - extent, t + extent)
 
     elif geometry.geometry_type == GeometryType.CYLINDER:
+        if _USE_CPP_CONTACT:
+            buf = _cpp_mod.contact.aabb_cylinder(
+                R, t, float(geometry.radius), float(geometry.length))
+            return AABB(np.ascontiguousarray(buf[0]), np.ascontiguousarray(buf[1]))
         r, hl = geometry.radius, geometry.length / 2.0
         # Tight AABB: project OBB cylinder onto each world axis.
         # For axis unit-vector u and world axis e_i:

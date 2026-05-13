@@ -358,6 +358,45 @@ class Robot:
 
         fk = self.forward_kinematics()
         n = self.n_links
+
+        # ── C++ dispatch ────────────────────────────────────────────────
+        if getattr(self, "_use_cpp_fk", True):
+            try:
+                from robosim.model._cpp_bridge import (
+                    HAVE_CPP_RBD, build_rbd_topology, _cpp,
+                )
+            except ImportError:
+                HAVE_CPP_RBD = False
+            if HAVE_CPP_RBD:
+                if getattr(self, "_cpp_rbd_topo", None) is None:
+                    self._cpp_rbd_topo = build_rbd_topology(self)
+                # Reuse packed (R_flat, t_arr) cached by the C++ FK.
+                R_flat = getattr(self, "_cpp_R_flat", None)
+                t_arr  = getattr(self, "_cpp_t_arr",  None)
+                if R_flat is None or t_arr is None:
+                    R_flat = np.empty((n, 9), dtype=np.float64)
+                    t_arr  = np.empty((n, 3), dtype=np.float64)
+                    for l in range(n):
+                        R_flat[l] = fk[l].rotation.ravel()
+                        t_arr[l]  = fk[l].translation
+                qd = np.ascontiguousarray(self._qd, dtype=np.float64)
+                omega, vlin = _cpp.kin.link_world_velocities(
+                    self._cpp_rbd_topo, qd, R_flat, t_arr)
+                # Stash packed arrays for downstream batched kernels
+                # (compute_rbd_contact_forces -> batch_point_velocities).
+                self._cpp_omega_arr    = omega
+                self._cpp_v_origin_arr = vlin
+                result = [
+                    (np.ascontiguousarray(omega[i]),
+                     np.ascontiguousarray(vlin[i]))
+                    for i in range(n)
+                ]
+                self._vel_cache = result
+                self._vel_q_snapshot = self._q.copy()
+                self._vel_qd_snapshot = self._qd.copy()
+                return result
+
+        # ── Pure-Python fallback ────────────────────────────────────────
         result: list[tuple[np.ndarray, np.ndarray]] = [None] * n  # type: ignore
 
         # BFS from root, propagating spatial velocity outward.

@@ -266,48 +266,70 @@ class PenaltyContactSolver:
             return fk_cache[rid]
 
         # ── Pass 1: classify contacts and count per-link ──
-        # Each entry: (ContactPoint, link_idx, v_a, v_b)
+        # Fast batched path when the C++ ``link_world_velocities`` filled
+        # ``_cpp_omega_arr`` / ``_cpp_v_origin_arr`` on the robot. We
+        # collect (link_idx, point) pairs and resolve all v_a in one
+        # ``batch_point_velocities`` call. v_b (other body) stays
+        # per-contact since cross-body work is rare and irregular.
         classified: list[tuple[ContactPoint, int, np.ndarray, np.ndarray]] = []
         contacts_per_link: dict[int, int] = {}
 
+        records = []   # (cp_or_swapped, link_idx, bid_other, side_b)
+        # First scan: identify which contacts belong to this robot.
         for cp, bid_a, bid_b in contacts:
             rid_a, link_a = self._body_map.get(bid_a, (None, None))
-
             if rid_a == robot_id:
-                link_idx = link_a
-                v_a = _link_point_velocity(robot, link_idx, cp.point_a, fk=fk)
-                v_b = np.zeros(3)
-                if bid_b >= 0:
-                    rid_b, link_b = self._body_map.get(bid_b, (None, None))
-                    if rid_b is not None:
-                        other_solver = self._robot_solvers.get(rid_b)
-                        if other_solver:
-                            v_b = _link_point_velocity(
-                                other_solver.robot, link_b, cp.point_b,
-                                fk=_get_fk(rid_b))
-                classified.append((cp, link_idx, v_a, v_b))
-                contacts_per_link[link_idx] = contacts_per_link.get(link_idx, 0) + 1
+                records.append((cp, link_a, bid_b, False))
                 continue
-
-            # Check body_b (our robot on the B side)
             rid_b, link_b = self._body_map.get(bid_b, (None, None))
-            if rid_b != robot_id:
-                continue
+            if rid_b == robot_id:
+                cp_swapped = ContactPoint(
+                    point_a=cp.point_b, point_b=cp.point_a,
+                    normal=-cp.normal, penetration=cp.penetration,
+                )
+                records.append((cp_swapped, link_b, bid_a, True))
 
-            cp_swapped = ContactPoint(
-                point_a=cp.point_b, point_b=cp.point_a,
-                normal=-cp.normal, penetration=cp.penetration,
-            )
-            link_idx = link_b
-            v_a = _link_point_velocity(robot, link_idx, cp_swapped.point_a, fk=fk)
+        # Batched v_a via C++ when available.
+        v_a_arr = None
+        if records:
+            try:
+                from robosim.model._cpp_bridge import HAVE_CPP_RBD, _cpp
+            except ImportError:
+                HAVE_CPP_RBD = False
+            # Force the velocity cache to be fresh for the current
+            # (q, qd) — this also populates ``_cpp_omega_arr`` /
+            # ``_cpp_v_origin_arr`` if the C++ path is active.
+            robot.link_world_velocities()
+            if (HAVE_CPP_RBD
+                    and getattr(robot, "_cpp_omega_arr", None) is not None
+                    and getattr(robot, "_cpp_t_arr", None) is not None):
+                N = len(records)
+                link_idx_arr = np.empty(N, dtype=np.int32)
+                pts_arr      = np.empty((N, 3), dtype=np.float64)
+                for i, (cp_i, li, _, _) in enumerate(records):
+                    link_idx_arr[i] = li
+                    pts_arr[i]      = cp_i.point_a
+                v_a_arr = _cpp.kin.batch_point_velocities(
+                    link_idx_arr, pts_arr,
+                    robot._cpp_omega_arr, robot._cpp_v_origin_arr,
+                    robot._cpp_t_arr,
+                )
+
+        for i, (cp_i, link_idx, bid_other, _) in enumerate(records):
+            if v_a_arr is not None:
+                v_a = v_a_arr[i]
+            else:
+                v_a = _link_point_velocity(robot, link_idx, cp_i.point_a, fk=fk)
             v_b = np.zeros(3)
-            if rid_a is not None:
-                other_solver = self._robot_solvers.get(rid_a)
-                if other_solver:
-                    v_b = _link_point_velocity(
-                        other_solver.robot, link_a, cp_swapped.point_b,
-                        fk=_get_fk(rid_a))
-            classified.append((cp_swapped, link_idx, v_a, v_b))
+            if bid_other >= 0:
+                rid_o, link_o = self._body_map.get(bid_other, (None, None))
+                if rid_o is not None:
+                    other_solver = self._robot_solvers.get(rid_o)
+                    if other_solver:
+                        v_b = _link_point_velocity(
+                            other_solver.robot, link_o, cp_i.point_b,
+                            fk=_get_fk(rid_o))
+            classified.append((cp_i, link_idx, v_a, v_b))
             contacts_per_link[link_idx] = contacts_per_link.get(link_idx, 0) + 1
 
         # ── Pass 2: compute forces with per-contact effective mass ──

@@ -56,6 +56,24 @@ void register_kinematics(py::module_& m) {
           "Compute per-link world-frame (R, t).  Returns "
           "(R_flat: (n_links, 9), t_flat: (n_links, 3)) — caller reshapes "
           "each R row to (3, 3) row-major.");
+
+    k.def("link_world_velocities",
+          [](const RbdTopology& topo,
+             const Eigen::Ref<const Eigen::VectorXd>& qd,
+             const Eigen::Ref<const MatRMXd>& R_flat,
+             const Eigen::Ref<const MatRMXd>& t_arr) {
+              const int n = topo.n_links;
+              MatRMXd omega(n, 3), v(n, 3);
+              link_world_velocities(topo, qd, R_flat, t_arr, omega, v);
+              return std::make_tuple(omega, v);
+          },
+          py::arg("topo"), py::arg("qd"), py::arg("R_flat"), py::arg("t_arr"),
+          "Per-link (ω, v_origin) propagation from the FK output.");
+
+    k.def("batch_point_velocities", &batch_point_velocities,
+          py::arg("link_indices"), py::arg("points"),
+          py::arg("omega_arr"), py::arg("v_origin_arr"), py::arg("t_arr"),
+          "Batched body-fixed point velocities given link spatial vels.");
 }
 
 }  // namespace robosim

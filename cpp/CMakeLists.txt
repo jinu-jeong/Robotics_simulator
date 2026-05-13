@@ -41,9 +41,15 @@ pybind11_add_module(_cpp MODULE
     bindings/kinematics.cpp
     bindings/rbd.cpp
     bindings/cb.cpp
+    bindings/contact.cpp
+    bindings/fem.cpp
+    bindings/scene_step.cpp
     src/kinematics.cpp
     src/rbd.cpp
     src/cb.cpp
+    src/contact.cpp
+    src/fem.cpp
+    src/scene_step.cpp
 )
 
 target_include_directories(_cpp PRIVATE
@@ -53,6 +59,25 @@ target_include_directories(_cpp PRIVATE
 target_link_libraries(_cpp PRIVATE
     Eigen3::Eigen
 )
+
+# ── Apple Accelerate (BLAS+LAPACK) ─────────────────────────────────────────
+# On macOS, link Apple Accelerate so Eigen routes its dense matrix
+# products through Apple's M1-tuned SGEMV/DGEMV/SGEMM/DGEMM kernels.
+# For Craig-Bampton dynamics (dense n_r × n_r solves + Phi matvecs)
+# this is the single biggest available speedup short of restructuring
+# the basis. Falls back to Eigen's built-in NEON path on non-Apple.
+if(APPLE)
+    find_library(ACCELERATE_FRAMEWORK Accelerate)
+    if(ACCELERATE_FRAMEWORK)
+        message(STATUS "Linking Apple Accelerate: ${ACCELERATE_FRAMEWORK}")
+        target_link_libraries(_cpp PRIVATE ${ACCELERATE_FRAMEWORK})
+        target_compile_definitions(_cpp PRIVATE
+            EIGEN_USE_BLAS
+            EIGEN_USE_LAPACKE
+            ACCELERATE_NEW_LAPACK
+        )
+    endif()
+endif()
 
 # Optimisation flags — kept conservative so the build behaves the same
 # across reviewers. ``-march=native`` is host-specific so it stays off

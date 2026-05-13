@@ -1,11 +1,28 @@
-"""Signed distance functions and contact point queries for geometry primitives."""
+"""Signed distance functions and contact point queries for geometry primitives.
+
+Hot-path kernels (sphere/box vs ground & pair) dispatch to C++ when the
+``robosim._cpp.contact`` submodule is available — the C++ side returns a
+packed (N, 10) buffer that we slice back into :class:`ContactPoint` here.
+Set ``ROBOSIM_NO_CPP_CONTACT=1`` to force the pure-Python reference (used
+by parity tests).
+"""
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import numpy as np
+
+try:
+    from robosim import _cpp as _cpp_mod
+    _HAVE_CPP_CONTACT = hasattr(_cpp_mod, "contact")
+except ImportError:
+    _cpp_mod = None
+    _HAVE_CPP_CONTACT = False
+
+_USE_CPP_CONTACT = _HAVE_CPP_CONTACT and not os.environ.get("ROBOSIM_NO_CPP_CONTACT")
 
 
 @dataclass
@@ -18,6 +35,37 @@ class ContactPoint:
     penetration: float        # positive = penetrating
 
 
+def _unpack_contact_buf(buf: np.ndarray) -> list[ContactPoint]:
+    """Slice a packed (N, 10) C++ buffer into :class:`ContactPoint` instances.
+
+    Each row carries point_a (cols 0-2), point_b (3-5), normal (6-8),
+    penetration (9). Empty buffer ⇒ empty list (no contact).
+    """
+    if buf.shape[0] == 0:
+        return []
+    return [
+        ContactPoint(
+            point_a=np.ascontiguousarray(buf[i, 0:3]),
+            point_b=np.ascontiguousarray(buf[i, 3:6]),
+            normal=np.ascontiguousarray(buf[i, 6:9]),
+            penetration=float(buf[i, 9]),
+        )
+        for i in range(buf.shape[0])
+    ]
+
+
+def _unpack_single(buf: np.ndarray) -> ContactPoint | None:
+    """Single-contact variant: (1, 10) ⇒ ContactPoint, (0, 10) ⇒ None."""
+    if buf.shape[0] == 0:
+        return None
+    return ContactPoint(
+        point_a=np.ascontiguousarray(buf[0, 0:3]),
+        point_b=np.ascontiguousarray(buf[0, 3:6]),
+        normal=np.ascontiguousarray(buf[0, 6:9]),
+        penetration=float(buf[0, 9]),
+    )
+
+
 # ── Ground plane contacts ────────────────────────────────────────
 
 def sphere_ground(
@@ -27,6 +75,14 @@ def sphere_ground(
     """Sphere vs infinite ground plane."""
     if ground_normal is None:
         ground_normal = np.array([0.0, 0.0, 1.0])
+    if _USE_CPP_CONTACT:
+        buf = _cpp_mod.contact.sphere_ground(
+            np.ascontiguousarray(center, dtype=np.float64),
+            float(radius),
+            float(ground_height),
+            np.ascontiguousarray(ground_normal, dtype=np.float64),
+        )
+        return _unpack_single(buf)
     n = ground_normal / np.linalg.norm(ground_normal)
 
     dist = np.dot(center, n) - ground_height  # signed distance from plane
@@ -53,6 +109,16 @@ def box_ground(
     ground_height: float = 0.0, ground_normal: np.ndarray | None = None,
 ) -> list[ContactPoint]:
     """Box vs ground plane — returns contact for each penetrating vertex."""
+    if _USE_CPP_CONTACT:
+        gn = ground_normal if ground_normal is not None else _GROUND_UP_Z
+        buf = _cpp_mod.contact.box_ground(
+            np.ascontiguousarray(center, dtype=np.float64),
+            np.ascontiguousarray(rotation, dtype=np.float64),
+            np.ascontiguousarray(half_extents, dtype=np.float64),
+            float(ground_height),
+            np.ascontiguousarray(gn, dtype=np.float64),
+        )
+        return _unpack_contact_buf(buf)
     if ground_normal is None or ground_normal is _GROUND_UP_Z:
         # Axis-aligned ground (the common case): only Z matters.
         local_verts = _BOX_CORNER_SIGNS * half_extents       # (8, 3)
@@ -108,6 +174,17 @@ def cylinder_ground(
     n_ring: int = 8,
 ) -> list[ContactPoint]:
     """Cylinder vs ground — sample points on bottom/top ring edges."""
+    if _USE_CPP_CONTACT:
+        gn = ground_normal if ground_normal is not None else _GROUND_UP_Z
+        buf = _cpp_mod.contact.cylinder_ground(
+            np.ascontiguousarray(center, dtype=np.float64),
+            np.ascontiguousarray(rotation, dtype=np.float64),
+            float(radius), float(half_length),
+            float(ground_height),
+            np.ascontiguousarray(gn, dtype=np.float64),
+            int(n_ring),
+        )
+        return _unpack_contact_buf(buf)
     # Build local ring vertices (top + bottom) in one shot.
     unit_ring = _cyl_ring_unit(n_ring)         # (n_ring, 3) with z=0
     local = np.empty((2 * n_ring, 3))
@@ -154,6 +231,12 @@ def sphere_sphere(
     c2: np.ndarray, r2: float,
 ) -> ContactPoint | None:
     """Sphere vs sphere contact."""
+    if _USE_CPP_CONTACT:
+        buf = _cpp_mod.contact.sphere_sphere(
+            np.ascontiguousarray(c1, dtype=np.float64), float(r1),
+            np.ascontiguousarray(c2, dtype=np.float64), float(r2),
+        )
+        return _unpack_single(buf)
     diff = c1 - c2
     dist = np.linalg.norm(diff)
     penetration = r1 + r2 - dist
@@ -217,6 +300,16 @@ def box_box(
     → the box tips.  4 symmetric contacts distribute the normal force
     evenly and produce stable resting.
     """
+    if _USE_CPP_CONTACT:
+        buf = _cpp_mod.contact.box_box(
+            np.ascontiguousarray(center_a, dtype=np.float64),
+            np.ascontiguousarray(rot_a,    dtype=np.float64),
+            np.ascontiguousarray(half_a,   dtype=np.float64),
+            np.ascontiguousarray(center_b, dtype=np.float64),
+            np.ascontiguousarray(rot_b,    dtype=np.float64),
+            np.ascontiguousarray(half_b,   dtype=np.float64),
+        )
+        return _unpack_contact_buf(buf)
     ax_a = rot_a.T   # rows = local axes of A in world frame
     ax_b = rot_b.T
     d = center_b - center_a
@@ -362,6 +455,15 @@ def box_sphere(
 
     Finds closest point on OBB surface to sphere center, then checks distance.
     """
+    if _USE_CPP_CONTACT:
+        buf = _cpp_mod.contact.box_sphere(
+            np.ascontiguousarray(box_center, dtype=np.float64),
+            np.ascontiguousarray(box_rot,    dtype=np.float64),
+            np.ascontiguousarray(box_half,   dtype=np.float64),
+            np.ascontiguousarray(sphere_center, dtype=np.float64),
+            float(sphere_radius),
+        )
+        return _unpack_single(buf)
     # Transform sphere center into box local frame
     local = box_rot.T @ (sphere_center - box_center)
 
