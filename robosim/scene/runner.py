@@ -419,14 +419,15 @@ class SimRunner:
             if not grip_active:
                 cp = self._find_contact_pair(bh)
                 if cp is not None:
-                    # Penalty forces BEFORE step
+                    # Penalty forces BEFORE step (drives nodes outward early)
                     fk = cp.robot._model.forward_kinematics()
-                    f_ext, wrenches = self._compute_penalty_contact(cp, fk, bh._body)
+                    f_ext, _ = self._compute_penalty_contact(cp, fk, bh._body)
                     bh._solver.step(dt=dt, extra_forces={0: f_ext})
-                    # Cache wrenches
-                    for li_name, w in wrenches.items():
-                        idx = cp.robot._model.link_index(li_name)
-                        cp._cached_wrenches[idx] = w
+                    # Position projection AFTER step — hard non-penetration
+                    # guarantee.  Penalty alone lets the CB modal deformation
+                    # absorb the force and the finger sinks in like tofu.
+                    fk = cp.robot._model.forward_kinematics()
+                    self._apply_projection_contact(cp, fk, bh._body, dt)
                 else:
                     bh._solver.step(dt=dt)
             else:
@@ -838,21 +839,24 @@ class SimRunner:
             viewer.update_mesh_vertices(name, bh._body.x)
 
             # Von Mises stress coloring
-            try:
+            if bh._body._dN_list is not None:
                 from robosim.physics.fem.assembly import batch_von_mises
                 vm = batch_von_mises(
                     bh._body.mesh, bh._body.x, bh._body.material,
                     bh._body._dN_list, bh._body._volumes,
                 )
-                vm_max = max(float(vm.max()), 1.0)
-                t = np.clip(vm / vm_max, 0, 1)
-                r = np.clip(1.5 - np.abs(t - 0.75) * 4, 0, 1)
-                g = np.clip(1.5 - np.abs(t - 0.50) * 4, 0, 1)
-                b = np.clip(1.5 - np.abs(t - 0.25) * 4, 0, 1)
+                vm_min = float(vm.min())
+                vm_max = float(vm.max())
+                if vm_max > vm_min:
+                    t = np.clip((vm - vm_min) / (vm_max - vm_min), 0, 1)
+                else:
+                    t = np.zeros_like(vm)
+                # blue → cyan → green → yellow → red
+                r = np.clip(t * 2.0 - 0.5, 0, 1).astype(np.float32)
+                g = np.clip(1.0 - np.abs(t - 0.5) * 2.0, 0, 1).astype(np.float32)
+                b = np.clip(1.0 - t * 2.0 + 0.0, 0, 1).astype(np.float32)
                 colors = np.column_stack([r, g, b]).astype(np.float32)
                 viewer.update_mesh_color(name, colors)
-            except Exception:
-                pass
 
         # HUD text
         phase_strs = [f"{traj.current_phase or 'DONE'}" for traj in trajs]
