@@ -114,6 +114,11 @@ class Scene:
         self._runner: SimRunner | None = None
         self._initial_state: dict | None = None
 
+        # Deformable grippers — visual hex-box meshes that replace the
+        # URDF visual on selected robot links (Phase 1: kinematic-following
+        # only; no contact, no actual deformation yet).
+        self._deformable_grippers: list[dict] = []
+
     # ══════════════════════════════════════════════════════════════════════════
     # add()
     # ══════════════════════════════════════════════════════════════════════════
@@ -443,6 +448,120 @@ class Scene:
             "lift_start_t":  lift_start_t,
             "release_val":   release_val,
         }
+
+    def attach_deformable_gripper(
+        self,
+        robot:     RobotHandle,
+        links:     list[str],
+        color:     np.ndarray | None = None,
+        divisions: tuple[int, int, int] = (3, 3, 3),
+        young:     float = 1.0e5,
+        poisson:   float = 0.45,
+        density:   float = 1000.0,
+        n_modes:   int   = 6,
+        damping:   float = 0.05,
+    ) -> None:
+        """Attach a real deformable Craig-Bampton body to each named link.
+
+        For each link in ``links``:
+
+        * the URDF rigid visual is hidden in the viewer (prevents
+          Z-fighting with the deformable mesh),
+        * a hex-box CB body is created in the link's local frame
+          (anchored on the palm-facing face — i.e. the link-frame
+          ``-X`` face — so the deformable piece stays attached to the
+          rest of the gripper),
+        * each simulation step the body's reference frame is set to
+          the current link transform via
+          :meth:`CraigBamptonBody.set_anchor_pose`, so the deformable
+          piece follows the gripper kinematically. Modal coordinates
+          evolve freely under contact forces (Phase 2c wires those).
+
+        Each link must declare exactly one ``<box>`` visual; the box's
+        size and origin come from that declaration.
+
+        Parameters
+        ----------
+        robot      : RobotHandle returned by ``scene.add(Robot(...))``.
+        links      : link names to deformify (must each have a ``<box>`` visual).
+        color      : RGB (3,). Defaults to URDF orange ``(0.9, 0.50, 0.10)``.
+        divisions  : hex subdivisions per axis (default ``(3,3,3)``).
+        young      : Young's modulus [Pa].
+        poisson    : Poisson's ratio.
+        density    : material density [kg/m³].
+        n_modes    : Craig-Bampton fixed-interface normal modes to keep.
+        damping    : Rayleigh mass-proportional damping coefficient β.
+        """
+        from robosim.model.geometry import GeometryType
+        from robosim.physics.fem.materials import CorotationalElastic
+        from robosim.physics.fem.mesh import FEMesh
+        from robosim.physics.fem.reduced import CraigBamptonBody
+
+        if color is None:
+            color = np.array([0.9, 0.50, 0.10])
+        model = robot._model
+
+        specs: list[dict] = []
+        for link_name in links:
+            link_idx = model.link_index(link_name)
+            link     = model.links[link_idx]
+            if not link.visuals:
+                raise ValueError(
+                    f"attach_deformable_gripper: link {link_name!r} has no <visual>"
+                )
+            vis = link.visuals[0]
+            if vis.geometry.geometry_type != GeometryType.BOX:
+                raise ValueError(
+                    f"attach_deformable_gripper: link {link_name!r} visual must be a <box>"
+                )
+            size = np.asarray(vis.geometry.size, dtype=float)
+
+            # Hex box mesh expressed in the LINK frame (so the mesh
+            # nodes ARE the local-frame reference positions that
+            # CraigBamptonBody expects). URDF visual is axis-aligned
+            # (rpy="0 0 0" on the finger links), centred at
+            # vis.origin.translation. We therefore lay the mesh out
+            # with corner = vis.origin.translation - size/2.
+            corner_link = vis.origin.translation - 0.5 * size
+            mesh = FEMesh.create_hex_box(
+                origin=corner_link, size=size, divisions=divisions,
+            )
+            # Anchor face: the link-frame -X face (palm side). These
+            # nodes track the link kinematically; the rest deform.
+            x_min = corner_link[0]
+            fixed_nodes = np.where(mesh.nodes[:, 0] < x_min + 1e-6)[0]
+            if len(fixed_nodes) == 0:
+                raise RuntimeError(
+                    f"attach_deformable_gripper: no fixed nodes selected on "
+                    f"link {link_name!r} (-X face)"
+                )
+
+            body = CraigBamptonBody(
+                mesh=mesh,
+                material=CorotationalElastic(young=young, poisson=poisson),
+                density=density,
+                n_modes=n_modes,
+                fixed_nodes=fixed_nodes,
+                # Gravity is suppressed: the deformable gripper is
+                # kinematically anchored to the (already gravity-
+                # compensated) robot arm — adding gravity on the free
+                # nodes would just make the pad sag noticeably.
+                gravity=np.zeros(3),
+                damping=damping,
+                name=f"defgrip_{robot.name}_{link_name}",
+            )
+
+            specs.append({
+                "link_name": link_name,
+                "link_idx":  link_idx,
+                "body":      body,
+            })
+
+        self._deformable_grippers.append({
+            "robot": robot,
+            "color": np.asarray(color, dtype=float)[:3].copy(),
+            "specs": specs,
+        })
 
     # ══════════════════════════════════════════════════════════════════════════
     # run()

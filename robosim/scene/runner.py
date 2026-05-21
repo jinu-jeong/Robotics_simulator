@@ -168,6 +168,9 @@ class SimRunner:
                 for bh in self._scene._body_handles.values():
                     self._step_body(bh, dt)
 
+                # ── step deformable grippers (kinematically anchored to robot links) ──
+                self._step_deformable_grippers(dt)
+
                 # NOTE: ConstraintContactSolver also exposes
                 # project_free_body_penetrations() for non-grasp scenarios
                 # (e.g. a free box bouncing off an arm link), but it is
@@ -263,6 +266,22 @@ class SimRunner:
             for li_name in cp.contact_links:
                 idx = cp.robot._model.link_index(li_name)
                 cp._cached_wrenches[idx] = np.zeros(6)
+
+        # Deformable gripper CB bodies — initialise the implicit-Euler
+        # system, then lift mesh.nodes (link-frame reference) into world
+        # via the current robot FK so the first viewer frame and the
+        # first physics step both see the body at its anchored pose.
+        for grip in self._scene._deformable_grippers:
+            rh = grip["robot"]
+            fk = rh._model.forward_kinematics()
+            for spec in grip["specs"]:
+                body     = spec["body"]
+                link_idx = spec["link_idx"]
+                T_link   = fk[link_idx]
+                body.initialize(dt=dt)
+                body.set_anchor_pose(T_link.rotation, T_link.translation)
+                body.x = body.mesh.nodes @ T_link.rotation.T + T_link.translation
+                body.v = np.zeros_like(body.v)
 
     # ── robot step ────────────────────────────────────────────────────────────
 
@@ -476,6 +495,31 @@ class SimRunner:
                 if np.linalg.norm(delta_xy) > 1e-6:
                     bh._body.x[:, :2] += delta_xy
                     bh._body.v[:, :2]  = 0.0
+
+    # ── deformable grippers ───────────────────────────────────────────────────
+
+    def _step_deformable_grippers(self, dt: float) -> None:
+        """Per-step update of attached deformable gripper CB bodies.
+
+        For each (link, CB body) registered via
+        :meth:`Scene.attach_deformable_gripper`: read the current link
+        FK, set the body's anchor pose via
+        :meth:`CraigBamptonBody.set_anchor_pose`, and advance one
+        implicit-Euler step. The body's fixed-interface boundary nodes
+        follow the link kinematically; modal coordinates (free
+        interior + interface modes) evolve under the integrator. Phase
+        2c will wire box ↔ gripper contact through ``extra_forces``;
+        for now the body tracks the link with no internal motion.
+        """
+        for grip in self._scene._deformable_grippers:
+            rh = grip["robot"]
+            fk = rh._model.forward_kinematics()
+            for spec in grip["specs"]:
+                body     = spec["body"]
+                link_idx = spec["link_idx"]
+                T_link   = fk[link_idx]
+                body.set_anchor_pose(T_link.rotation, T_link.translation)
+                body.step(dt=dt)
 
     # ── grip ──────────────────────────────────────────────────────────────────
 
@@ -819,6 +863,34 @@ class SimRunner:
                 rr.setup()
                 ctx["renderers"][bh.name] = rr
 
+        # ── Deformable grippers ──
+        # For each (robot, link) registered via Scene.attach_deformable_gripper:
+        #   • hide the URDF visual for that link (prevents Z-fighting),
+        #   • add the CB body's surface mesh; positions come straight
+        #     from body.x, which _init_physics already lifted into world
+        #     coordinates via the link's current FK.
+        # The hide key MUST use the URDF <robot name="..."> tag
+        # (== rh._model.name), not the user-facing handle name —
+        # viewer.set_mesh_visible is a silent no-op when the key is
+        # absent, so a wrong prefix is invisible to tests and only
+        # catches the eye in the headed viewer.
+        ctx["gripper_meshes"] = {}
+        for grip in scene._deformable_grippers:
+            rh         = grip["robot"]
+            color      = grip["color"]
+            vis_prefix = f"{rh._model.name}/"
+            for spec in grip["specs"]:
+                link_name = spec["link_name"]
+                body      = spec["body"]
+
+                viewer.set_mesh_visible(f"{vis_prefix}{link_name}", False)
+
+                faces     = body.mesh.extract_surface()
+                mesh_name = f"defgrip/{rh.name}/{link_name}"
+                viewer.add_mesh(mesh_name, body.x, faces,
+                                color=color, opacity=1.0)
+                ctx["gripper_meshes"][mesh_name] = {"body": body}
+
         return ctx
 
     def _update_viewer(self, ctx: dict, trajs: list) -> bool:
@@ -832,6 +904,11 @@ class SimRunner:
 
         for name, rr in ctx["renderers"].items():
             rr.update()
+
+        for mesh_name, info in ctx.get("gripper_meshes", {}).items():
+            # body.x is updated each substep by _step_deformable_grippers;
+            # just push the latest world-frame node positions.
+            viewer.update_mesh_vertices(mesh_name, info["body"].x)
 
         from robosim.scene.handles import FEMBodyHandle, CBBodyHandle
         for name, surf in ctx["meshes"].items():

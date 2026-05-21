@@ -108,6 +108,9 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
             links=["left_finger", "right_finger"],
             **_CONTACT_PARAMS[mode],
         )
+        scene.attach_deformable_gripper(
+            robot, links=["left_finger", "right_finger"],
+        )
     scene.grip(
         robot, box,
         trigger_q=4,

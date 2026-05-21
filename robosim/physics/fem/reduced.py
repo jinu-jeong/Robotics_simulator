@@ -90,6 +90,12 @@ def _try_cpp_step_anchored(body, dt: float, extra_forces) -> bool:
         return False
     if not body._anchored:
         return False
+    # Moving-frame anchor (set via body.set_anchor_pose) is Python-only
+    # for now — the C++ kernel assumes the reference frame is world-
+    # stationary. Falling back to Python keeps results correct; a
+    # future C++ port can take R, t as extra args.
+    if body._anchor_R is not None or body._anchor_t is not None:
+        return False
     n_dof = body.mesh.n_nodes * 3
     if extra_forces is not None and 0 in extra_forces:
         f_ext = np.ascontiguousarray(extra_forces[0], dtype=np.float64).reshape(-1)
@@ -231,6 +237,14 @@ class CraigBamptonBody:
 
         # Current reduced modal coordinates (updated each step)
         self.q_r: np.ndarray | None = None
+
+        # Moving-frame anchor pose (for anchored bodies that follow a
+        # kinematic external frame, e.g. a deformable robot link). When
+        # both are None the body is stationary-anchored (legacy
+        # behaviour) and ``_step_anchored`` reduces exactly to the
+        # original implementation. Set via :meth:`set_anchor_pose`.
+        self._anchor_R: np.ndarray | None = None
+        self._anchor_t: np.ndarray | None = None
 
         # LU (set by initialize)
         self._A_r_lu = None
@@ -440,6 +454,36 @@ class CraigBamptonBody:
               f"A_r ({self._n_r}×{self._n_r}) inverted.")
 
     # ------------------------------------------------------------------
+    # Moving-frame anchor (for kinematic-following anchored bodies)
+    # ------------------------------------------------------------------
+
+    def set_anchor_pose(self, R: np.ndarray, t: np.ndarray) -> None:
+        """Prescribe the rigid pose of the reference frame.
+
+        For anchored bodies (``fixed_nodes`` non-empty) that follow an
+        external kinematic frame (e.g. a deformable robot link). Each
+        subsequent ``step`` interprets ``fixed_nodes`` and the small-
+        displacement linearisation in the frame
+        ``x_world = R @ mesh.nodes + t``. Call once per step **before**
+        ``step``.
+
+        Default (never called) keeps the legacy stationary-anchored
+        behaviour (R=I, t=0) — bit-identical to the original code path,
+        including the C++ kernel.
+
+        Calling on a free-body (``fixed_nodes`` empty) raises ValueError.
+        """
+        if not self._anchored:
+            raise ValueError(
+                "set_anchor_pose is only valid for anchored bodies "
+                "(fixed_nodes must be non-empty)"
+            )
+        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        t = np.asarray(t, dtype=np.float64).reshape(3)
+        self._anchor_R = R
+        self._anchor_t = t
+
+    # ------------------------------------------------------------------
     # step
     # ------------------------------------------------------------------
 
@@ -538,6 +582,20 @@ class CraigBamptonBody:
         if getattr(self, "_use_cpp_cb", True) and _try_cpp_step_anchored(self, dt, extra_forces):
             return
 
+        # Dispatch on anchor mode: stationary (legacy) vs moving frame.
+        # The stationary branch is kept BIT-IDENTICAL to the pre-change
+        # implementation so C++ parity tests and every existing anchored
+        # caller see unchanged behaviour.
+        if self._anchor_R is None and self._anchor_t is None:
+            self._step_anchored_stationary(dt, extra_forces)
+        else:
+            self._step_anchored_moving(dt, extra_forces)
+
+    # ------------------------------------------------------------------
+    # Stationary anchored step — legacy implementation (unchanged math)
+    # ------------------------------------------------------------------
+
+    def _step_anchored_stationary(self, dt: float, extra_forces) -> None:
         n_nodes = self.mesh.n_nodes
         n_dof = n_nodes * 3
         dt2_inv = 1.0 / (dt * dt)
@@ -585,6 +643,74 @@ class CraigBamptonBody:
         self.x = x_new
         self.v = v_new
         self.q_r = q_r_new   # store for external access (e.g. CBBodyHandle.modal_coords)
+
+    # ------------------------------------------------------------------
+    # Moving-frame anchored step  (anchor pose set via set_anchor_pose)
+    # ------------------------------------------------------------------
+
+    def _step_anchored_moving(self, dt: float, extra_forces) -> None:
+        """Anchored step with a kinematically-prescribed reference frame.
+
+        Linearisation is small-displacement in the local (anchor-relative)
+        frame, so we map ``self.x``, ``self.v`` and external forces from
+        world to local, run the same implicit Euler step, then map the
+        result back to world. ``R=I, t=0`` reproduces the stationary
+        algorithm up to floating-point noise from the extra matmuls.
+        """
+        n_nodes = self.mesh.n_nodes
+        n_dof = n_nodes * 3
+        dt2_inv = 1.0 / (dt * dt)
+
+        free_dofs = self._free_dofs
+
+        R = self._anchor_R if self._anchor_R is not None else np.eye(3)
+        t = self._anchor_t if self._anchor_t is not None else np.zeros(3)
+
+        # World → local.  (R^T @ a.T).T = a @ R for orthonormal R.
+        x_local = (self.x - t) @ R
+        v_local = self.v @ R
+
+        x_local_flat = x_local.reshape(-1)
+        x_ref_flat = self.mesh.nodes.reshape(-1)
+        u_free = x_local_flat[free_dofs] - x_ref_flat[free_dofs]
+        q_r = self._C_q @ u_free
+
+        v_local_flat = v_local.reshape(-1)
+        q_r_dot = self._C_q @ v_local_flat[free_dofs]
+
+        # External forces (world frame); rotate into local frame.
+        f_ext = np.zeros(n_dof)
+        for d in range(3):
+            f_ext[d::3] += self._M_diag[d::3] * self.gravity[d]
+        if extra_forces is not None and 0 in extra_forces:
+            f_ext += extra_forces[0]
+        f_ext_local = (f_ext.reshape(n_nodes, 3) @ R).reshape(-1)
+        f_ext_free = f_ext_local[free_dofs]
+
+        f_r = self._Phi_CB[free_dofs, :].T @ f_ext_free
+
+        q_r_pred = q_r + dt * q_r_dot
+        rhs = self._M_r @ q_r_pred * dt2_inv + f_r
+        if self.damping > 0.0:
+            rhs += self.damping * self._M_r @ q_r / dt
+        q_r_new = self._A_r_inv @ rhs
+        q_r_dot_new = (q_r_new - q_r) / dt
+
+        # Reconstruct in local frame.
+        u_new = (self._Phi_CB @ q_r_new).reshape(n_nodes, 3)
+        x_new_local = self.mesh.nodes + u_new
+        x_new_local.reshape(-1)[self._fixed_dofs] = x_ref_flat[self._fixed_dofs]
+
+        u_dot_new = (self._Phi_CB @ q_r_dot_new).reshape(n_nodes, 3)
+        v_new_local = u_dot_new
+        v_new_local.reshape(-1)[self._fixed_dofs] = 0.0
+
+        # Local → world.
+        self.x = x_new_local @ R.T + t
+        self.v = v_new_local @ R.T   # frame velocity contribution
+                                     # intentionally omitted (small-
+                                     # displacement assumption)
+        self.q_r = q_r_new
 
 
 # ═══════════════════════════════════════════════════════════════
