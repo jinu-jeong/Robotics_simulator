@@ -518,7 +518,28 @@ class SimRunner:
                 body     = spec["body"]
                 link_idx = spec["link_idx"]
                 T_link   = fk[link_idx]
-                body.set_anchor_pose(T_link.rotation, T_link.translation)
+                R_new    = T_link.rotation
+                t_new    = T_link.translation
+
+                # Rigid-transport body.x, body.v from the previous anchor
+                # frame to the new one BEFORE updating the anchor pose
+                # and stepping. Without this, body.x stays in the old
+                # frame and the anchored step interprets pure frame
+                # motion (arm joint rotation) as internal deformation —
+                # the free nodes drift, the finger pad squishes inward,
+                # and the box appears to sink through the finger like
+                # tofu. Preserving body-local displacement keeps the
+                # pad rigidly following the link when no contact force
+                # is active.
+                R_old = (body._anchor_R if body._anchor_R is not None
+                         else np.eye(3))
+                t_old = (body._anchor_t if body._anchor_t is not None
+                         else np.zeros(3))
+                relR  = R_new @ R_old.T
+                body.x = (body.x - t_old) @ relR.T + t_new
+                body.v = body.v @ relR.T
+
+                body.set_anchor_pose(R_new, t_new)
                 body.step(dt=dt)
 
     # ── grip ──────────────────────────────────────────────────────────────────

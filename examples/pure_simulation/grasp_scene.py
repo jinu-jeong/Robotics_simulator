@@ -35,13 +35,17 @@ HOME_Q     = np.array([ 0.0, -1.571,  0.000, +1.571,  0.040, -0.040])
 FOLD_Q     = np.array([ 0.0, -1.400,  2.000, -0.600,  0.040, -0.040])
 APPROACH_Q = np.array([ 0.0, -0.365,  2.047, -1.682,  0.040, -0.040])
 NEAR_Q     = np.array([ 0.0, -0.370,  1.909, -1.539,  0.040, -0.040])
-# Finger target (q[4]=-0.011 with q[5]=+0.011 via mimic) puts the finger
-# inner face right at the box +Y surface for this CLOSE pose.  Going further
-# (e.g. -0.020) commands the PD to drive the fingers THROUGH the box →
-# visible "fork-skewer" penetration during LIFT.  -0.011 still triggers the
-# kinematic grip threshold (q[4] < 0.003) without overshooting.
-CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.011,  0.011])
-LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.011,  0.011])
+# Finger close target: the URDF says joint_left origin Y=0.043 and the
+# visual half-width is 0.005, so the finger inner face sits at
+# Y = 0.043 + q[4] - 0.005 (palm frame).  The box's +Y face is at
+# palm-Y 0.040 (box half-extent 0.04, centered on palm Y=0).
+# Solving inner_face == +Y face gives q[4] ≈ +0.002.  We slightly
+# undershoot at q[4]=-0.002 so the finger PD still drives it just
+# 4 mm past the surface (enough load for the kinematic grip threshold
+# q[4] < 0.003 to fire and lock the grip on), without the previous
+# 13 mm "fork through tofu" overshoot the old -0.011 target produced.
+CLOSE_Q    = np.array([ 0.0, -0.370,  1.909, -1.539, -0.002,  0.002])
+LIFT_Q     = np.array([ 0.0, -0.878,  2.080, -1.202, -0.002,  0.002])
 # RELEASE: same arm pose as the LIFT hold but fingers wide open (HOME
 # finger q = ±0.040). Crossing ``release_val=0.020`` snaps the kinematic
 # grip off and the box inherits the palm's velocity at that instant.
