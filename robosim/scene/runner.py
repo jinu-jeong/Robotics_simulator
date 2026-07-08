@@ -101,6 +101,8 @@ class SimRunner:
         self._fps       = FPSCounter(smoothing=20)
         # Cached rigid-body reaction from deformable-gripper contact (1-step lag).
         self._gripper_box_wrenches: dict[str, np.ndarray] = {}
+        # Cached nodal forces on deformable grasp targets (1-step lag).
+        self._gripper_box_node_forces: dict[str, np.ndarray] = {}
 
     # ── public entry point ────────────────────────────────────────────────────
 
@@ -161,8 +163,6 @@ class SimRunner:
                 #  it in _step_robot, otherwise the trajectory wins and the
                 #  finger drives through the kinematically-locked body).
                 self._apply_grip_locks()
-
-                self._gripper_box_wrenches.clear()
 
                 # ── step all robots (applies CACHED contact reactions before stepping) ──
                 for rh in self._scene._robot_handles.values():
@@ -290,14 +290,17 @@ class SimRunner:
         # Deformable grippers replace rigid finger ↔ object contact.
         contact = self._scene._contact
         for grip in self._scene._deformable_grippers:
-            rb = grip.get("rigid_body")
-            if rb is None:
+            target = grip.get("target_body")
+            if target is None:
                 continue
-            body_link = rb._model.links[-1].name
+            from robosim.scene.handles import RigidBodyHandle
+            if not isinstance(target, RigidBodyHandle):
+                continue
+            body_link = target._model.links[-1].name
             for spec in grip["specs"]:
                 contact.add_cross_filter(
                     grip["robot"].name, spec["link_name"],
-                    rb.name, body_link,
+                    target.name, body_link,
                 )
 
     # ── robot step ────────────────────────────────────────────────────────────
@@ -440,18 +443,27 @@ class SimRunner:
 
         if isinstance(bh, FEMBodyHandle):
             fem_dt = bh._fem_dt
+            grip_nf = self._gripper_box_node_forces.get(bh.name)
+            extra = {0: grip_nf} if grip_nf is not None and np.linalg.norm(grip_nf) > 1e-12 else None
             if not grip_active:
                 # Find contact pair for this body
                 cp = self._find_contact_pair(bh)
                 if cp is not None:
                     # Position-projection AFTER step
-                    bh._solver.step(dt=fem_dt)
+                    bh._solver.step(dt=fem_dt, extra_forces=extra)
+                    extra = None
                     fk = cp.robot._model.forward_kinematics()
                     self._apply_projection_contact(cp, fk, bh._body, fem_dt)
                 else:
-                    bh._solver.step(dt=fem_dt)
+                    if extra is not None:
+                        bh._solver.step(dt=fem_dt, extra_forces=extra)
+                    else:
+                        bh._solver.step(dt=fem_dt)
             else:
-                bh._solver.step(dt=fem_dt)
+                if extra is not None:
+                    bh._solver.step(dt=fem_dt, extra_forces=extra)
+                else:
+                    bh._solver.step(dt=fem_dt)
                 if cp := self._find_contact_pair(bh):
                     for idx in cp._cached_wrenches:
                         cp._cached_wrenches[idx][:] = 0.0
@@ -460,12 +472,17 @@ class SimRunner:
             self._update_grip_fem(bh, dt)
 
         elif isinstance(bh, CBBodyHandle):
+            grip_nf = self._gripper_box_node_forces.get(bh.name)
+            extra = {0: grip_nf} if grip_nf is not None and np.linalg.norm(grip_nf) > 1e-12 else None
             if not grip_active:
                 cp = self._find_contact_pair(bh)
                 if cp is not None:
                     # Penalty forces BEFORE step (drives nodes outward early)
                     fk = cp.robot._model.forward_kinematics()
                     f_ext, _ = self._compute_penalty_contact(cp, fk, bh._body)
+                    if extra is not None:
+                        f_ext = f_ext + extra
+                        extra = None
                     bh._solver.step(dt=dt, extra_forces={0: f_ext})
                     # Position projection AFTER step — hard non-penetration
                     # guarantee.  Penalty alone lets the CB modal deformation
@@ -473,9 +490,15 @@ class SimRunner:
                     fk = cp.robot._model.forward_kinematics()
                     self._apply_projection_contact(cp, fk, bh._body, dt)
                 else:
-                    bh._solver.step(dt=dt)
+                    if extra is not None:
+                        bh._solver.step(dt=dt, extra_forces=extra)
+                    else:
+                        bh._solver.step(dt=dt)
             else:
-                bh._solver.step(dt=dt)
+                if extra is not None:
+                    bh._solver.step(dt=dt, extra_forces=extra)
+                else:
+                    bh._solver.step(dt=dt)
                 if cp := self._find_contact_pair(bh):
                     for idx in cp._cached_wrenches:
                         cp._cached_wrenches[idx][:] = 0.0
@@ -531,14 +554,16 @@ class SimRunner:
         FK, set the body's anchor pose via
         :meth:`CraigBamptonBody.set_anchor_pose`, and advance one
         implicit-Euler step. When :meth:`Scene.contact_deformable_gripper`
-        has wired a rigid target, penalty contact on penetrating finger
+        has wired a grasp target, penalty contact on penetrating finger
         nodes drives cantilever-style bending and caches a reaction
-        wrench on the rigid body for the next substep.
+        wrench / nodal forces on the target for the next substep.
         """
+        self._gripper_box_wrenches.clear()
+        self._gripper_box_node_forces.clear()
         for grip in self._scene._deformable_grippers:
             rh = grip["robot"]
             fk = rh._model.forward_kinematics()
-            rigid_bh = grip.get("rigid_body")
+            target = grip.get("target_body")
             k_pen = grip.get("k_contact", 8e3)
             c_pen = grip.get("c_contact", 40.0)
             box_wrench = np.zeros(6)
@@ -559,21 +584,42 @@ class SimRunner:
                 body.v = body.v @ relR.T
 
                 extra_forces = None
-                if rigid_bh is not None:
-                    f_ext, w_box = self._compute_gripper_rigid_contact(
-                        body, rigid_bh, spec, fk, k_pen, c_pen,
-                    )
-                    if np.linalg.norm(f_ext) > 1e-12:
-                        extra_forces = {0: f_ext}
-                    box_wrench += w_box
+                if target is not None:
+                    from robosim.scene.handles import RigidBodyHandle, CBBodyHandle, FEMBodyHandle
+                    if isinstance(target, RigidBodyHandle):
+                        f_ext, w_box = self._compute_gripper_rigid_contact(
+                            body, target, spec, fk, k_pen, c_pen,
+                        )
+                        if np.linalg.norm(f_ext) > 1e-12:
+                            extra_forces = {0: f_ext}
+                        box_wrench += w_box
+                    elif isinstance(target, (CBBodyHandle, FEMBodyHandle)):
+                        f_ext, f_box = self._compute_gripper_deformable_contact(
+                            body, target._body, k_pen, c_pen,
+                        )
+                        if np.linalg.norm(f_ext) > 1e-12:
+                            extra_forces = {0: f_ext}
+                        if np.linalg.norm(f_box) > 1e-12:
+                            prev = self._gripper_box_node_forces.get(target.name)
+                            if prev is None:
+                                self._gripper_box_node_forces[target.name] = f_box.copy()
+                            else:
+                                self._gripper_box_node_forces[target.name] = prev + f_box
 
                 body.set_anchor_pose(R_new, t_new)
                 body.step(dt=dt, extra_forces=extra_forces)
-                if rigid_bh is not None:
-                    self._project_gripper_rigid_contact(body, rigid_bh, spec)
+                if target is not None:
+                    from robosim.scene.handles import RigidBodyHandle
+                    if isinstance(target, RigidBodyHandle):
+                        self._project_gripper_rigid_contact(body, target, spec)
+                    else:
+                        self._project_gripper_deformable_contact(
+                            body, target._body, spec,
+                        )
 
-            if rigid_bh is not None:
-                self._gripper_box_wrenches[rigid_bh.name] = box_wrench
+            from robosim.scene.handles import RigidBodyHandle
+            if isinstance(target, RigidBodyHandle):
+                self._gripper_box_wrenches[target.name] = box_wrench
 
     # ── grip ──────────────────────────────────────────────────────────────────
 
@@ -874,7 +920,7 @@ class SimRunner:
         """
         MAX_PEN = 0.002   # cap penetration used for penalty [m]
         MAX_FN  = 0.12    # per-node force cap [N] — ~few mm cantilever bend
-        TIP_LEN = 0.025   # contact band at the fingertip [m]
+        TIP_LEN = 0.050   # contact band at the fingertip [m] (2× finger length)
 
         model = rigid_bh._model
         box_link = model.links[-1]
@@ -945,7 +991,7 @@ class SimRunner:
         spec: dict,
     ) -> None:
         """Post-step: push penetrating fingertip nodes to the box surface."""
-        TIP_LEN = 0.025
+        TIP_LEN = 0.050   # contact band at the fingertip [m] (2× finger length)
         model = rigid_bh._model
         box_link = model.links[-1]
         fk_box = model.forward_kinematics()
@@ -977,6 +1023,123 @@ class SimRunner:
         n_local = np.zeros((len(idx), 3))
         n_local[np.arange(len(idx)), axis] = sign
         n_world = n_local @ R_box.T
+
+        finger_body.x[idx] += depth[:, None] * n_world
+        v_into = -(finger_body.v[idx] * n_world).sum(axis=1)
+        finger_body.v[idx] += np.maximum(v_into, 0.0)[:, None] * n_world
+
+    # ── deformable gripper ↔ deformable body contact ─────────────────────────
+
+    @staticmethod
+    def _box_aabb(box_x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """World-frame centre and half-extents from current node positions."""
+        lo = box_x.min(axis=0)
+        hi = box_x.max(axis=0)
+        return 0.5 * (lo + hi), 0.5 * (hi - lo)
+
+    @staticmethod
+    def _distribute_reaction_to_box(
+        box_x: np.ndarray,
+        contact_pos: np.ndarray,
+        contact_forces: np.ndarray,
+    ) -> np.ndarray:
+        """Newton-3: spread finger contact forces onto nearest box nodes."""
+        n_box = box_x.shape[0]
+        f_box = np.zeros(n_box * 3)
+        if len(contact_pos) == 0:
+            return f_box
+        f_view = f_box.reshape(-1, 3)
+        # Nearest-node scatter (one target per contact point).
+        d2 = ((box_x[:, None, :] - contact_pos[None, :, :]) ** 2).sum(axis=2)
+        nearest = np.argmin(d2, axis=0)
+        np.add.at(f_view, nearest, -contact_forces)
+        return f_box
+
+    def _compute_gripper_deformable_contact(
+        self,
+        finger_body,
+        target_body,
+        k: float,
+        c: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Penalty contact: deformable finger tip nodes vs deformable box AABB."""
+        MAX_PEN = 0.002
+        MAX_FN  = 0.12
+        TIP_LEN = 0.050
+
+        center, half_ext = self._box_aabb(target_body.x)
+        ref_link = finger_body.mesh.nodes
+        x_tip = ref_link[:, 0].max() - TIP_LEN
+        tip_nodes = np.where(ref_link[:, 0] >= x_tip)[0]
+
+        n = finger_body.x.shape[0]
+        f_ext = np.zeros(n * 3)
+
+        rel = finger_body.x[tip_nodes] - center
+        pen_axes = half_ext - np.abs(rel)
+        inside = (pen_axes[:, 0] > 0) & (pen_axes[:, 1] > 0) & (pen_axes[:, 2] > 0)
+        if not inside.any():
+            return f_ext, np.zeros(target_body.x.shape[0] * 3)
+
+        idx_all = tip_nodes[inside]
+        pen_a = pen_axes[inside]
+        rel_a = rel[inside]
+        axis = np.argmin(pen_a, axis=1)
+        depth = np.clip(pen_a[np.arange(len(idx_all)), axis], 0.0, MAX_PEN)
+        sign = np.sign(rel_a[np.arange(len(idx_all)), axis])
+        sign[sign == 0] = 1.0
+        n_local = np.zeros((len(idx_all), 3))
+        n_local[np.arange(len(idx_all)), axis] = sign
+        n_world = n_local  # AABB normals are world-axis aligned
+
+        v_out = np.sum(finger_body.v[idx_all] * n_world, axis=1)
+        fn = np.clip(k * depth + c * np.maximum(-v_out, 0.0), 0.0, MAX_FN)
+        keep = fn > 0.0
+        if not keep.any():
+            return f_ext, np.zeros(target_body.x.shape[0] * 3)
+        idx = idx_all[keep]
+        fn = fn[keep]
+        n_world = n_world[keep]
+
+        f_on_finger = fn[:, None] * n_world
+        f_view = f_ext.reshape(-1, 3)
+        np.add.at(f_view, idx, f_on_finger)
+
+        f_box = self._distribute_reaction_to_box(
+            target_body.x, finger_body.x[idx], f_on_finger,
+        )
+        return f_ext, f_box
+
+    def _project_gripper_deformable_contact(
+        self,
+        finger_body,
+        target_body,
+        spec: dict,
+    ) -> None:
+        """Post-step: push penetrating fingertip nodes to the box AABB surface."""
+        TIP_LEN = 0.050
+        center, half_ext = self._box_aabb(target_body.x)
+
+        ref_link = finger_body.mesh.nodes
+        x_tip = ref_link[:, 0].max() - TIP_LEN
+        tip_nodes = np.where(ref_link[:, 0] >= x_tip)[0]
+
+        rel = finger_body.x[tip_nodes] - center
+        pen_axes = half_ext - np.abs(rel)
+        inside = (pen_axes[:, 0] > 0) & (pen_axes[:, 1] > 0) & (pen_axes[:, 2] > 0)
+        if not inside.any():
+            return
+
+        idx = tip_nodes[inside]
+        rel_a = rel[inside]
+        pen_a = pen_axes[inside]
+        axis = np.argmin(pen_a, axis=1)
+        depth = pen_a[np.arange(len(idx)), axis]
+        sign = np.sign(rel_a[np.arange(len(idx)), axis])
+        sign[sign == 0] = 1.0
+        n_local = np.zeros((len(idx), 3))
+        n_local[np.arange(len(idx)), axis] = sign
+        n_world = n_local
 
         finger_body.x[idx] += depth[:, None] * n_world
         v_into = -(finger_body.v[idx] * n_world).sum(axis=1)

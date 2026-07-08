@@ -59,6 +59,8 @@ _RELEASE_END_T = _LIFT_START_T + 3.0 + 0.5     # = 11.7 s
 _DROP_END_T    = _RELEASE_END_T + 2.5          # let the box settle
 
 _FINGER_LINKS = ["left_finger", "right_finger"]
+# Grasp target X: finger prong grew +80 mm vs the original 80 mm length → shift box +X.
+_BOX_X = 0.705
 
 # ── Contact params ────────────────────────────────────────────────────────────
 _OBJECT_CONTACT_PARAMS = {
@@ -68,12 +70,15 @@ _OBJECT_CONTACT_PARAMS = {
 # Softer finger↔rigid penalty so the CB mesh can bend (cantilever visual).
 _FINGER_RIGID_CONTACT = dict(k=300.0, c=8.0)
 
+# Shared Young's modulus for deformable grasp objects [Pa].
+_OBJECT_YOUNG = 3.0e4
+
 # ── Object physics ────────────────────────────────────────────────────────────
 def _box_physics(object_mode: str):
     if object_mode == "fem":
-        return FEM(young=1e5, poisson=0.45, mesh=(8, 8, 8), dt_scale=5)
+        return FEM(young=_OBJECT_YOUNG, poisson=0.45, mesh=(8, 8, 8), dt_scale=5)
     if object_mode == "cb":
-        return CB(young=1.1e5, poisson=0.45, mesh=(6, 6, 6), n_modes=10)
+        return CB(young=_OBJECT_YOUNG, poisson=0.45, mesh=(6, 6, 6), n_modes=10)
     return Rigid()
 
 
@@ -98,13 +103,14 @@ def main(
     )
 
     box = scene.add(
-        Box(size=0.08, mass=1.0, pos=[0.625, 0.0, 0.04])
+        Box(size=0.08, mass=1.0, pos=[_BOX_X, 0.0, 0.04])
         .physics(_box_physics(object_mode))
         .name("box")
     )
 
     # ── Contact + deformable fingers ──────────────────────────────────────────
-    if object_mode != "rigid":
+    # Rigid URDF finger slabs ↔ deformable object (skip when fingers are CB).
+    if object_mode != "rigid" and finger_mode != "cb":
         scene.contact(
             robot, box,
             links=_FINGER_LINKS,
@@ -121,11 +127,10 @@ def main(
             n_modes=8,
             damping=0.12,
         )
-        if object_mode == "rigid":
-            scene.contact_deformable_gripper(
-                robot, box,
-                **_FINGER_RIGID_CONTACT,
-            )
+        scene.contact_deformable_gripper(
+            robot, box,
+            **_FINGER_RIGID_CONTACT,
+        )
 
     scene.grip(
         robot, box,

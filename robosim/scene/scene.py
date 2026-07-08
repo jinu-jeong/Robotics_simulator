@@ -560,7 +560,7 @@ class Scene:
             "robot": robot,
             "color": np.asarray(color, dtype=float)[:3].copy(),
             "specs": specs,
-            "rigid_body": None,
+            "target_body": None,
             "k_contact": 8e3,
             "c_contact": 40.0,
         })
@@ -568,27 +568,28 @@ class Scene:
     def contact_deformable_gripper(
         self,
         robot:  RobotHandle,
-        body:   "RigidBodyHandle",
+        body:   "RigidBodyHandle | CBBodyHandle | FEMBodyHandle",
         k:      float = 8e3,
         c:      float = 40.0,
     ) -> None:
-        """Wire deformable gripper CB meshes to a rigid grasp target.
+        """Wire deformable gripper CB meshes to a grasp target.
 
-        Penalty contact pushes penetrating finger nodes out of the rigid
-        body each substep (cantilever-style bending under grasp load).
-        Rigid URDF finger ↔ body collisions are filtered automatically.
+        Penalty contact pushes penetrating finger-tip nodes out of the
+        target each substep (cantilever-style bending under grasp load).
+        When the target is rigid, URDF finger ↔ body collisions are
+        filtered automatically.
 
         Call after :meth:`attach_deformable_gripper`.
         """
-        from robosim.scene.handles import RigidBodyHandle
-        if not isinstance(body, RigidBodyHandle):
+        from robosim.scene.handles import RigidBodyHandle, CBBodyHandle, FEMBodyHandle
+        if not isinstance(body, (RigidBodyHandle, CBBodyHandle, FEMBodyHandle)):
             raise TypeError(
-                "contact_deformable_gripper expects a Rigid body handle; "
+                "contact_deformable_gripper expects a body handle; "
                 f"got {type(body).__name__}"
             )
         for grip in self._deformable_grippers:
             if grip["robot"] is robot:
-                grip["rigid_body"] = body
+                grip["target_body"] = body
                 grip["k_contact"] = k
                 grip["c_contact"] = c
                 return
@@ -836,8 +837,8 @@ class Scene:
         if self._deformable_grippers:
             lines.append(f"  Deformable grippers ({len(self._deformable_grippers)})")
             for grip in self._deformable_grippers:
-                rb = grip.get("rigid_body")
-                tgt = f" ↔ {rb.name}" if rb is not None else ""
+                tb = grip.get("target_body")
+                tgt = f" ↔ {tb.name}" if tb is not None else ""
                 links = [s["link_name"] for s in grip["specs"]]
                 lines.append(f"    {grip['robot'].name}{tgt}  links={links}")
 

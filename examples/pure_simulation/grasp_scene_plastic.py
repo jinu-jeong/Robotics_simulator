@@ -89,7 +89,7 @@ def main(headless: bool = False, mode: str = "fem") -> None:
     # is retained on release (perfect plasticity would let elastic
     # rebound erase it via reverse yielding).
     box = scene.add(
-        Box(size=0.08, mass=0.5, pos=[0.625, 0.0, 0.04])
+        Box(size=0.08, mass=0.5, pos=[0.705, 0.0, 0.04])
         .physics(_box_physics(mode))
         .name("box")
     )
