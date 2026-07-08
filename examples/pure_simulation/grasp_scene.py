@@ -1,6 +1,6 @@
 """Grasp demo via the Scene API.
 
-Robot picks up a box (rigid / FEM / CB modes) in ~40 lines of user code:
+Robot picks up a box (rigid / FEM / CB) with optional deformable CB fingers:
   Scene → add robot + box → register contact/grip → build trajectory → run
 
 Uses penalty contact + kinematic grip lock (Scene's default). The
@@ -10,9 +10,10 @@ constraint-based Coulomb-cone solver is also available — see
 visual for this demo.
 
 Usage:
-  python examples/grasp_scene.py              # rigid mode, GUI
-  python examples/grasp_scene.py --mode fem --headless
-  python examples/grasp_scene.py --mode cb  --headless
+  python examples/pure_simulation/grasp_scene.py
+  python examples/pure_simulation/grasp_scene.py --object rigid --finger cb
+  python examples/pure_simulation/grasp_scene.py --object cb --finger cb --headless
+  python examples/pure_simulation/grasp_scene.py --mode fem --headless   # legacy
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ HOME_Q     = np.array([ 0.0, -1.571,  0.000, +1.571,  0.040, -0.040])
 FOLD_Q     = np.array([ 0.0, -1.400,  2.000, -0.600,  0.040, -0.040])
 APPROACH_Q = np.array([ 0.0, -0.365,  2.047, -1.682,  0.040, -0.040])
 NEAR_Q     = np.array([ 0.0, -0.370,  1.909, -1.539,  0.040, -0.040])
-# Finger close target: the URDF says joint_left origin Y=0.043 and the
+# Finger close target: joint_left origin at palm tip (x=0.025, y=0.043);
 # visual half-width is 0.005, so the finger inner face sits at
 # Y = 0.043 + q[4] - 0.005 (palm frame).  The box's +Y face is at
 # palm-Y 0.040 (box half-extent 0.04, centered on palm Y=0).
@@ -57,28 +58,30 @@ _LIFT_START_T = 1.5 + 1.2 + 2.5 + 1.5 + 1.5   # = 8.2 s
 _RELEASE_END_T = _LIFT_START_T + 3.0 + 0.5     # = 11.7 s
 _DROP_END_T    = _RELEASE_END_T + 2.5          # let the box settle
 
-# ── Physics mode → contact params ────────────────────────────────────────────
-_CONTACT_PARAMS = {
+_FINGER_LINKS = ["left_finger", "right_finger"]
+
+# ── Contact params ────────────────────────────────────────────────────────────
+_OBJECT_CONTACT_PARAMS = {
     "fem": dict(k=1e3,  c=30.0),
     "cb":  dict(k=1e4,  c=50.0),
-    "rigid": {},
 }
+# Softer finger↔rigid penalty so the CB mesh can bend (cantilever visual).
+_FINGER_RIGID_CONTACT = dict(k=300.0, c=8.0)
 
-# ── Physics mode → box physics spec ──────────────────────────────────────────
-def _box_physics(mode: str):
-    if mode == "fem":
+# ── Object physics ────────────────────────────────────────────────────────────
+def _box_physics(object_mode: str):
+    if object_mode == "fem":
         return FEM(young=1e5, poisson=0.45, mesh=(8, 8, 8), dt_scale=5)
-    if mode == "cb":
-        # mesh=(6,6,6) — at (4,4,4) the 20 mm node spacing is so coarse that
-        # only the finger's mid-row (z=4 cm) sits inside its 20 mm collision
-        # height, so the finger appears to skewer the box between rows.
-        # (6,6,6) gives 3 rows inside the slab (with the SLAB_PAD); (8,8,8)
-        # is similar but doubles the CB basis size for marginal gain.
+    if object_mode == "cb":
         return CB(young=1.1e5, poisson=0.45, mesh=(6, 6, 6), n_modes=10)
     return Rigid()
 
 
-def main(mode: str = "rigid", headless: bool = False) -> None:
+def main(
+    object_mode: str = "rigid",
+    finger_mode: str = "rigid",
+    headless: bool = False,
+) -> None:
     # ── Build scene ───────────────────────────────────────────────────────────
     scene = Scene(dt=0.001, gravity=[0, 0, -9.81], substeps=10)
 
@@ -87,11 +90,6 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
     robot = scene.add(
         Robot(_URDF)
         .controller(JointPD(
-            # Arm joints stiff (large links, gravity-compensated load).
-            # Finger joints intentionally soft: a stiff finger PD overpowers
-            # the contact reaction and drives the fingertips visibly through
-            # the box mesh.  kp≈800 leaves enough grip force for the
-            # kinematic grip threshold to fire while keeping penetration <5 mm.
             kp=[280.0, 480.0, 200.0, 75.0,  800,  800],
             kd=[ 35.0,  50.0,  20.0,  2.0,   30,   30],
         ))
@@ -100,29 +98,40 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
     )
 
     box = scene.add(
-        Box(size=0.08, mass=1.0, pos=[0.6, 0.0, 0.04])
-        .physics(_box_physics(mode))
+        Box(size=0.08, mass=1.0, pos=[0.625, 0.0, 0.04])
+        .physics(_box_physics(object_mode))
         .name("box")
     )
 
-    # ── Contact + grip ────────────────────────────────────────────────────────
-    if mode != "rigid":
+    # ── Contact + deformable fingers ──────────────────────────────────────────
+    if object_mode != "rigid":
         scene.contact(
             robot, box,
-            links=["left_finger", "right_finger"],
-            **_CONTACT_PARAMS[mode],
+            links=_FINGER_LINKS,
+            **_OBJECT_CONTACT_PARAMS[object_mode],
         )
+
+    if finger_mode == "cb":
+        # Soft CB prong: anchored at palm (-X face), free tip bends under load.
         scene.attach_deformable_gripper(
-            robot, links=["left_finger", "right_finger"],
+            robot, links=_FINGER_LINKS,
+            divisions=(4, 2, 2),
+            young=3.0e4,
+            poisson=0.45,
+            n_modes=8,
+            damping=0.12,
         )
+        if object_mode == "rigid":
+            scene.contact_deformable_gripper(
+                robot, box,
+                **_FINGER_RIGID_CONTACT,
+            )
+
     scene.grip(
         robot, box,
         trigger_q=4,
         trigger_val=0.003,
         lift_start_t=_LIFT_START_T,
-        # Fingers must cross 20 mm back open before the grip drops; with
-        # the RELEASE trajectory target of 40 mm and a soft finger PD,
-        # this fires roughly midway through the RELEASE phase.
         release_val=0.020,
     )
 
@@ -134,14 +143,12 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
     traj.phase("NEAR",     target=NEAR_Q,     duration=1.5)
     traj.phase("CLOSE",    target=CLOSE_Q,    duration=1.5)
     traj.phase("LIFT",     target=LIFT_Q,     duration=3.0)
-    # Open fingers — box drops onto the ground, bounces, settles.
     traj.phase("RELEASE",  target=RELEASE_Q,  duration=0.5)
 
     # ── Run ───────────────────────────────────────────────────────────────────
     print(scene)
     scene.run(
         trajectories=traj,
-        # Total run = lift_start + lift + release-ramp + free-fall settle.
         duration=_DROP_END_T,
         viewer=not headless,
         headless=headless,
@@ -150,7 +157,30 @@ def main(mode: str = "rigid", headless: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Grasp demo — Scene API")
-    parser.add_argument("--mode",     default="rigid", choices=["rigid", "fem", "cb"])
+    parser.add_argument(
+        "--object", default=None, choices=["rigid", "fem", "cb"],
+        help="physics model for the grasped box",
+    )
+    parser.add_argument(
+        "--finger", default=None, choices=["rigid", "cb"],
+        help="physics model for gripper fingers (cb = deformable Craig-Bampton)",
+    )
+    parser.add_argument(
+        "--mode", default=None, choices=["rigid", "fem", "cb"],
+        help="legacy alias: sets --object and auto-enables deformable fingers "
+             "for fem/cb (use --object/--finger instead)",
+    )
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
-    main(mode=args.mode, headless=args.headless)
+
+    if args.mode is not None:
+        object_mode = args.object or args.mode
+        if args.finger is not None:
+            finger_mode = args.finger
+        else:
+            finger_mode = "cb" if args.mode in ("fem", "cb") else "rigid"
+    else:
+        object_mode = args.object or "rigid"
+        finger_mode = args.finger or "rigid"
+
+    main(object_mode=object_mode, finger_mode=finger_mode, headless=args.headless)

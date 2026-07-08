@@ -114,9 +114,8 @@ class Scene:
         self._runner: SimRunner | None = None
         self._initial_state: dict | None = None
 
-        # Deformable grippers — visual hex-box meshes that replace the
-        # URDF visual on selected robot links (Phase 1: kinematic-following
-        # only; no contact, no actual deformation yet).
+        # Deformable grippers — CB hex meshes anchored on selected robot links.
+        # Contact with a rigid target is wired via contact_deformable_gripper().
         self._deformable_grippers: list[dict] = []
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -561,7 +560,42 @@ class Scene:
             "robot": robot,
             "color": np.asarray(color, dtype=float)[:3].copy(),
             "specs": specs,
+            "rigid_body": None,
+            "k_contact": 8e3,
+            "c_contact": 40.0,
         })
+
+    def contact_deformable_gripper(
+        self,
+        robot:  RobotHandle,
+        body:   "RigidBodyHandle",
+        k:      float = 8e3,
+        c:      float = 40.0,
+    ) -> None:
+        """Wire deformable gripper CB meshes to a rigid grasp target.
+
+        Penalty contact pushes penetrating finger nodes out of the rigid
+        body each substep (cantilever-style bending under grasp load).
+        Rigid URDF finger ↔ body collisions are filtered automatically.
+
+        Call after :meth:`attach_deformable_gripper`.
+        """
+        from robosim.scene.handles import RigidBodyHandle
+        if not isinstance(body, RigidBodyHandle):
+            raise TypeError(
+                "contact_deformable_gripper expects a Rigid body handle; "
+                f"got {type(body).__name__}"
+            )
+        for grip in self._deformable_grippers:
+            if grip["robot"] is robot:
+                grip["rigid_body"] = body
+                grip["k_contact"] = k
+                grip["c_contact"] = c
+                return
+        raise ValueError(
+            "contact_deformable_gripper: no deformable gripper on this robot — "
+            "call attach_deformable_gripper() first"
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # run()
@@ -798,6 +832,14 @@ class Scene:
             for cp in self._contact_pairs:
                 lines.append(f"    {cp.robot.name} ↔ {cp.body.name}"
                              f"  links={cp.contact_links}")
+
+        if self._deformable_grippers:
+            lines.append(f"  Deformable grippers ({len(self._deformable_grippers)})")
+            for grip in self._deformable_grippers:
+                rb = grip.get("rigid_body")
+                tgt = f" ↔ {rb.name}" if rb is not None else ""
+                links = [s["link_name"] for s in grip["specs"]]
+                lines.append(f"    {grip['robot'].name}{tgt}  links={links}")
 
         return "\n".join(lines)
 

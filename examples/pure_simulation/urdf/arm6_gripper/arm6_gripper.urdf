@@ -19,11 +19,11 @@
   Shoulder frame (joint_shoulder) is at world z = 0.25 m.
   Upper arm extends along local +X, elbow/wrist in the XZ plane.
 
-  GRASP GEOMETRY (side-approach, box 8×8×8 cm cube at (0.60, 0, 0.04)):
+  GRASP GEOMETRY (side-approach, box 8×8×8 cm cube at (0.625, 0, 0.04)):
     q_pan=0, q_shoulder=-0.370, q_elbow=1.909, q_wrist=-1.539
       → palm centre  ≈ (0.524, 0, 0.022)
-      → fingers extend 60 mm forward from palm centre in X; box front face at 0.560 m
-      → front 30 % of finger (24 mm) overlaps box; 70 % root stays outside box
+      → fingers mount at palm tip (+X = +25 mm) and extend 80 mm forward in X
+      → box front face at 0.585 m (+25 mm vs pre-tip-mount 0.560 m)
       → inner faces straddle box in Y; 2 mm penetration when closed
 
   Wrist compensation: q_wrist = -(q_shoulder + q_elbow)  →  total Y-rotation = 0
@@ -180,31 +180,24 @@
     </collision>
   </link>
 
-  <!-- Left finger  — approach-aligned prong (box 0.080×0.010×0.020 m)
-       Long in X (80 mm, approach direction / red axis), thin in Y (10 mm),
-       shallow in Z (20 mm).  Wrist compensation keeps palm local-X = world X
-       throughout all phases, so fingers always point along world X.
-       Geometry/inertia origin at (+0.020, 0, +0.020) in joint frame so the
-       prong extends 60 mm forward and 20 mm backward in X, and sits centred
-       on the box mid-height (world z ≈ 0.022 + 0.020 = 0.042 m ≈ box centre).
-       mass=0.12 kg
-       About COM at (0.020, 0, 0.020):
-         Ixx = 0.12(0.010²+0.020²)/12 = 5.00e-6
-         Iyy = 0.12(0.080²+0.020²)/12 = 6.80e-5
-         Izz = 0.12(0.080²+0.010²)/12 = 6.50e-5 -->
+  <!-- Left finger  — approach-aligned prong (box 0.080×0.010×0.040 m)
+       Long in X (80 mm, approach direction), thin in Y (10 mm), 40 mm in Z.
+       Joint mounts at the palm tip (+X face); geometry origin at (+0.040, 0, 0)
+       so the prong root sits on the tip and extends purely forward in +X.
+       mass=0.12 kg -->
   <link name="left_finger">
     <inertial>
-      <origin xyz="0.020 0 0.020"/>
+      <origin xyz="0.040 0 0"/>
       <mass value="0.12"/>
       <inertia ixx="0.0000170" ixy="0" ixz="0" iyy="0.0000800" iyz="0" izz="0.0000650"/>
     </inertial>
     <visual>
-      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <origin xyz="0.040 0 0" rpy="0 0 0"/>
       <geometry><box size="0.080 0.010 0.040"/></geometry>
       <material name="orange"><color rgba="0.9 0.50 0.10 1"/></material>
     </visual>
     <collision>
-      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <origin xyz="0.040 0 0" rpy="0 0 0"/>
       <geometry><box size="0.080 0.010 0.040"/></geometry>
     </collision>
   </link>
@@ -212,17 +205,17 @@
   <!-- Right finger (mirror of left) -->
   <link name="right_finger">
     <inertial>
-      <origin xyz="0.020 0 0.020"/>
+      <origin xyz="0.040 0 0"/>
       <mass value="0.12"/>
       <inertia ixx="0.0000170" ixy="0" ixz="0" iyy="0.0000800" iyz="0" izz="0.0000650"/>
     </inertial>
     <visual>
-      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <origin xyz="0.040 0 0" rpy="0 0 0"/>
       <geometry><box size="0.080 0.010 0.040"/></geometry>
       <material name="orange"><color rgba="0.9 0.50 0.10 1"/></material>
     </visual>
     <collision>
-      <origin xyz="0.020 0 0.020" rpy="0 0 0"/>
+      <origin xyz="0.040 0 0" rpy="0 0 0"/>
       <geometry><box size="0.080 0.010 0.040"/></geometry>
     </collision>
   </link>
@@ -281,14 +274,14 @@
   </joint>
 
   <!-- Left finger: prismatic along +Y
-       Origin at y=0.043 m (wider base to straddle 8 cm cube, half-Y=40 mm).
+       Origin at palm tip (+X = +25 mm) and y=0.043 m (straddle 8 cm cube).
        At q= 0.000: inner face at +0.038 m →  2 mm into 40 mm half-box  ✓
-       At q=-0.020: inner face at +0.018 m → 22 mm into 40 mm half-box  ✓ (50 % more close)
+       At q=-0.020: inner face at +0.018 m → 22 mm into 40 mm half-box  ✓
        At q=+0.040: inner face at +0.078 m → 38 mm clearance for approach ✓ -->
   <joint name="joint_left" type="prismatic">
     <parent link="palm_link"/>
     <child link="left_finger"/>
-    <origin xyz="0 0.043 0" rpy="0 0 0"/>
+    <origin xyz="0.025 0.043 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit lower="-0.020" upper="0.050" velocity="0.3" effort="60"/>
     <dynamics damping="8.0"/>
@@ -298,7 +291,7 @@
   <joint name="joint_right" type="prismatic">
     <parent link="palm_link"/>
     <child link="right_finger"/>
-    <origin xyz="0 -0.043 0" rpy="0 0 0"/>
+    <origin xyz="0.025 -0.043 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit lower="-0.050" upper="0.020" velocity="0.3" effort="60"/>
     <dynamics damping="8.0"/>
