@@ -1218,9 +1218,11 @@ class SimRunner:
         # absent, so a wrong prefix is invisible to tests and only
         # catches the eye in the headed viewer.
         ctx["gripper_meshes"] = {}
+        from robosim.viz.colormap import gripper_palm_tip_gradient
         for grip in scene._deformable_grippers:
             rh         = grip["robot"]
             color      = grip["color"]
+            use_grad   = grip.get("gradient", False)
             vis_prefix = f"{rh._model.name}/"
             for spec in grip["specs"]:
                 link_name = spec["link_name"]
@@ -1230,8 +1232,12 @@ class SimRunner:
 
                 faces     = body.mesh.extract_surface()
                 mesh_name = f"defgrip/{rh.name}/{link_name}"
+                vtx_color = None
+                if use_grad:
+                    vtx_color = gripper_palm_tip_gradient(body.mesh.nodes)
                 viewer.add_mesh(mesh_name, body.x, faces,
-                                color=color, opacity=1.0)
+                                color=color, opacity=1.0,
+                                per_vertex_color=vtx_color)
                 ctx["gripper_meshes"][mesh_name] = {"body": body}
 
         return ctx

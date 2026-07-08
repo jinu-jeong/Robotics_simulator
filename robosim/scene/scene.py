@@ -459,6 +459,7 @@ class Scene:
         density:   float = 1000.0,
         n_modes:   int   = 6,
         damping:   float = 0.05,
+        gradient:  bool  = True,
     ) -> None:
         """Attach a real deformable Craig-Bampton body to each named link.
 
@@ -490,6 +491,8 @@ class Scene:
         density    : material density [kg/m³].
         n_modes    : Craig-Bampton fixed-interface normal modes to keep.
         damping    : Rayleigh mass-proportional damping coefficient β.
+        gradient   : if True, shade fingers white (palm) → red (tip) for
+                       deformation/force imaging in the viewer.
         """
         from robosim.model.geometry import GeometryType
         from robosim.physics.fem.materials import CorotationalElastic
@@ -561,6 +564,7 @@ class Scene:
             "color": np.asarray(color, dtype=float)[:3].copy(),
             "specs": specs,
             "target_body": None,
+            "gradient": gradient,
             "k_contact": 8e3,
             "c_contact": 40.0,
         })
