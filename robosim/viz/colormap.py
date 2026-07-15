@@ -70,33 +70,30 @@ def stress_to_color(
     return np.column_stack([r, g, b]).astype(np.float32)
 
 
-def gripper_palm_tip_gradient(nodes_link: np.ndarray) -> np.ndarray:
-    """Palm-to-tip color ramp for deformable gripper force imaging.
+def gripper_solid_red(nodes_link: np.ndarray) -> np.ndarray:
+    """Solid red per-vertex colors for deformable gripper CV imaging.
 
-    Uses link-frame node positions: white at the palm anchor (-X face),
-    full red at the fingertip (+X).  The ramp is fixed to reference
-    coordinates so it does not slide when the mesh deforms.
+    Uniform bright red makes the whole finger a stable mask for tip/root
+    ridge tracking (no white→red falloff near the palm).
 
     Parameters
     ----------
     nodes_link : (N, 3) mesh node positions in the finger link frame
+                 (only ``N`` is used; positions are unused)
 
     Returns
     -------
     colors : (N, 3) float32 RGB in [0, 1]
     """
-    x = np.asarray(nodes_link, dtype=np.float64)[:, 0]
-    x0, x1 = float(x.min()), float(x.max())
-    if x1 - x0 < 1e-9:
-        t = np.zeros_like(x)
-    else:
-        t = np.clip((x - x0) / (x1 - x0), 0.0, 1.0)
-    # white → red along +X (palm → tip)
-    return np.column_stack([
-        np.ones_like(t),
-        1.0 - t,
-        1.0 - t,
-    ]).astype(np.float32)
+    n = int(np.asarray(nodes_link).shape[0])
+    colors = np.zeros((n, 3), dtype=np.float32)
+    colors[:, 0] = 1.0
+    return colors
+
+
+def gripper_palm_tip_gradient(nodes_link: np.ndarray) -> np.ndarray:
+    """Deprecated alias — solid red (was white→red palm→tip)."""
+    return gripper_solid_red(nodes_link)
 
 
 # ═══════════════════════════════════════════════════════════════

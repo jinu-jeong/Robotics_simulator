@@ -117,6 +117,8 @@ class Scene:
         # Deformable grippers — CB hex meshes anchored on selected robot links.
         # Contact with a rigid target is wired via contact_deformable_gripper().
         self._deformable_grippers: list[dict] = []
+        # Optional viewer frame capture + gradient CV (see finger_capture.py).
+        self._finger_capture = None
 
     # ══════════════════════════════════════════════════════════════════════════
     # add()
@@ -491,8 +493,7 @@ class Scene:
         density    : material density [kg/m³].
         n_modes    : Craig-Bampton fixed-interface normal modes to keep.
         damping    : Rayleigh mass-proportional damping coefficient β.
-        gradient   : if True, shade fingers white (palm) → red (tip) for
-                       deformation/force imaging in the viewer.
+        gradient   : if True, shade fingers solid red for CV imaging.
         """
         from robosim.model.geometry import GeometryType
         from robosim.physics.fem.materials import CorotationalElastic
@@ -602,6 +603,13 @@ class Scene:
             "call attach_deformable_gripper() first"
         )
 
+    def sample_finger_probe(self) -> dict[str, dict[str, float]]:
+        """Per-finger deflection / normal-force snapshot (see :meth:`SimRunner.sample_finger_probe`)."""
+        if self._runner is None:
+            from robosim.scene.finger_probe import empty_probe
+            return empty_probe()
+        return self._runner.sample_finger_probe()
+
     # ══════════════════════════════════════════════════════════════════════════
     # run()
     # ══════════════════════════════════════════════════════════════════════════
@@ -640,6 +648,7 @@ class Scene:
         self._build_contact()
 
         runner = SimRunner(scene=self, dt=self.dt, substeps=self.substeps)
+        self._runner = runner
         return runner.run(
             trajectories=trajs,
             duration=duration,

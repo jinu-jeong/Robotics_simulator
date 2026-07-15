@@ -6,6 +6,7 @@ Uses Metal/Vulkan native rendering for high performance.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -223,6 +224,59 @@ class SimViewer:
         self._orbit_speed = 0.3     # degrees per pixel
         self._zoom_speed = 0.05
         self._pan_speed = 0.003
+        self._camera_locked = False
+        # Free (non-orbit) pose used when locking to a palm-mounted camera.
+        self._cam_eye: np.ndarray | None = None
+        self._cam_lookat: np.ndarray | None = None
+        self._cam_up: np.ndarray | None = None
+
+    def lock_camera(
+        self,
+        target: tuple[float, float, float],
+        azimuth: float,
+        elevation: float,
+        distance: float,
+    ) -> None:
+        """Fix orbit camera for repeatable CV screenshots."""
+        self._cam_target = np.asarray(target, dtype=float)
+        self._cam_azimuth = float(azimuth)
+        self._cam_elevation = float(elevation)
+        self._cam_distance = float(distance)
+        self._cam_eye = None
+        self._cam_lookat = None
+        self._cam_up = None
+        self._camera_locked = True
+        if self._camera is not None:
+            self._apply_camera()
+
+    def set_world_camera(
+        self,
+        eye: tuple[float, float, float] | np.ndarray,
+        lookat: tuple[float, float, float] | np.ndarray,
+        up: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 1.0),
+        *,
+        lock: bool = True,
+    ) -> None:
+        """Set an explicit world-space eye / lookat / up (e.g. palm-mounted)."""
+        self._cam_eye = np.asarray(eye, dtype=float)
+        self._cam_lookat = np.asarray(lookat, dtype=float)
+        self._cam_up = np.asarray(up, dtype=float)
+        if lock:
+            self._camera_locked = True
+        if self._camera is not None:
+            self._apply_camera()
+
+    def get_framebuffer(self) -> np.ndarray:
+        """Return the latest RGBA framebuffer (float32, 0–1)."""
+        if self._window is None:
+            raise RuntimeError("viewer not initialized")
+        return self._window.get_image_buffer_as_numpy()
+
+    def save_screenshot(self, path: str | Path) -> None:
+        """Save the current framebuffer to a PNG file."""
+        if self._window is None:
+            raise RuntimeError("viewer not initialized")
+        self._window.save_image(str(path))
 
     def _cam_position(self) -> np.ndarray:
         """Compute camera world position from orbit parameters."""
@@ -235,7 +289,13 @@ class SimViewer:
         return self._cam_target + np.array([x, y, z])
 
     def _apply_camera(self):
-        """Apply orbit camera state to the Taichi camera object."""
+        """Apply free or orbit camera state to the Taichi camera object."""
+        if self._cam_eye is not None and self._cam_lookat is not None:
+            up = self._cam_up if self._cam_up is not None else np.array([0.0, 0.0, 1.0])
+            self._camera.position(*self._cam_eye)
+            self._camera.lookat(*self._cam_lookat)
+            self._camera.up(*up)
+            return
         pos = self._cam_position()
         self._camera.position(*pos)
         self._camera.lookat(*self._cam_target)
@@ -243,6 +303,8 @@ class SimViewer:
 
     def _handle_camera_input(self):
         """Process mouse/keyboard input for orbit camera (Z-up correct)."""
+        if self._camera_locked:
+            return
         window = self._window
 
         # ── Mouse orbit (LMB drag) ──

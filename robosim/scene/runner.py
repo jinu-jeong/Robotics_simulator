@@ -103,6 +103,9 @@ class SimRunner:
         self._gripper_box_wrenches: dict[str, np.ndarray] = {}
         # Cached nodal forces on deformable grasp targets (1-step lag).
         self._gripper_box_node_forces: dict[str, np.ndarray] = {}
+        # Per-finger normal force from last deformable-gripper contact substep [N].
+        self._finger_fn_cache: dict[str, float] = {}
+        self._finger_contact_s_cache: dict[str, float] = {}
 
     # ── public entry point ────────────────────────────────────────────────────
 
@@ -137,8 +140,12 @@ class SimRunner:
 
         # --- initialise viewer ---
         _viewer_ctx = None
-        if viewer and not headless:
+        cap = getattr(self._scene, "_finger_capture", None)
+        use_viewer = (viewer and not headless) or (cap is not None)
+        if use_viewer:
             _viewer_ctx = self._init_viewer()
+            if cap is not None:
+                cap.lock_viewer_camera(_viewer_ctx["viewer"])
 
         # --- headless banner ---
         if headless:
@@ -185,15 +192,15 @@ class SimRunner:
 
                 self._time += dt
 
-            # ── frame callbacks ──
-            if on_step is not None:
-                on_step(self._scene, self._time)
-
-            # ── viewer update ──
+            # ── viewer update (before on_step so CV matches logged frame) ──
             if _viewer_ctx is not None:
                 alive = self._update_viewer(_viewer_ctx, trajs)
                 if not alive:
                     break   # user closed the window
+
+            # ── frame callbacks ──
+            if on_step is not None:
+                on_step(self._scene, self._time)
 
             # ── frame timing (after the frame's heavy work) ──
             self._fps.tick()
@@ -203,8 +210,8 @@ class SimRunner:
         if headless:
             self._print_summary(t_wall)
 
-        # ── Keep viewer open until user closes the window ─────────────────────
-        if _viewer_ctx is not None:
+        # ── Keep viewer open until user closes (skip when batch-capturing) ───
+        if _viewer_ctx is not None and cap is None:
             viewer = _viewer_ctx["viewer"]
             while viewer._window.running:
                 self._update_viewer(_viewer_ctx, trajs)
@@ -560,6 +567,8 @@ class SimRunner:
         """
         self._gripper_box_wrenches.clear()
         self._gripper_box_node_forces.clear()
+        self._finger_fn_cache.clear()
+        self._finger_contact_s_cache.clear()
         for grip in self._scene._deformable_grippers:
             rh = grip["robot"]
             fk = rh._model.forward_kinematics()
@@ -584,6 +593,7 @@ class SimRunner:
                 body.v = body.v @ relR.T
 
                 extra_forces = None
+                f_ext_cached = None
                 if target is not None:
                     from robosim.scene.handles import RigidBodyHandle, CBBodyHandle, FEMBodyHandle
                     if isinstance(target, RigidBodyHandle):
@@ -592,6 +602,7 @@ class SimRunner:
                         )
                         if np.linalg.norm(f_ext) > 1e-12:
                             extra_forces = {0: f_ext}
+                            f_ext_cached = f_ext
                         box_wrench += w_box
                     elif isinstance(target, (CBBodyHandle, FEMBodyHandle)):
                         f_ext, f_box = self._compute_gripper_deformable_contact(
@@ -599,6 +610,7 @@ class SimRunner:
                         )
                         if np.linalg.norm(f_ext) > 1e-12:
                             extra_forces = {0: f_ext}
+                            f_ext_cached = f_ext
                         if np.linalg.norm(f_box) > 1e-12:
                             prev = self._gripper_box_node_forces.get(target.name)
                             if prev is None:
@@ -608,6 +620,22 @@ class SimRunner:
 
                 body.set_anchor_pose(R_new, t_new)
                 body.step(dt=dt, extra_forces=extra_forces)
+
+                # Elastic grasp load: U from CB field, δ at contact station.
+                # Pass held s_c so brief zero-penalty frames keep F consistent.
+                from robosim.scene.finger_probe import elastic_normal_force_n
+                link_name = spec["link_name"]
+                fn_n, s_c = elastic_normal_force_n(
+                    body, R_new, t_new, link_name,
+                    f_ext=f_ext_cached,
+                    contact_s=self._finger_contact_s_cache.get(link_name),
+                )
+                self._finger_fn_cache[link_name] = fn_n
+                if s_c is not None and fn_n >= 1e-6:
+                    self._finger_contact_s_cache[link_name] = float(s_c)
+                elif fn_n < 1e-6:
+                    self._finger_contact_s_cache.pop(link_name, None)
+
                 if target is not None:
                     from robosim.scene.handles import RigidBodyHandle
                     if isinstance(target, RigidBodyHandle):
@@ -620,6 +648,55 @@ class SimRunner:
             from robosim.scene.handles import RigidBodyHandle
             if isinstance(target, RigidBodyHandle):
                 self._gripper_box_wrenches[target.name] = box_wrench
+
+    def sample_finger_probe(self) -> dict[str, dict[str, float]]:
+        """Per-finger deflection and normal force for logging / CV validation.
+
+        Returns a dict keyed by link name (``left_finger``, ``right_finger``)
+        with ``deflection_m`` / ``deflection_y_m`` (signed closing bend, m)
+        and ``fn_n`` (Newtons).
+        """
+        from robosim.scene.finger_probe import (
+            empty_probe,
+            tip_deflection_y_m,
+            deflection_profile_closing_mm,
+            normal_force_from_wrench,
+        )
+
+        out = empty_probe()
+
+        for grip in self._scene._deformable_grippers:
+            rh = grip["robot"]
+            fk = rh._model.forward_kinematics()
+            for spec in grip["specs"]:
+                link_name = spec["link_name"]
+                body = spec["body"]
+                T = fk[spec["link_idx"]]
+                R, t = T.rotation, T.translation
+                # Signed closing-direction bend (same convention as CV).
+                dy = tip_deflection_y_m(body, R, t, link_name)
+                out[link_name]["deflection_m"] = dy
+                out[link_name]["deflection_y_m"] = dy
+                out[link_name]["fn_n"] = self._finger_fn_cache.get(link_name, 0.0)
+                out[link_name]["contact_s"] = self._finger_contact_s_cache.get(
+                    link_name, float("nan"),
+                )
+                x_m, u_mm = deflection_profile_closing_mm(body, R, t, link_name)
+                out[link_name]["profile_x_m"] = x_m
+                out[link_name]["profile_u_mm"] = u_mm
+
+        for cp in self._scene._contact_pairs:
+            if self._scene._grip_active.get(cp.body.name, False):
+                continue
+            fk = cp.robot._model.forward_kinematics()
+            for link_name in cp.contact_links:
+                if out[link_name]["fn_n"] > 1e-9:
+                    continue
+                li_idx = cp.robot._model.link_index(link_name)
+                w = cp._cached_wrenches.get(li_idx, np.zeros(6))
+                out[link_name]["fn_n"] = normal_force_from_wrench(w, link_name)
+
+        return out
 
     # ── grip ──────────────────────────────────────────────────────────────────
 
@@ -915,12 +992,14 @@ class SimRunner:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Penalty contact: deformable finger tip nodes vs a rigid box OBB.
 
-        Only the prong tip (link-frame +X end) participates so the palm
-        anchor stays fixed and the free end bends like a cantilever.
+        Only free (non-anchor) finger nodes participate so contact can sit
+        anywhere along the prong as grasp depth changes. Used to *drive*
+        the CB mesh; logged grasp load uses strain-energy / contact-s.
         """
-        MAX_PEN = 0.002   # cap penetration used for penalty [m]
-        MAX_FN  = 0.12    # per-node force cap [N] — ~few mm cantilever bend
-        TIP_LEN = 0.050   # contact band at the fingertip [m] (2× finger length)
+        MAX_PEN = 0.002
+        MAX_FN  = 0.12
+
+        from robosim.scene.finger_probe import free_contact_node_indices
 
         model = rigid_bh._model
         box_link = model.links[-1]
@@ -934,24 +1013,18 @@ class SimRunner:
         col_off = col.origin.translation
         center = p_box + R_box @ col_off
 
-        link_idx = spec["link_idx"]
-        T_link = fk[link_idx]
-        R_link = T_link.rotation
-        # Tip band from the reference mesh (not the deformed state).
-        ref_link = finger_body.mesh.nodes
-        x_tip = ref_link[:, 0].max() - TIP_LEN
-        tip_nodes = np.where(ref_link[:, 0] >= x_tip)[0]
+        contact_nodes = free_contact_node_indices(finger_body)
 
         n = finger_body.x.shape[0]
         f_ext = np.zeros(n * 3)
 
-        rel = (finger_body.x[tip_nodes] - center) @ R_box
+        rel = (finger_body.x[contact_nodes] - center) @ R_box
         pen_axes = half_ext - np.abs(rel)
         inside_local = (pen_axes[:, 0] > 0) & (pen_axes[:, 1] > 0) & (pen_axes[:, 2] > 0)
         if not inside_local.any():
             return f_ext, np.zeros(6)
 
-        idx_all = tip_nodes[inside_local]
+        idx_all = contact_nodes[inside_local]
         pen_a = pen_axes[inside_local]
         rel_a = rel[inside_local]
         axis = np.argmin(pen_a, axis=1)
@@ -990,8 +1063,9 @@ class SimRunner:
         rigid_bh: "RigidBodyHandle",
         spec: dict,
     ) -> None:
-        """Post-step: push penetrating fingertip nodes to the box surface."""
-        TIP_LEN = 0.050   # contact band at the fingertip [m] (2× finger length)
+        """Post-step: push penetrating free finger nodes to the box surface."""
+        from robosim.scene.finger_probe import free_contact_node_indices
+
         model = rigid_bh._model
         box_link = model.links[-1]
         fk_box = model.forward_kinematics()
@@ -1003,17 +1077,15 @@ class SimRunner:
         col_off = col.origin.translation
         center = p_box + R_box @ col_off
 
-        ref_link = finger_body.mesh.nodes
-        x_tip = ref_link[:, 0].max() - TIP_LEN
-        tip_nodes = np.where(ref_link[:, 0] >= x_tip)[0]
+        contact_nodes = free_contact_node_indices(finger_body)
 
-        rel = (finger_body.x[tip_nodes] - center) @ R_box
+        rel = (finger_body.x[contact_nodes] - center) @ R_box
         pen_axes = half_ext - np.abs(rel)
         inside = (pen_axes[:, 0] > 0) & (pen_axes[:, 1] > 0) & (pen_axes[:, 2] > 0)
         if not inside.any():
             return
 
-        idx = tip_nodes[inside]
+        idx = contact_nodes[inside]
         rel_a = rel[inside]
         pen_a = pen_axes[inside]
         axis = np.argmin(pen_a, axis=1)
@@ -1062,26 +1134,25 @@ class SimRunner:
         k: float,
         c: float,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Penalty contact: deformable finger tip nodes vs deformable box AABB."""
+        """Penalty contact: deformable finger free nodes vs deformable box AABB."""
         MAX_PEN = 0.002
         MAX_FN  = 0.12
-        TIP_LEN = 0.050
+
+        from robosim.scene.finger_probe import free_contact_node_indices
 
         center, half_ext = self._box_aabb(target_body.x)
-        ref_link = finger_body.mesh.nodes
-        x_tip = ref_link[:, 0].max() - TIP_LEN
-        tip_nodes = np.where(ref_link[:, 0] >= x_tip)[0]
+        contact_nodes = free_contact_node_indices(finger_body)
 
         n = finger_body.x.shape[0]
         f_ext = np.zeros(n * 3)
 
-        rel = finger_body.x[tip_nodes] - center
+        rel = finger_body.x[contact_nodes] - center
         pen_axes = half_ext - np.abs(rel)
         inside = (pen_axes[:, 0] > 0) & (pen_axes[:, 1] > 0) & (pen_axes[:, 2] > 0)
         if not inside.any():
             return f_ext, np.zeros(target_body.x.shape[0] * 3)
 
-        idx_all = tip_nodes[inside]
+        idx_all = contact_nodes[inside]
         pen_a = pen_axes[inside]
         rel_a = rel[inside]
         axis = np.argmin(pen_a, axis=1)
@@ -1218,7 +1289,7 @@ class SimRunner:
         # absent, so a wrong prefix is invisible to tests and only
         # catches the eye in the headed viewer.
         ctx["gripper_meshes"] = {}
-        from robosim.viz.colormap import gripper_palm_tip_gradient
+        from robosim.viz.colormap import gripper_solid_red
         for grip in scene._deformable_grippers:
             rh         = grip["robot"]
             color      = grip["color"]
@@ -1234,7 +1305,7 @@ class SimRunner:
                 mesh_name = f"defgrip/{rh.name}/{link_name}"
                 vtx_color = None
                 if use_grad:
-                    vtx_color = gripper_palm_tip_gradient(body.mesh.nodes)
+                    vtx_color = gripper_solid_red(body.mesh.nodes)
                 viewer.add_mesh(mesh_name, body.x, faces,
                                 color=color, opacity=1.0,
                                 per_vertex_color=vtx_color)
@@ -1284,23 +1355,48 @@ class SimRunner:
                 colors = np.column_stack([r, g, b]).astype(np.float32)
                 viewer.update_mesh_color(name, colors)
 
-        # HUD text
-        phase_strs = [f"{traj.current_phase or 'DONE'}" for traj in trajs]
-        phase_str  = " | ".join(phase_strs) if phase_strs else "–"
-        lines = [
-            f"t = {self._time:.3f} s   phase: {phase_str}",
-            self._fps.format(),
-        ]
-        for bh in scene._body_handles.values():
-            c = bh.com
-            lines.append(
-                f"{bh.name}: CoM=({c[0]:+.3f},{c[1]:+.3f},{c[2]:+.3f})"
-                f"  bot_z={bh.bottom_z:+.4f}"
-            )
-        viewer.add_text("\n".join(lines) + "\n[LDrag=orbit  Scroll=zoom  ESC=quit]")
+        # HUD text (skip on clean capture frames — HUD occludes gradient CV)
+        cap = scene._finger_capture
+        capture_this = (
+            cap is not None and (cap._frame_idx % cap.every == 0)
+        )
+        show_hud = not (cap is not None and cap.clean_hud and capture_this)
+        if show_hud:
+            phase_strs = [f"{traj.current_phase or 'DONE'}" for traj in trajs]
+            phase_str  = " | ".join(phase_strs) if phase_strs else "–"
+            lines = [
+                f"t = {self._time:.3f} s   phase: {phase_str}",
+                self._fps.format(),
+            ]
+            for bh in scene._body_handles.values():
+                c = bh.com
+                lines.append(
+                    f"{bh.name}: CoM=({c[0]:+.3f},{c[1]:+.3f},{c[2]:+.3f})"
+                    f"  bot_z={bh.bottom_z:+.4f}"
+                )
+            viewer.add_text("\n".join(lines) + "\n[LDrag=orbit  Scroll=zoom  ESC=quit]")
+        else:
+            viewer.add_text("")
+
+        # Palm-mounted capture camera must be set before the frame is drawn.
+        if cap is not None:
+            cap.update_palm_camera(viewer, scene)
 
         # ── Actually render the frame ──────────────────────────────────────────
         viewer._render_frame()
+
+        if cap is not None:
+            phase = trajs[0].current_phase if trajs else None
+            if not getattr(cap, "_finger_bodies", None):
+                bodies = {}
+                for grip in scene._deformable_grippers:
+                    for spec in grip["specs"]:
+                        bodies[spec["link_name"]] = spec["body"]
+                cap.set_finger_bodies(bodies)
+            cap.process_after_render(
+                viewer, self._time, phase, self.sample_finger_probe(),
+            )
+
         viewer._window.show()
         return True
 
