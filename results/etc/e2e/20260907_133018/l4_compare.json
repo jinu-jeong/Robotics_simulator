@@ -1,0 +1,61 @@
+{
+  "n_test": 1000,
+  "n_candidates": 2100,
+  "methods": {
+    "known_ridge": {
+      "contact_err_mm_median": 0.0,
+      "force_rel_median": 0.04979769026443506,
+      "force_rel_median_Fgt1": 0.04249320636688747,
+      "n": 1000
+    },
+    "old_ridge": {
+      "n": 1000,
+      "contact_err_mm_median": 14.890758673672448,
+      "contact_err_mm_mean": 17.637057689890245,
+      "contact_err_mm_p90": 31.373178763117707,
+      "force_rel_median": 0.3057837096788043,
+      "force_rel_mean": 6.380371866892585,
+      "force_rel_p90": 0.7099817269550854,
+      "n_high": 800,
+      "contact_err_mm_median_Fgt1": 13.984329903257075,
+      "force_rel_median_Fgt1": 0.26927902055685543
+    },
+    "new_ridge": {
+      "n": 1000,
+      "contact_err_mm_median": 14.875350757282067,
+      "contact_err_mm_mean": 17.64065174165697,
+      "contact_err_mm_p90": 31.18275818198252,
+      "force_rel_median": 0.3063992706146919,
+      "force_rel_mean": 6.494843975141594,
+      "force_rel_p90": 0.7106576998896399,
+      "n_high": 800,
+      "contact_err_mm_median_Fgt1": 13.954619789909357,
+      "force_rel_median_Fgt1": 0.2709435674799219
+    },
+    "old_oracle": {
+      "n": 1000,
+      "contact_err_mm_median": 0.36265586218399,
+      "contact_err_mm_mean": 0.3946001183056559,
+      "contact_err_mm_p90": 0.6615449518785615,
+      "force_rel_median": 0.0060822382716613065,
+      "force_rel_mean": 0.010587160042518837,
+      "force_rel_p90": 0.02290912395251792,
+      "n_high": 800,
+      "contact_err_mm_median_Fgt1": 0.36265586218399215,
+      "force_rel_median_Fgt1": 0.006694110817356574
+    },
+    "new_oracle": {
+      "n": 1000,
+      "contact_err_mm_median": 0.2530987098270231,
+      "contact_err_mm_mean": 0.29961713179320404,
+      "contact_err_mm_p90": 0.6615449518785611,
+      "force_rel_median": 0.003782336850062154,
+      "force_rel_mean": 0.007178959344342267,
+      "force_rel_p90": 0.021395296728326112,
+      "n_high": 800,
+      "contact_err_mm_median_Fgt1": 0.2530987098270231,
+      "force_rel_median_Fgt1": 0.0038073955672321986
+    }
+  },
+  "baseline_note": "old = unweighted discrete grid; new = leading-4 modes + refine"
+}

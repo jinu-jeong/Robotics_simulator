@@ -1,0 +1,54 @@
+# Milestone 5 – synthetic observation camera dataset.
+#
+# Every FEM sample of `fem_dataset` is rendered from `n_views_per_sample`
+# randomly jittered observation-camera poses. Stored per rendered sample:
+# image, marker pixel coordinates (+ visibility), q = Phi_r^T u, force, contact,
+# camera intrinsics/extrinsics, appearance parameters and the FEM sample index.
+
+fem_dataset: data/processed/contact_sweep_top.npz
+rom_basis:   data/processed/rom_basis_top.npz     # q labels use its first `q_modes` modes
+q_modes: 8
+output:      data/processed/vision_top.npz
+seed: 0
+
+image:
+  width: 192
+  height: 144
+  grayscale: false
+  noise_std: 0.02                 # Gaussian pixel noise on [0,1] intensities (0 = off)
+
+camera:
+  # Pose relative to the finger: look-at point as fractions of (L, W, H), camera
+  # position = target + L * position_offset_rel. Vertical FOV in degrees.
+  target_rel: [0.55, 0.5, 0.5]
+  position_offset_rel: [0.05, -1.1, 0.55]
+  up: [0.0, 0.0, 1.0]
+  fov_y_deg: 40.0
+  n_views_per_sample: 2
+  jitter:                         # uniform +-amplitude per rendered sample
+    position_rel: 0.05            # in units of L
+    target_rel: 0.02              # in units of L
+    fov_deg: 2.0
+
+markers:
+  face: top
+  nx: 10
+  ny: 3
+  margin_rel: 0.06
+  radius_rel: 0.12                # marker sphere radius as fraction of finger height
+  color: [1.0, 0.2, 0.1]
+  pixel_noise_std: 0.5            # Gaussian noise on marker pixel coordinates [px] (0 = off)
+
+appearance:
+  finger_color: [0.75, 0.75, 0.78]
+  ambient: [0.35, 0.35, 0.35]
+  light_color: [0.8, 0.8, 0.8]
+  light_offset_rel: [0.5, -1.0, 1.5]   # nominal light position relative to finger centre, units of L
+  light_jitter_rel: 0.4                # uniform +- jitter of the light position, units of L
+  background_colors:                   # one is picked per sample
+    - [0.10, 0.11, 0.13]
+    - [0.45, 0.45, 0.47]
+    - [0.85, 0.85, 0.85]
+    - [0.20, 0.30, 0.15]
+    - [0.35, 0.20, 0.10]
+  show_probe: true                     # render the probe sphere at the contact

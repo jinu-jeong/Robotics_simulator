@@ -1,0 +1,26 @@
+e2e_config: e2e
+vision_config: vision
+seed: 0
+output_dir: results/e2e
+n_views: 2
+noise_px: 0.5
+width: 192
+height: 144
+n_frames: 32
+frame_counts:
+- 1
+- 2
+- 4
+- 8
+- 16
+- 32
+max_samples: 200
+n_iter: 2
+huber_px: 1.5
+geometric_ridge: 0.0001
+ema_alpha: 0.25
+kalman_process: 1.0e-08
+kalman_measure: 0.0001
+kalman_process_ramp: 3.0e-06
+ramp_start: 0.3
+n_samples: 200

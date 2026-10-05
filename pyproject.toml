@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compliant-finger-force"
+version = "0.0.1"
+description = "Vision + FEM mechanics based contact force estimation for compliant robotic fingers (Taichi-first visualization)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy",
+    "scipy",
+    "taichi>=1.7",
+    "pyyaml",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+ml = ["torch", "opencv-python"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

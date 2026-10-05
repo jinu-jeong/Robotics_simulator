@@ -1,0 +1,172 @@
+{
+  "reference": {
+    "I": 1.666666666666667e-09,
+    "delta_euler_bernoulli": 0.004,
+    "delta_timoshenko": 0.0040306000000000005,
+    "shear_fraction": 0.007650000000000157,
+    "slenderness_L_over_H": 10.0,
+    "bending_axis": "z",
+    "F": 1.0,
+    "E": 50000000.0,
+    "nu": 0.3,
+    "L": 0.1,
+    "W": 0.02,
+    "H": 0.01
+  },
+  "levels": [
+    {
+      "resolution": [
+        5,
+        1,
+        1
+      ],
+      "n_nodes": 75,
+      "n_tets": 6,
+      "n_hexes": 4,
+      "n_ties": 1,
+      "n_dofs": 225,
+      "bending_axis": "z",
+      "h_z": 0.01,
+      "tip_deflection": 0.0038465192335129447,
+      "max_displacement": 0.003859312550782796,
+      "equilibrium_residual": 2.838669037635825e-12,
+      "reaction_resultant": [
+        2.5218978381286172e-12,
+        -1.2392156257309134e-12,
+        1.0000000000004032
+      ],
+      "solve_time_s": 0.018136978149414062,
+      "rel_error_euler_bernoulli": -0.038370191621763805,
+      "rel_error_timoshenko": -0.04567080992583128
+    },
+    {
+      "resolution": [
+        10,
+        2,
+        2
+      ],
+      "n_nodes": 365,
+      "n_tets": 48,
+      "n_hexes": 32,
+      "n_ties": 4,
+      "n_dofs": 1095,
+      "bending_axis": "z",
+      "h_z": 0.005,
+      "tip_deflection": 0.003944547043089633,
+      "max_displacement": 0.003956410593814218,
+      "equilibrium_residual": 1.544683601483951e-11,
+      "reaction_resultant": [
+        7.251976796851523e-13,
+        -2.6539881403664367e-12,
+        1.0000000000152
+      ],
+      "solve_time_s": 0.11653614044189453,
+      "rel_error_euler_bernoulli": -0.013863239227591806,
+      "rel_error_timoshenko": -0.021349912397749082
+    },
+    {
+      "resolution": [
+        20,
+        4,
+        4
+      ],
+      "n_nodes": 2169,
+      "n_tets": 384,
+      "n_hexes": 256,
+      "n_ties": 16,
+      "n_dofs": 6507,
+      "bending_axis": "z",
+      "h_z": 0.0025,
+      "tip_deflection": 0.0039685878835394005,
+      "max_displacement": 0.003980294881890162,
+      "equilibrium_residual": 7.269691215882906e-11,
+      "reaction_resultant": [
+        -9.029443859276398e-13,
+        -1.3095080575453721e-13,
+        1.0000000000726916
+      ],
+      "solve_time_s": 1.1177470684051514,
+      "rel_error_euler_bernoulli": -0.007853029115149845,
+      "rel_error_timoshenko": -0.01538533133047193
+    },
+    {
+      "resolution": [
+        30,
+        6,
+        6
+      ],
+      "n_nodes": 6565,
+      "n_tets": 1296,
+      "n_hexes": 864,
+      "n_ties": 36,
+      "n_dofs": 19695,
+      "bending_axis": "z",
+      "h_z": 0.0016666666666666668,
+      "tip_deflection": 0.003973755954968143,
+      "max_displacement": 0.003985467755634343,
+      "equilibrium_residual": 4.6059672168920774e-11,
+      "reaction_resultant": [
+        2.407962718109502e-12,
+        6.991740519879386e-12,
+        0.9999999999545396
+      ],
+      "solve_time_s": 4.092240810394287,
+      "rel_error_euler_bernoulli": -0.0065610112579643776,
+      "rel_error_timoshenko": -0.014103122371820098
+    },
+    {
+      "resolution": [
+        40,
+        8,
+        8
+      ],
+      "n_nodes": 14705,
+      "n_tets": 3072,
+      "n_hexes": 2048,
+      "n_ties": 64,
+      "n_dofs": 44115,
+      "bending_axis": "z",
+      "h_z": 0.00125,
+      "tip_deflection": 0.003975828365282863,
+      "max_displacement": 0.003987554718882443,
+      "equilibrium_residual": 2.0825240943657437e-10,
+      "reaction_resultant": [
+        -3.2748803668880555e-12,
+        1.4243425883186944e-11,
+        1.0000000002077412
+      ],
+      "solve_time_s": 17.370394945144653,
+      "rel_error_euler_bernoulli": -0.0060429086792843645,
+      "rel_error_timoshenko": -0.013588953187400832
+    },
+    {
+      "resolution": [
+        60,
+        12,
+        12
+      ],
+      "n_nodes": 46825,
+      "n_tets": 10368,
+      "n_hexes": 6912,
+      "n_ties": 144,
+      "n_dofs": 140475,
+      "bending_axis": "z",
+      "h_z": 0.0008333333333333334,
+      "tip_deflection": 0.0039775619583243774,
+      "max_displacement": 0.00398930768653492,
+      "equilibrium_residual": 4.669269324686116e-10,
+      "reaction_resultant": [
+        -7.951000968731137e-12,
+        -2.492675510445963e-11,
+        0.9999999995337996
+      ],
+      "solve_time_s": 146.43530797958374,
+      "rel_error_euler_bernoulli": -0.005609510418905672,
+      "rel_error_timoshenko": -0.013158845252722484
+    }
+  ],
+  "convergence_order": 0.4819425113868548,
+  "finest_rel_error_timoshenko": -0.013158845252722484,
+  "target_relative_error": 0.1,
+  "passed_target": true
+}

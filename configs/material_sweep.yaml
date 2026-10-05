@@ -1,0 +1,32 @@
+# Fig. 5 – material generalisation of the q → mechanics stage.
+#
+# Frozen: POD basis Φ (reference material), marker geometry / image Jacobian,
+# marker-free ResNet checkpoint. Changed: (E, ν) → K → K_r = ΦᵀKΦ only.
+
+grasp_config: grasp                      # reference mechanics, world camera, estimator gates
+output_dir: results/figure5
+seed: 0
+
+materials:
+  e_factors: [0.25, 0.5, 1.0, 2.0, 4.0]  # E / E_ref at the reference ν
+  nu_values: [0.30, 0.35, 0.45]          # ν at the reference E (reference ν = 0.40 already included)
+
+# held-out inner-face contacts (midpoints of the grasp-NN training grid, x: 13 pts 0.55–0.97, z: 7 pts 0.15–0.85)
+held_out:
+  x_rel: [0.585, 0.655, 0.725, 0.795, 0.865, 0.935]
+  z_rel: [0.2083, 0.4417, 0.6750]
+forces_N: [0.3, 0.8, 1.3, 1.8, 2.3, 3.0]
+
+sources:
+  oracle: true
+  marker: true                           # Stage-D world-camera marker LS (pixel_noise_std from grasp.yaml)
+  marker_frames: 30                      # q averaged over this many noisy frames (≈ the Kalman hold in the demo)
+  nn: true                               # marker-free ResNet (estimator.nn.checkpoint from grasp.yaml)
+
+closed_loop:
+  enabled: true
+  e_factors: [0.5, 1.0, 2.0, 4.0]        # E x0.25 cannot reach the 2.2 N target within opening_min
+  modes: [world, nn]
+  t_max_s: 10.0
+  # deformation-based gates (q units) scale with compliance: q_gate(E) = q_gate(E_ref) * E_ref / E
+  scale_q_gates: true

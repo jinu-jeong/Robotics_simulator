@@ -1,0 +1,26 @@
+# Milestone 2 – contact position / force magnitude sweep (FEM ground truth).
+#
+# Each sample: a single pressing normal contact (force along -n) at a point on
+# the finger's top surface, solved with the linear FEM of configs/fem.yaml.
+# Stored: nodal displacement u, contact position/normal/face/barycentric
+# weights, force magnitude & vector, plus the mesh and all metadata.
+
+fem_config: fem                # configs/<name>.yaml (geometry, mesh, material, BC)
+output: data/processed/contact_sweep_top.npz
+seed: 0
+store_dtype: float32           # storage precision for u (float32 | float64)
+
+contact:
+  surface: top                 # top | side_pos_y | side_neg_y  (surface the probe presses on)
+  sampling: grid               # grid | random
+  # grid: fractions of (L, W) along the surface
+  x_rel: { min: 0.30, max: 0.98, n: 15 }
+  y_rel: { min: 0.15, max: 0.85, n: 5 }
+  # random: uniform in the same ranges
+  n_random: 300
+
+force:
+  # pressing normal force magnitudes [N]; grid or log-uniform random
+  sampling: grid               # grid | random
+  magnitude: { min: 0.1, max: 3.0, n: 12 }
+  n_random: 1

@@ -1,0 +1,72 @@
+grasp_config: grasp
+output: data/processed/grasp_nn_top.npz
+output_dir: results/grasp_nn
+checkpoint_dir: results/checkpoints/grasp_nn
+seed: 0
+image:
+  width: 240
+  height: 180
+samples:
+  contact_x_rel:
+  - 0.55
+  - 0.97
+  - 13
+  contact_z_rel:
+  - 0.15
+  - 0.85
+  - 7
+  forces_N:
+  - 0.15
+  - 3.5
+  - 10
+  pose_repeats: 2
+  n_free: 300
+  pose_jitter:
+    xy_mm: 4.0
+    lift_max_m: 0.04
+    rot_deg: 2.0
+    light_jitter_m: 0.05
+scene:
+  finger_color:
+  - 0.75
+  - 0.75
+  - 0.78
+  object_color:
+  - 0.85
+  - 0.45
+  - 0.18
+  table_color:
+  - 0.35
+  - 0.35
+  - 0.38
+  background_color:
+  - 0.1
+  - 0.11
+  - 0.13
+  ambient:
+  - 0.35
+  - 0.35
+  - 0.35
+  light_color:
+  - 0.8
+  - 0.8
+  - 0.8
+  light_offset:
+  - 0.0
+  - 0.0
+  - 0.15
+  image_noise_std: 0.01
+model:
+  arch: resnet18
+  width: 64
+  epochs: 60
+  batch_size: 32
+  lr: 0.0005
+  weight_decay: 0.0001
+  patience: 12
+  augment: true
+  target: sim
+  input: raw
+split:
+  hold_every: 3
+  hold_force_above: null

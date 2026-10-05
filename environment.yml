@@ -1,0 +1,26 @@
+# Conda environment for the compliant-finger force estimation project.
+#
+#   conda env create -f environment.yml
+#   conda activate compliant_finger
+#   pip install -e .
+#
+# Taichi is installed via pip (no conda package). On macOS the GGUI viewer runs
+# on Vulkan (MoltenVK, bundled with the Taichi wheel). On Linux/Windows with an
+# NVIDIA GPU set `backend: cuda` in configs/viewer.yaml.
+name: compliant_finger
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - pyyaml
+  - pytest
+  - h5py
+  - pip
+  - pip:
+      - taichi>=1.7
+      # ML / vision (used from Milestone 5 onward)
+      - torch
+      - opencv-python

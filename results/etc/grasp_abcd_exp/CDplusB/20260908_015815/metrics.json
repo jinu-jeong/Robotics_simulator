@@ -1,0 +1,20 @@
+{
+  "name": "CDplusB",
+  "success": true,
+  "phase": "hold",
+  "t_contact": 0.6800000000000004,
+  "t_lock": 2.020000000000001,
+  "dt_lock_after_contact": 1.3400000000000005,
+  "lam_true_at_lock": 1.3079134546416675,
+  "lam_meas_at_lock": 1.0115792021018153,
+  "contact_err_mm_at_lock": 14.88899253695266,
+  "n_visible_at_lock": 24,
+  "blind_s": 0.31,
+  "max_true_while_blind": 0.4445196054990603,
+  "post_lock_mae_1s": 0.54198828182671,
+  "early_prelock_mae": 0.05599462731238241,
+  "final_contact_err_mm": 14.88899253695266,
+  "obj_z_mm": 39.92435243742804,
+  "dual_cam": true,
+  "known_fallback": true
+}

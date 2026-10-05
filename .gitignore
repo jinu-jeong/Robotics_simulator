@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.taichi_cache/
+data/raw/*
+data/processed/*
+results/figures/*
+results/videos/*
+results/checkpoints/*
+results/metrics/*
+# timestamped run directories written by scripts/run_*.py
+results/*/20*/
+!**/.gitkeep
+.DS_Store
+imgui.ini
+results/etc/checkpoints/
+*.pt
+.benchmarks/
+

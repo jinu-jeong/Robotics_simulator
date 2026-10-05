@@ -1,0 +1,20 @@
+{
+  "name": "DplusB",
+  "success": true,
+  "phase": "hold",
+  "t_contact": 0.6800000000000004,
+  "t_lock": 1.9600000000000015,
+  "dt_lock_after_contact": 1.2800000000000011,
+  "lam_true_at_lock": 1.2566227309302254,
+  "lam_meas_at_lock": 1.1932589449420117,
+  "contact_err_mm_at_lock": 1.6666666666666634,
+  "n_visible_at_lock": 24,
+  "blind_s": 0.3,
+  "max_true_while_blind": 0.4188742436433393,
+  "post_lock_mae_1s": 0.14054143023812474,
+  "early_prelock_mae": 0.046469861783963805,
+  "final_contact_err_mm": 1.6666666666666634,
+  "obj_z_mm": 39.92435243742804,
+  "dual_cam": false,
+  "known_fallback": true
+}

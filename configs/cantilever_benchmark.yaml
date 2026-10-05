@@ -1,0 +1,37 @@
+# Milestone 1 – cantilever verification of the 3D quadratic (H20 + T10) FEM.
+#
+# Rectangular beam clamped at x = 0, transverse force F (-z) distributed as a
+# uniform traction over the end face x = L. FEM tip deflection (mean u_z of
+# the end-face nodes) is compared with Euler-Bernoulli and Timoshenko theory
+# on a sequence of refined meshes.
+
+geometry:
+  length: 0.100
+  width:  0.020
+  height: 0.010
+
+material:
+  name: "benchmark elastic"
+  youngs_modulus: 5.0e7
+  poisson_ratio: 0.30
+
+load:
+  force_magnitude: 1.0          # [N], applied in -z on the end face
+  direction: [0.0, 0.0, -1.0]
+
+# (nx, ny, nz) H20/T10 cell resolutions. Listed coarse to fine.
+refinement:
+  - [5, 1, 1]
+  - [10, 2, 2]
+  - [20, 4, 4]
+  - [30, 6, 6]
+  - [40, 8, 8]
+# Extra level used only with --fine (≈120k DOFs, about a minute).
+refinement_fine:
+  - [60, 12, 12]
+
+# Reported (not enforced) target for the finest default mesh vs Timoshenko.
+target_relative_error: 0.10
+
+output_dir: results/etc/cantilever
+seed: 0

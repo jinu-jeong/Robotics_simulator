@@ -1,0 +1,708 @@
+{
+  "reference_material": {
+    "youngs_modulus": "5.0e7",
+    "poisson_ratio": 0.4,
+    "density": 1200.0
+  },
+  "basis_fingerprint": "069d499f2236",
+  "q_modes": 8,
+  "held_out_contacts": [
+    [
+      0.058499999999999996,
+      0.02,
+      0.002083
+    ],
+    [
+      0.058499999999999996,
+      0.02,
+      0.004417
+    ],
+    [
+      0.058499999999999996,
+      0.02,
+      0.006750000000000001
+    ],
+    [
+      0.0655,
+      0.02,
+      0.002083
+    ],
+    [
+      0.0655,
+      0.02,
+      0.004417
+    ],
+    [
+      0.0655,
+      0.02,
+      0.006750000000000001
+    ],
+    [
+      0.0725,
+      0.02,
+      0.002083
+    ],
+    [
+      0.0725,
+      0.02,
+      0.004417
+    ],
+    [
+      0.0725,
+      0.02,
+      0.006750000000000001
+    ],
+    [
+      0.07950000000000002,
+      0.02,
+      0.002083
+    ],
+    [
+      0.07950000000000002,
+      0.02,
+      0.004417
+    ],
+    [
+      0.07950000000000002,
+      0.02,
+      0.006750000000000001
+    ],
+    [
+      0.08650000000000001,
+      0.02,
+      0.002083
+    ],
+    [
+      0.08650000000000001,
+      0.02,
+      0.004417
+    ],
+    [
+      0.08650000000000001,
+      0.02,
+      0.006750000000000001
+    ],
+    [
+      0.09350000000000001,
+      0.02,
+      0.002083
+    ],
+    [
+      0.09350000000000001,
+      0.02,
+      0.004417
+    ],
+    [
+      0.09350000000000001,
+      0.02,
+      0.006750000000000001
+    ]
+  ],
+  "forces_N": [
+    0.3,
+    0.8,
+    1.3,
+    1.8,
+    2.3,
+    3.0
+  ],
+  "q_train_max_p99_5": 0.17086739930602374,
+  "marker_frames_averaged": 30,
+  "pixel_noise_std": 0.25,
+  "offline": [
+    {
+      "material": {
+        "name": "E x0.25",
+        "E_factor": 0.25,
+        "youngs_modulus": 12500000.0,
+        "poisson_ratio": 0.4,
+        "sweep": "E"
+      },
+      "proj_residual_median": 0.0006428565422607071,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.0007938066979892586,
+          "force_known_rel_median_staleK": 3.0031752267919574,
+          "force_unknown_rel_median": 0.010982914228259713,
+          "force_unknown_rel_median_staleK": 3.027681311193777,
+          "contact_err_mm_median": 0.6593145758846362,
+          "contact_err_mm_median_staleK": 0.6593145758846362,
+          "q_norm_median": 0.20156513164251924
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.02090237225170727,
+          "force_known_rel_median": 0.01455256193675368,
+          "force_known_rel_median_staleK": 3.056567368095906,
+          "force_unknown_rel_median": 0.049656002171780435,
+          "force_unknown_rel_median_staleK": 2.919582563302139,
+          "contact_err_mm_median": 2.9543252211156803,
+          "contact_err_mm_median_staleK": 2.9543252211156803,
+          "q_norm_median": 0.2031351562009538
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.13209350287240657,
+          "force_known_rel_median": 0.13204706865250643,
+          "force_known_rel_median_staleK": 2.748972773405179,
+          "force_unknown_rel_median": 0.13090117557002315,
+          "force_unknown_rel_median_staleK": 2.6711720426255523,
+          "contact_err_mm_median": 1.4283964261351327,
+          "contact_err_mm_median_staleK": 1.4283964261351327,
+          "q_norm_median": 0.15330950222610432
+        }
+      },
+      "stiffness_N_per_m": 386.92214470570065,
+      "nn_in_distribution_fraction": 0.4444444444444444
+    },
+    {
+      "material": {
+        "name": "E x0.5",
+        "E_factor": 0.5,
+        "youngs_modulus": 25000000.0,
+        "poisson_ratio": 0.4,
+        "sweep": "E"
+      },
+      "proj_residual_median": 0.0006428565422607071,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.0007938066979892586,
+          "force_known_rel_median_staleK": 1.0015876133959785,
+          "force_unknown_rel_median": 0.010982914228259713,
+          "force_unknown_rel_median_staleK": 1.0138406555968884,
+          "contact_err_mm_median": 0.6593145758846362,
+          "contact_err_mm_median_staleK": 0.6593145758846362,
+          "q_norm_median": 0.10078256582125962
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.027939943531986602,
+          "force_known_rel_median": 0.013136156735549529,
+          "force_known_rel_median_staleK": 1.0214374337137557,
+          "force_unknown_rel_median": 0.06985181466465074,
+          "force_unknown_rel_median_staleK": 1.0064721405677213,
+          "contact_err_mm_median": 4.113759551421488,
+          "contact_err_mm_median_staleK": 4.113759551421488,
+          "q_norm_median": 0.10194930193697593
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.04176880172124005,
+          "force_known_rel_median": 0.04060170309478432,
+          "force_known_rel_median_staleK": 1.044901358267355,
+          "force_unknown_rel_median": 0.04998066141870841,
+          "force_unknown_rel_median_staleK": 1.072345072747157,
+          "contact_err_mm_median": 0.8336000239923231,
+          "contact_err_mm_median_staleK": 0.8336000239923231,
+          "q_norm_median": 0.10224637589985
+        }
+      },
+      "stiffness_N_per_m": 773.8442894114013,
+      "nn_in_distribution_fraction": 0.8333333333333334
+    },
+    {
+      "material": {
+        "name": "E x1",
+        "E_factor": 1.0,
+        "youngs_modulus": 50000000.0,
+        "poisson_ratio": 0.4,
+        "sweep": "E"
+      },
+      "proj_residual_median": 0.0006428565422607071,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.0007938066979892586,
+          "force_known_rel_median_staleK": 0.0007938066979892586,
+          "force_unknown_rel_median": 0.010982914228259713,
+          "force_unknown_rel_median_staleK": 0.010982914228259713,
+          "contact_err_mm_median": 0.6593145758846362,
+          "contact_err_mm_median_staleK": 0.6593145758846362,
+          "q_norm_median": 0.05039128291062981
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.04896389552558472,
+          "force_known_rel_median": 0.014993292555240519,
+          "force_known_rel_median_staleK": 0.014993292555240519,
+          "force_unknown_rel_median": 0.13447034523119106,
+          "force_unknown_rel_median_staleK": 0.13447034523119106,
+          "contact_err_mm_median": 6.526667508937928,
+          "contact_err_mm_median_staleK": 6.526667508937928,
+          "q_norm_median": 0.05018517584304796
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.06550011083981902,
+          "force_known_rel_median": 0.06619405015213278,
+          "force_known_rel_median_staleK": 0.06619405015213278,
+          "force_unknown_rel_median": 0.0879573540048369,
+          "force_unknown_rel_median_staleK": 0.0879573540048369,
+          "contact_err_mm_median": 0.711820092002025,
+          "contact_err_mm_median_staleK": 0.711820092002025,
+          "q_norm_median": 0.054807448651788195
+        }
+      },
+      "stiffness_N_per_m": 1547.6885788228026,
+      "nn_in_distribution_fraction": 1.0
+    },
+    {
+      "material": {
+        "name": "E x2",
+        "E_factor": 2.0,
+        "youngs_modulus": 100000000.0,
+        "poisson_ratio": 0.4,
+        "sweep": "E"
+      },
+      "proj_residual_median": 0.0006428565422607071,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.0007938066979892586,
+          "force_known_rel_median_staleK": 0.4996030966510054,
+          "force_unknown_rel_median": 0.010982914228259713,
+          "force_unknown_rel_median_staleK": 0.4965398361007779,
+          "contact_err_mm_median": 0.6593145758846362,
+          "contact_err_mm_median_staleK": 0.6593145758846362,
+          "q_norm_median": 0.025195641455314905
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.08997347021697574,
+          "force_known_rel_median": 0.026172888350733503,
+          "force_known_rel_median_staleK": 0.5004594534686295,
+          "force_unknown_rel_median": 0.2467754550501461,
+          "force_unknown_rel_median_staleK": 0.5253445935560601,
+          "contact_err_mm_median": 13.51746563166934,
+          "contact_err_mm_median_staleK": 13.51746563166934,
+          "q_norm_median": 0.025551836920937765
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.16021188671557873,
+          "force_known_rel_median": 0.16121293917198237,
+          "force_known_rel_median_staleK": 0.452188474969233,
+          "force_unknown_rel_median": 0.17598921457353994,
+          "force_unknown_rel_median_staleK": 0.44685686205297115,
+          "contact_err_mm_median": 0.6612478038044511,
+          "contact_err_mm_median_staleK": 0.6612478038044511,
+          "q_norm_median": 0.028690119265521452
+        }
+      },
+      "stiffness_N_per_m": 3095.377157645605,
+      "nn_in_distribution_fraction": 1.0
+    },
+    {
+      "material": {
+        "name": "E x4",
+        "E_factor": 4.0,
+        "youngs_modulus": 200000000.0,
+        "poisson_ratio": 0.4,
+        "sweep": "E"
+      },
+      "proj_residual_median": 0.0006428565422607071,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.0007938066979892586,
+          "force_known_rel_median_staleK": 0.7498015483255027,
+          "force_unknown_rel_median": 0.010982914228259713,
+          "force_unknown_rel_median_staleK": 0.7482699180503889,
+          "contact_err_mm_median": 0.6593145758846362,
+          "contact_err_mm_median_staleK": 0.6593145758846362,
+          "q_norm_median": 0.012597820727657453
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.20338833126542394,
+          "force_known_rel_median": 0.06367502558962954,
+          "force_known_rel_median_staleK": 0.7570856830444627,
+          "force_unknown_rel_median": 0.4185002044297953,
+          "force_unknown_rel_median_staleK": 0.7712314300844665,
+          "contact_err_mm_median": 23.900973552196522,
+          "contact_err_mm_median_staleK": 23.900973552196522,
+          "q_norm_median": 0.012967143787347792
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.5167578238958273,
+          "force_known_rel_median": 0.5183840631730021,
+          "force_known_rel_median_staleK": 0.6227827622572383,
+          "force_unknown_rel_median": 0.5138419778640462,
+          "force_unknown_rel_median_staleK": 0.624630002107146,
+          "contact_err_mm_median": 0.5749384346640795,
+          "contact_err_mm_median_staleK": 0.5749384346640795,
+          "q_norm_median": 0.02032723796921586
+        }
+      },
+      "stiffness_N_per_m": 6190.75431529121,
+      "nn_in_distribution_fraction": 1.0
+    },
+    {
+      "material": {
+        "name": "nu 0.3",
+        "E_factor": 1.0,
+        "youngs_modulus": 50000000.0,
+        "poisson_ratio": 0.3,
+        "sweep": "nu"
+      },
+      "proj_residual_median": 0.0011336178093929248,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.041493676526416036,
+          "force_known_rel_median_staleK": 0.008505124117442319,
+          "force_unknown_rel_median": 0.05010306635109264,
+          "force_unknown_rel_median_staleK": 0.01664926805218082,
+          "contact_err_mm_median": 0.5085745512180482,
+          "contact_err_mm_median_staleK": 0.5025416526481408,
+          "q_norm_median": 0.05078969357594332
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.04894210737623409,
+          "force_known_rel_median": 0.04555014034744655,
+          "force_known_rel_median_staleK": 0.016482777657232685,
+          "force_unknown_rel_median": 0.10423427429361992,
+          "force_unknown_rel_median_staleK": 0.1125086505794839,
+          "contact_err_mm_median": 6.394585253597436,
+          "contact_err_mm_median_staleK": 6.520533669788514,
+          "q_norm_median": 0.05114927767279157
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.08116844882038432,
+          "force_known_rel_median": 0.1261562654482044,
+          "force_known_rel_median_staleK": 0.09050693381941377,
+          "force_unknown_rel_median": 0.14266407629224315,
+          "force_unknown_rel_median_staleK": 0.10414217282314318,
+          "contact_err_mm_median": 0.7682231302022867,
+          "contact_err_mm_median_staleK": 0.7052393390280353,
+          "q_norm_median": 0.055153804659039574
+        }
+      },
+      "stiffness_N_per_m": 1535.5690640278294,
+      "nn_in_distribution_fraction": 1.0
+    },
+    {
+      "material": {
+        "name": "nu 0.35",
+        "E_factor": 1.0,
+        "youngs_modulus": 50000000.0,
+        "poisson_ratio": 0.35,
+        "sweep": "nu"
+      },
+      "proj_residual_median": 0.0008080135554778857,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.014026748798027542,
+          "force_known_rel_median_staleK": 0.0053264944657049375,
+          "force_unknown_rel_median": 0.02231690315088899,
+          "force_unknown_rel_median_staleK": 0.01345500701470164,
+          "contact_err_mm_median": 0.583014499226447,
+          "contact_err_mm_median_staleK": 0.5085745512180482,
+          "q_norm_median": 0.05062690217839584
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.048583967448117674,
+          "force_known_rel_median": 0.020337944499919818,
+          "force_known_rel_median_staleK": 0.015984785582076864,
+          "force_unknown_rel_median": 0.08380270396155179,
+          "force_unknown_rel_median_staleK": 0.0894598946358324,
+          "contact_err_mm_median": 5.474362553470926,
+          "contact_err_mm_median_staleK": 5.424884581876939,
+          "q_norm_median": 0.050782818680422434
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.06659609475785441,
+          "force_known_rel_median": 0.08192318068630797,
+          "force_known_rel_median_staleK": 0.07270437440736596,
+          "force_unknown_rel_median": 0.09135437866725807,
+          "force_unknown_rel_median_staleK": 0.08266575092434061,
+          "contact_err_mm_median": 0.7523077511261088,
+          "contact_err_mm_median_staleK": 0.6718548123582163,
+          "q_norm_median": 0.05423194993081519
+        }
+      },
+      "stiffness_N_per_m": 1540.4957782388162,
+      "nn_in_distribution_fraction": 1.0
+    },
+    {
+      "material": {
+        "name": "nu 0.45",
+        "E_factor": 1.0,
+        "youngs_modulus": 50000000.0,
+        "poisson_ratio": 0.45,
+        "sweep": "nu"
+      },
+      "proj_residual_median": 0.0008461816473466447,
+      "n_contacts": 18,
+      "forces": [
+        0.3,
+        0.8,
+        1.3,
+        1.8,
+        2.3,
+        3.0
+      ],
+      "sources": {
+        "oracle": {
+          "n": 108,
+          "q_rel_median": 0.0,
+          "force_known_rel_median": 0.03867951131039818,
+          "force_known_rel_median_staleK": 0.0056677637962901685,
+          "force_unknown_rel_median": 0.045044285645837845,
+          "force_unknown_rel_median_staleK": 0.018103432503738387,
+          "contact_err_mm_median": 0.6644624933774114,
+          "contact_err_mm_median_staleK": 0.9277114882260822,
+          "q_norm_median": 0.05004288618595441
+        },
+        "marker": {
+          "n": 108,
+          "q_rel_median": 0.047183908624715304,
+          "force_known_rel_median": 0.042219229309191406,
+          "force_known_rel_median_staleK": 0.013883997094555862,
+          "force_unknown_rel_median": 0.11361743765623988,
+          "force_unknown_rel_median_staleK": 0.10322817363350399,
+          "contact_err_mm_median": 5.938815789425236,
+          "contact_err_mm_median_staleK": 5.8622506251902955,
+          "q_norm_median": 0.04943909734889368
+        },
+        "nn": {
+          "n": 108,
+          "q_rel_median": 0.06830503428718815,
+          "force_known_rel_median": 0.1099443019256578,
+          "force_known_rel_median_staleK": 0.062349278401242464,
+          "force_unknown_rel_median": 0.12885237122387394,
+          "force_unknown_rel_median_staleK": 0.07759661379878754,
+          "contact_err_mm_median": 0.6009252125773312,
+          "contact_err_mm_median_staleK": 0.711820092002025,
+          "q_norm_median": 0.05480166227479201
+        }
+      },
+      "stiffness_N_per_m": 1558.6118138433544,
+      "nn_in_distribution_fraction": 1.0
+    }
+  ],
+  "closed_loop": [
+    {
+      "E_factor": 0.5,
+      "mode": "world",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 773.8442894114013,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 1.3674914608885396,
+      "lam_meas_final": 2.248069033447571,
+      "force_rel_err_median": 0.5892677685794692,
+      "force_rel_err_p90": 0.6439364323246805,
+      "contact_err_mm": 22.092175902593016,
+      "lift_started_s": 3.039999999999979,
+      "sim_t": 6.949999999999896,
+      "wall_s": 25.070973873138428,
+      "basis_fingerprint": "069d499f2236"
+    },
+    {
+      "E_factor": 0.5,
+      "mode": "nn",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 773.8442894114013,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 2.4113230473138105,
+      "lam_meas_final": 2.142620797752673,
+      "force_rel_err_median": 0.08135446142068202,
+      "force_rel_err_p90": 0.1377026597401925,
+      "contact_err_mm": 3.8414768572053597,
+      "lift_started_s": 3.9599999999999596,
+      "sim_t": 7.869999999999877,
+      "wall_s": 28.10216498374939,
+      "basis_fingerprint": "069d499f2236"
+    },
+    {
+      "E_factor": 1.0,
+      "mode": "world",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 1547.6885788228026,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 2.7102698568746675,
+      "lam_meas_final": 2.1534402745952304,
+      "force_rel_err_median": 0.1946081132187919,
+      "force_rel_err_p90": 0.22784560903239884,
+      "contact_err_mm": 14.710752869924773,
+      "lift_started_s": 2.899999999999982,
+      "sim_t": 6.809999999999899,
+      "wall_s": 25.323467016220093,
+      "basis_fingerprint": "069d499f2236"
+    },
+    {
+      "E_factor": 1.0,
+      "mode": "nn",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 1547.6885788228026,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 2.393857710358198,
+      "lam_meas_final": 2.1987582356615145,
+      "force_rel_err_median": 0.07311486218349433,
+      "force_rel_err_p90": 0.12687616891127684,
+      "contact_err_mm": 3.9528470752104643,
+      "lift_started_s": 2.669999999999987,
+      "sim_t": 6.579999999999904,
+      "wall_s": 24.47831916809082,
+      "basis_fingerprint": "069d499f2236"
+    },
+    {
+      "E_factor": 2.0,
+      "mode": "world",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 3095.377157645605,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 1.6399961870136608,
+      "lam_meas_final": 2.1678399413534875,
+      "force_rel_err_median": 0.3218566960823244,
+      "force_rel_err_p90": 0.4249009854753071,
+      "contact_err_mm": 14.62790806795163,
+      "lift_started_s": 1.7300000000000013,
+      "sim_t": 5.639999999999924,
+      "wall_s": 20.59139609336853,
+      "basis_fingerprint": "069d499f2236"
+    },
+    {
+      "E_factor": 2.0,
+      "mode": "nn",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 3095.377157645605,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 2.3459601485892225,
+      "lam_meas_final": 2.102019780045575,
+      "force_rel_err_median": 0.06160476188493226,
+      "force_rel_err_p90": 0.15608135369233742,
+      "contact_err_mm": 1.3975424859373695,
+      "lift_started_s": 1.8900000000000015,
+      "sim_t": 5.799999999999921,
+      "wall_s": 21.67000699043274,
+      "basis_fingerprint": "069d499f2236"
+    },
+    {
+      "E_factor": 4.0,
+      "mode": "world",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 6190.75431529121,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 1.416876458353338,
+      "lam_meas_final": 2.2199425718359165,
+      "force_rel_err_median": 0.3576211301219733,
+      "force_rel_err_p90": 0.5688050878041999,
+      "contact_err_mm": 14.62790806795163,
+      "lift_started_s": 1.5600000000000012,
+      "sim_t": 5.469999999999928,
+      "wall_s": 20.403478145599365,
+      "basis_fingerprint": "069d499f2236"
+    },
+    {
+      "E_factor": 4.0,
+      "mode": "nn",
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "stiffness_N_per_m": 6190.75431529121,
+      "hold_force_N": 1.3075533333333331,
+      "lam_final": 2.7384308571375104,
+      "lam_meas_final": 2.126252386228597,
+      "force_rel_err_median": 0.09921509307160827,
+      "force_rel_err_p90": 0.23526962372044743,
+      "contact_err_mm": 0.8838834764831847,
+      "lift_started_s": 1.8600000000000014,
+      "sim_t": 5.769999999999921,
+      "wall_s": 23.263998985290527,
+      "basis_fingerprint": "069d499f2236"
+    }
+  ]
+}

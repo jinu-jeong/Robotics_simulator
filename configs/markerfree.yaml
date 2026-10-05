@@ -1,0 +1,103 @@
+# Marker-free visual state estimation (markers as training-time privileged information).
+#
+# Data:   every FEM sample x view is rendered twice from the *same* state / camera /
+#         light / noise realisation: with marker discs (teacher) and without (deployment).
+#         Labels: q_sim = Phi_r^T u (exact) and q_marker (existing marker pipeline).
+# Model:  marker-free RGB -> ResNet-18 -> q_pred (same basis / convention as q_sim).
+# Physics: q_pred -> existing ROM (force at known contact, unknown-contact residual search).
+
+fem_dataset: data/processed/contact_sweep_top.npz
+rom_basis:   data/processed/rom_basis_top.npz
+q_modes: 8
+output:      data/processed/markerfree_top.npz
+seed: 0
+output_dir: results/etc/markerfree
+checkpoint_dir: results/etc/checkpoints/markerfree
+
+image:
+  width: 192
+  height: 144
+  grayscale: false
+  noise_std: 0.02
+
+camera:
+  target_rel: [0.55, 0.5, 0.5]
+  position_offset_rel: [0.05, -1.1, 0.55]
+  up: [0.0, 0.0, 1.0]
+  fov_y_deg: 40.0
+  n_views_per_sample: 2
+  jitter:
+    position_rel: 0.05
+    target_rel: 0.02
+    fov_deg: 2.0
+
+markers:
+  face: top
+  nx: 10
+  ny: 3
+  margin_rel: 0.06
+  radius_rel: 0.12
+  color: [1.0, 0.2, 0.1]
+  pixel_noise_std: 0.5          # noise on marker pixels used by the marker teacher
+
+appearance:
+  finger_color: [0.75, 0.75, 0.78]
+  ambient: [0.35, 0.35, 0.35]
+  light_color: [0.8, 0.8, 0.8]
+  light_offset_rel: [0.5, -1.0, 1.5]
+  light_jitter_rel: 0.4
+  background_colors:
+    - [0.10, 0.11, 0.13]
+    - [0.45, 0.45, 0.47]
+    - [0.85, 0.85, 0.85]
+    - [0.20, 0.30, 0.15]
+    - [0.35, 0.20, 0.10]
+  show_probe: true              # probe sphere at the contact (same in both renders)
+
+# q_marker teacher: existing marker -> q pipeline applied to the noisy marker pixels.
+teacher:
+  estimator: iterative          # geometric | iterative (GN + Huber)
+  use_noisy: true
+  geometric_ridge: 1.0e-4
+  n_iter: 2
+  huber_px: 1.5
+
+# Image -> q network (needs torch).
+model:
+  arch: resnet18
+  width: 64                     # base channel width (64 = standard ResNet-18)
+  epochs: 60
+  batch_size: 32
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  patience: 12
+  augment: true                 # brightness / contrast jitter + small pixel shifts (train only)
+  target: sim                   # sim | marker  (default for train_image_to_q.py --target)
+  input: raw                    # raw | marker  (raw = marker-free deployment images)
+
+split:
+  hold_every: 3                 # held-out contact locations
+  hold_force_above: null
+
+force:
+  method: displacement
+  mode: normal
+  nonneg: true
+
+unknown_contact:
+  enabled: true
+  face: top
+  face_stride: 2
+  barycentric:
+    - [1, 0, 0]
+    - [0, 1, 0]
+    - [0, 0, 1]
+    - [0.333333, 0.333333, 0.333333]
+    - [0.5, 0.5, 0.0]
+    - [0.5, 0.0, 0.5]
+    - [0.0, 0.5, 0.5]
+  min_influence: 1.0e-8
+  r_loc: 4
+  weight: leading
+  refine: true
+  refine_n: 7

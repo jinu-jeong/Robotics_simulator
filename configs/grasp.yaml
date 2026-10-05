@@ -1,0 +1,124 @@
+# Parallel-jaw grasp (stages A / B / C / D).
+# A: close / lift using the true contact force.
+# B/D: markers → q → (optional Kalman) → contact location from residual
+#      search on the inner face → ROM force (unknown_contact: true by default).
+
+fem:
+  geometry: {length: 0.100, width: 0.020, height: 0.010}
+  mesh: {element_size: 0.0025, tet_fraction: 0.2}   # H20 + T10 tip, 40x8x4 cells
+  material: {youngs_modulus: 5.0e7, poisson_ratio: 0.40, density: 1200.0}
+  boundary_conditions: {fixed_surface: root, tolerance: 1.0e-9}
+  # Self-weight of each finger (ρ V ≈ 24 g → 0.24 N spread along the finger).
+  # World-frame vector; rotated into the finger frame by the flange pose T_ee.
+  # The estimator subtracts the known sag Φᵀu_g(R) (estimator.gravity_compensation).
+  gravity: {enabled: true, vector: [0.0, 0.0, -9.80665]}
+
+contact:
+  # Inner-face contact, fractions of (L, W, H). y is overwritten to the inner face.
+  position_rel: [0.85, 1.0, 0.50]
+
+object:
+  size: [0.028, 0.024, 0.010]   # (x, y, z) [m]; y = grasped width
+  mass: 0.12                    # [kg]  -> weight ≈ 1.18 N
+  friction: 0.45                # Coulomb μ (need 2 μ λ ≥ mg to lift)
+  stiffness: null               # [N/m] λ / width compression; null = rigid (finger k ≈ 1550 N/m)
+  color: [0.85, 0.45, 0.18]
+
+gripper:
+  opening_start: 0.032          # inner-face gap [m], starts clear of the object
+  opening_min: 0.016
+  close_speed: 0.012            # [m/s] approach before contact
+  unlock_squeeze_speed: 0.0008  # [m/s] creep to preload while contact unlocked
+  lift_height: 0.035            # [m]
+  lift_speed: 0.010             # [m/s] slow vertical lift (~3.5 s for 35 mm)
+
+control:
+  force_target: 2.2             # [N] per finger (hold threshold ≈ 1.18 / (2*0.45) ≈ 1.31 N)
+  force_tol: 0.40               # [N] settle band (wider for noisy unknown-contact λ̂)
+  kp: 0.004                     # opening increment per Newton of error
+  ki: 0.001
+  settle_s: 0.30
+  dt: 0.01
+  preload_force: 1.5            # [N] SNR enough to localize; then hold to average q
+  post_contact_hold_s: 0.90     # pause at preload so Kalman / contact lock can settle
+
+estimator:
+  # gt | markers | inverse | world | nn
+  mode: gt
+  marker_face: top
+  marker_nx: 8
+  marker_ny: 3
+  pixel_noise_std: 0.25         # [px] demo SNR (exp B); was 0.5
+  q_filter: kalman              # kalman (default) | none
+  kalman_process: 3.0e-6        # small enough to average hold noise, large enough to track squeeze
+  kalman_measure: 1.0e-4
+  # When true (default for markers/world), contact on the inner face is found
+  # from q̂ by residual search — not taken from contact.position_rel above.
+  unknown_contact: true
+  # Until residual search locks, ROM force at config contact (exp D) — avoids blind PI.
+  prelock_known_force: true
+  q_modes: 8
+  pod_n_x: 6
+  pod_n_z: 3
+  unknown_contact_cfg:
+    face_stride: 2
+    r_loc: 4
+    weight: leading
+    refine: true
+    refine_n: 7
+  # Reject noisy mid-force localizations; lock contact after consecutive agreement.
+  q_min_norm: 8.0e-3
+  max_residual_rel: 0.32
+  lock_residual_rel: 0.28
+  lock_min_force: 0.6
+  force_clip: 8.0
+  lock_votes: 5
+  lock_radius_m: 1.5e-2
+  q_lock_norm: 1.2e-2
+  vote_clear_bad: 4
+  camera:
+    target_rel: [0.55, 0.5, 0.5]
+    position_offset_rel: [0.05, -1.1, 0.55]
+    fov_y_deg: 40.0
+    image_width: 480
+    image_height: 360
+  # Stage D: camera fixed in the world (looks at the moving left finger)
+  world_camera:
+    position: [0.26, -0.20, 0.15]
+    target: [0.28, -0.01, 0.02]
+    up: [0.0, 0.0, 1.0]
+    fov_y_deg: 42.0
+    image_width: 480
+    image_height: 360
+    near: 0.06
+    far: 0.60
+  # Stage E (mode nn): marker-free frames of the same world camera → ResNet-18 → q.
+  # Train with: generate_grasp_nn_dataset.py → train_image_to_q.py --config grasp_nn
+  nn:
+    checkpoint: results/etc/checkpoints/grasp_nn/resnet18_q_sim_raw.pt
+    image_width: 240             # network input resolution (camera pose / FOV from world_camera)
+    image_height: 180
+    every: 3                     # camera tick every k control steps (≈ 33 Hz at dt = 0.01)
+    remote: true                 # render in a child process (viewer owns the GGUI window)
+
+# Stage C: 7-DoF serial arm (damped-LS IK). A/B scripts ignore this block.
+arm:
+  d_base: 0.14
+  L_upper: 0.24
+  L_fore: 0.20
+  L_flange: 0.07
+  object_xy: [0.32, 0.00]
+  table_z: 0.0
+  pregrasp_offset: [-0.07, 0.00, 0.04]   # in EE frame, before final approach
+  ik_damping: 0.002
+  ik_max_dq: 0.03               # rad per step; lift follows Cartesian lift_speed
+  ik_tol: 0.0025
+
+# Temporarily disabled — Figure 2 demos write to results/figure2/{world|nn}/ instead.
+# output_dir: results/etc/grasp
+seed: 0
+
+# Plots / viewer inset only — does not change the force controller.
+display:
+  force_beautify: true
+  force_ema: 0.18          # causal EMA on the estimate curve

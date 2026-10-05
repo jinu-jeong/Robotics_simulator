@@ -1,0 +1,20 @@
+{
+  "name": "C_2cam",
+  "success": true,
+  "phase": "hold",
+  "t_contact": 0.6800000000000004,
+  "t_lock": 2.0799999999999996,
+  "dt_lock_after_contact": 1.3999999999999992,
+  "lam_true_at_lock": 1.3592041783531095,
+  "lam_meas_at_lock": 1.078052599862445,
+  "contact_err_mm_at_lock": 15.09230856356236,
+  "n_visible_at_lock": 24,
+  "blind_s": 1.3900000000000001,
+  "max_true_while_blind": 1.3506557244012025,
+  "post_lock_mae_1s": 0.5499501806301772,
+  "early_prelock_mae": null,
+  "final_contact_err_mm": 15.09230856356236,
+  "obj_z_mm": 39.92435243742804,
+  "dual_cam": true,
+  "known_fallback": false
+}

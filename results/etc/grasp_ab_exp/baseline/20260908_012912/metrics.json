@@ -1,0 +1,17 @@
+{
+  "name": "baseline",
+  "success": true,
+  "phase": "hold",
+  "t_contact": 0.6800000000000004,
+  "t_lock": 1.9300000000000015,
+  "dt_lock_after_contact": 1.250000000000001,
+  "lam_true_at_lock": 1.2309773690745045,
+  "lam_meas_at_lock": 1.1503864732910725,
+  "contact_err_mm_at_lock": 12.692955176439852,
+  "n_visible_at_lock": 24,
+  "blind_s": 1.24,
+  "max_true_while_blind": 1.2224289151225975,
+  "post_lock_mae_1s": 0.5495328492722111,
+  "final_contact_err_mm": 12.692955176439852,
+  "obj_z_mm": 39.92435243742804
+}

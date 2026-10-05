@@ -1,0 +1,56 @@
+# Milestone 7 – end-to-end evaluation (vision → q → deformation → force)
+# plus a first Level-4 unknown-contact localizer (residual search on the contact face).
+
+vision_dataset: data/processed/vision_top.npz
+fem_dataset:    data/processed/contact_sweep_top.npz
+rom_basis:      data/processed/rom_basis_top.npz
+q_modes: 8
+seed: 0
+output_dir: results/etc/e2e
+checkpoint_dir: results/etc/checkpoints/vision_model
+
+vision:
+  # default q-estimator for the packaged pipeline
+  estimator: ridge          # geometric | iterative | robust | ridge | cnn | oracle
+  use_noisy_markers: true
+  ridge_lambda: 1.0e-2
+  geometric_ridge: 1.0e-4
+  # overrides for iterative / robust (ignored unless that estimator is selected)
+  # n_iter: 2
+  # huber_px: 1.5
+  # fuse_multiview: true
+
+force:
+  method: displacement
+  mode: normal
+  nonneg: true
+
+split:
+  hold_every: 3             # Test B – held-out contacts
+  hold_force_above: 2.0     # Test A – also move F > this from train → test
+
+generalization:
+  # Test C – extra marker pixel noise on top of the dataset noise [px]
+  extra_marker_noise_px: [0.0, 0.5, 1.0, 2.0]
+  # Test D – evaluate geometric model under extra camera pose jitter (units of L / deg)
+  pose_jitter_position_rel: 0.05
+  pose_jitter_fov_deg: 2.0
+  pose_trials: 3
+
+unknown_contact:
+  enabled: true
+  face: top
+  face_stride: 2            # keep every k-th boundary triangle
+  barycentric:              # samples per triangle (continuous surface, not a fixed point set)
+    - [1, 0, 0]
+    - [0, 1, 0]
+    - [0, 0, 1]
+    - [0.333333, 0.333333, 0.333333]
+    - [0.5, 0.5, 0.0]
+    - [0.5, 0.0, 0.5]
+    - [0.0, 0.5, 0.5]
+  min_influence: 1.0e-8     # discard candidates with ‖g_r‖² below this
+  r_loc: 4                  # localize with the first r POD modes (high modes are noisy)
+  weight: leading           # none | leading | energy
+  refine: true              # dense barycentric refine on the winning triangle
+  refine_n: 7

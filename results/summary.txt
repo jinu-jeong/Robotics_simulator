@@ -1,0 +1,281 @@
+================================================================================
+PAPER STORYLINE  –  vision → deformation (q) → physics → contact force
+Target: ICLR (primary).  Variants for ICML / ICRA at the end.
+All numbers below are reproducible from this repo; the file that produced each
+figure / number is given in brackets.  Simulation only (see Limitations).
+================================================================================
+
+0. ONE-SENTENCE PITCH
+--------------------------------------------------------------------------------
+Do not learn force from pixels.  Learn the *geometry* (a low-dimensional
+deformation state q) from pixels, and let an interpretable, swappable linear
+mechanics model turn q into contact location and force.  The learned part never
+sees a force label and never needs retraining when the finger's material
+changes; the physics part is exact, 8-dimensional, and runs in microseconds.
+
+
+1. PROBLEM
+--------------------------------------------------------------------------------
+Compliant fingers make grasps forgiving, but the robot then has no idea how hard
+it is squeezing or where it touches.  Tactile skins are expensive and fragile;
+a camera is already on most robots.  Existing vision-to-force work regresses
+force directly with a black-box network: it is opaque, needs force labels
+(hard to get on soft bodies), and is tied to one specific finger.
+
+Question: can a single fixed RGB camera give contact force *and* location on a
+compliant finger, in closed loop, without markers on the finger, and without
+learning anything about force?
+
+
+2. KEY IDEA (contributions, ICLR framing)
+--------------------------------------------------------------------------------
+(i)  Deformation as the learning target.  The finger's deformation field u ∈ R^{3N}
+     lives on an 8-dimensional POD subspace (q = Φᵀu; 8 modes capture 99.99+ % of
+     snapshot energy, held-out reconstruction 0.06 %).  q is a *geometric*
+     quantity – it depends only on what the camera sees.
+
+(ii) Markers as privileged information.  During training we render each state
+     twice: with surface markers (a geometric least-squares estimator gives
+     q_marker), and without.  A ResNet-18 is trained marker-free → q.  At test
+     time no markers exist.  We show that supervising with the exact simulated q
+     beats supervising with the marker teacher, and why (per-mode SNR).
+
+(iii) Physics after the network.  A Galerkin ROM K_r = ΦᵀKΦ (8×8) turns q into
+     force at a known contact by one scalar least squares, and into contact
+     *location* by a residual search over the grasp face (~1000 candidates,
+     O(C r)).  Same code for marker q and network q.
+
+(iv) Generalisation for free.  Because the network outputs geometry, changing
+     the finger material (E, ν) means rebuilding K only.  We sweep E ×0.25–×4
+     and ν 0.30–0.45 with Φ, markers and network frozen: force is recovered to
+     reference accuracy, and an un-updated model is wrong by exactly |E₀/E − 1|.
+
+(v)  Closed loop.  A 7-DoF arm grasps and lifts an object with force feedback
+     coming *only* from the fixed camera, both with markers and marker-free.
+
+What is *not* claimed: no real-camera results; linear quasi-static elasticity;
+one finger geometry; the contacting object is visible to the camera.
+
+
+3. METHOD (short; the ROM is thin in the main text, POD details in appendix)
+--------------------------------------------------------------------------------
+Mechanics.  Linear-elastic FEM of a clamped soft finger on a hex-dominant
+quadratic mesh (20-node hexahedra, 10-node tetrahedra at the tip, hanging-node
+ties; default element size = thickness/4 → 40×8×4 cells, 23.7 k DOF),
+K(E, ν) u = B(c) λ n(c) for a normal point contact of magnitude λ at surface
+point c.  Verified against Euler–Bernoulli / Timoshenko for the lateral (−y)
+tip load used throughout (appendix A; top-face −z benchmark also available).
+
+Reduced state.  Snapshots of unit-load solves on the grasp face → POD → Φ (r=8).
+K_r = ΦᵀKΦ, B_r(c) = ΦᵀB(c).  Force at known c:  λ̂ = argmin_{λ≥0} ‖K_r⁻¹B_r(c)n λ − q‖.
+Unknown c: precompute g(c) = K_r⁻¹B_r(c)n for a candidate grid, pick the c with
+the smallest weighted residual (leading 4 modes), barycentric refine.
+
+Two routes to q̂ (Fig. 1):
+  D  markers   pixels of surface markers → LS with the image Jacobian of Φ → q̂.
+  E  marker-free   240×180 RGB from the same world camera → ResNet-18 → q̂.
+     Trained on 2 120 paired frames from the grasp scene (91 contacts × 10 forces
+     × 2 poses + 300 free frames), target q_sim, 60 epochs, ~10 min on an M-series
+     GPU.  Held-out contacts (31/91): q̂ error median 0.048 vs 0.27 for the marker
+     estimator at this camera.
+
+Temporal / control.  Kalman filter on q̂; before the contact lock, force is
+computed at the nominal grasp point; after 5 consistent localisations within
+15 mm the contact is locked and both ĉ and λ̂ feed a PI controller on gripper
+opening; Coulomb lift check.
+
+Material change.  Only K(E, ν) → K_r and g(c) are rebuilt; Φ is pinned to the
+reference material (estimator.pod_reference_material) so q keeps its meaning and
+the network checkpoint remains valid.
+
+Self-weight.  The finger carries its own weight (ρ = 1200 kg/m³ → 0.24 N,
+tip sag 0.35 mm = wL⁴/8EI; consistent quadratic body force, rotated into the
+finger frame by the flange pose).  Linear ⇒ u = u_contact(λ) + u_g(R).  u_g is a *known load*: the
+marker LS subtracts its marker motion in pixel space before the fit (exact –
+u_g is a −z bending field, almost orthogonal to the −y press modes in Φ, so a
+q-space correction Φᵀu_g would not remove it); on the hex-dominant mesh the
+ROM force at 2 N reads 2.002 N with or without compensation (the former T4
+mesh coupled y and z and read 1.918 N uncompensated).  The network regresses the
+contact-only q and is empirically invariant to the sag in the image
+(7.3 % force / 4.0 mm contact in the arm loop with the sag, 7.3 % / 2.8 mm
+without) – no q correction for path E.  Ablation: uncompensated marker paths
+degrade to 176 % (world camera) and 306 % (fixed camera), both drop the object.
+
+
+4. EXPERIMENTS AND FIGURES
+--------------------------------------------------------------------------------
+Fig. 1  Concept / pipeline.                                  [results/figure1/]
+   Draw the boxes yourself; panels 15 (world-camera view of the grasp) and
+   16 (draft block diagram) are the new building blocks; 14 shows the paired
+   marker-on / marker-off frames (privileged information); 06 the POD modes.
+   Scene panels 01–02, 04–12 are regenerated with the *inner-face / lateral (−y)*
+   press (same as Stages D/E) via ``scripts/render_figure1_lateral.py`` — not the
+   old top-face tip-load demos. Panel 03 is the FEM↔beam-theory convergence
+   check for the *same lateral (−y) tip load* (configs/cantilever_lateral.yaml,
+   I = H W³/12, L/W = 5; levels 1×1×1 … 80×12×6). FEM plateaus at 1.016 mm,
+   between Euler–Bernoulli (1.000 mm) and Timoshenko (1.033 mm).
+   There is no analytic 3D tip deflection: “correct” here means verification —
+     (1) mesh plateau (δ stops moving under refinement → not grid luck; else
+         every POD / vision / force label on u would drift with the mesh);
+     (2) patch test exact (uniaxial tension + hex|tet ties; reactions 1e-10) —
+         rules out a broken K that could still converge to the wrong PDE;
+     (3) |δ_FEM/δ_T − 1| floors at ~1.6 % for the expected 3D-vs-1D reasons
+         (full-face clamp, shear, end traction), not a mesh bug.
+   Right panel: same δ_FEM numerator; |δ/δ_T − 1| = gap to 1D theory (floors);
+   |δ/δ_3D − 1| = gap to Richardson estimate of this FEM’s own continuum limit
+   δ(h→0) from the two finest meshes (discretisation only; “3D” = not the 1D
+   beam line). Fit slope ≈ 1.9. See README Milestone 1.
+   Panel 17 (and 17a/b/c) shows what each path *consumes* for one real frame:
+     A  privileged marker uv as numbers → q → force (no image)
+     B  camera RGB → red-blob detect → Δuv → LS q̂ → force
+     C  marker-free RGB → ResNet-18 → q̂ → force
+   (same state F≈1.64 N; regenerate via ``python scripts/export_figure1_assets.py``).
+   Scene panels include the finger's self-weight (u_contact + u_g); 18 shows the
+   sag alone, 09 the ROM force with / without compensating it.
+
+Fig. 2  Closed-loop grasp from a single fixed camera.         [results/figure2/]
+   Stage screenshots home → approach → squeeze → lift → hold and the force
+   trace λ̂ vs λ for (a) markers (--mode world) and (b) marker-free (--mode nn).
+   Default config, 10 s cap, both lift:  contact error 14.7 mm / 4.0 mm, raw
+   |λ̂−λ| median 0.56 N (19.5 %) / 0.20 N (7.3 %) – the marker lock lands on a
+   wrong inner-face candidate (single-frame marker localisation at this camera
+   is 3–48 mm noisy, Fig. 3/5); the marker-free path lands right.  ResNet every
+   3rd step ≈ 33 Hz.
+   Message: the *same* physics code closes the loop from either q̂ source.
+
+Fig. 3  Marker-free q is good enough for physics – and where the teacher fails.
+                                    [results/etc/markerfree/eval_20260913_011452/]
+   summary_bars.png, error_vs_load.png, force_true_vs_est_known.png.
+   600 held-out views, medians:
+     q source                        q err   force(known c)  contact   force(unknown c)
+     q_sim (ROM ceiling)              0       ~0             0.17 mm   0.4 %
+     markers (geometric LS)           0.125   3.7 %          18.6 mm   40 %
+     ResNet raw → q_sim               0.106   10.5 %         1.22 mm   11 %
+     ResNet raw → q_marker (teacher)  0.210   20.9 %         5.2 mm    25 %
+     ResNet raw → q_marker, SNR wts   0.153   15.0 %         6.7 mm    20 %
+     ResNet marker-on → q_sim         0.084   8.4 %          1.16 mm   8.5 %
+     ResNet raw, no probe visible     0.130   12.5 %         7.8 mm    22 %
+   Message: markers nail mode 1 (force at a known contact) but are noise on
+   modes 4–8, which *localisation* needs; the network is uniform across modes,
+   so it wins by 15× on contact location and 4× on force once contact must be
+   found.  Supervise with exact q, or reweight the teacher by its per-mode SNR.
+   The network reads the silhouette / shading, not the dots (marker-on ≈ raw).
+
+Fig. 4  When does marker-based localisation close?  Sensitivity to SNR.
+                                    [results/etc/e2e/20260907_140516/ (snr_*),
+                                     results/etc/e2e/20260907_154647/ (contact_localization)]
+   Search ceiling with oracle q: 0.25 mm / 0.4 %.  Marker re-projection sweep:
+     2 views · 0.5 px · 192×144     12.2 mm / 24 %
+     8 views · 0.5 px · 192×144      7.1 mm / 16 %
+     8 views · 0.2 px · 192×144      2.7 mm / 6.0 %
+     8 views · 0.5 px · 768×576      1.7 mm / 3.3 %
+   Temporal: 32-frame Kalman hold at 2 views · 0.5 px → 2.45 mm / 4.8 %.
+   Message: the bottleneck is q̂ noise on high modes, not the physics or the
+   search; more pixels, more views, or a ~1 s hold buy accuracy – or (Fig. 3)
+   a network that reads the whole silhouette.
+
+Fig. 5  Material generalisation – same finger, different (E, ν), nothing retrained.
+                                    [results/figure5/material_sweep.png, closed_loop.png]
+   Frozen: Φ, marker geometry / image Jacobian, ResNet.  Rebuilt: K → K_r, g(c).
+   18 held-out contacts × 6 forces (0.3–3 N), medians:
+     (a) known-contact force error, K updated: oracle 0.1 %, markers 1–6 %,
+         NN 4–52 % across E ×0.25 … ×4 (trained at E₀ only; force error grows as
+         the deformations leave its training range);  K stale: exactly
+         |E₀/E − 1| = 300 / 100 / 0 / 50 / 75 %.
+     (b) contact location, K updated: oracle 0.7 mm; NN 0.6–1.4 mm for *every*
+         material; markers 3.0 → 23.9 mm as the finger stiffens (less deformation
+         per pixel of noise).
+     (c) force with contact found from q: NN 5–51 %, markers 5–42 %.
+     (d) ν sweep at E₀: on the hex-dominant mesh ν barely changes the field
+         (Φ residual ≈ 0.1 %, k 1536–1559 N/m); the rebuilt vs stale K_r differ
+         at the level of the r = 8 truncation error (1.4–4.1 % vs 0.5–0.9 %).
+   Closed loop with the material changed at run time (E ×0.5, 1, 2, 4; Φ pinned
+   to E₀; gates scaled by E₀/E):  8/8 lifts succeed.  Marker-free: contact 0.9–4.0
+   mm, force 6–10 %.  Markers: 15–22 mm, 20–59 % (the lock lands on a nearby
+   wrong candidate at every E; on the former T4 mesh the E₀ run got lucky).
+   Message: the learned stage is material-agnostic because it predicts geometry;
+   the physics stage is the only thing that knows E and ν, and it is a one-line
+   rebuild.  A direct image→force regressor would have to be retrained.
+
+Appendix (ROM and FEM details)              [results/etc/rom/20260907_041350/,
+                                             results/etc/cantilever/, figure1/02,03,06,07]
+   POD energy and r-sweep (r=4: 0.3 % reconstruction, r=8: 0.06 %; leading modes
+   are bending / torsion), displacement-space vs force-space reduced estimators
+   (force-space degrades beyond r=4, displacement-space does not), FEM
+   verification vs beam theory with mesh refinement, ROM vs full FEM timing.
+   Also: inverse-force robustness to model error (mesh, contact offset, δE) from
+   results/etc/inverse_force_robustness/ – complements Fig. 5 (Fig. 5 = the
+   material *is* known and swapped; robustness = it is *mis*-known).
+
+
+5. LIMITATIONS (state them, reviewers will)
+--------------------------------------------------------------------------------
+* Synthetic renders only; no real camera, texture, specularity or sim-to-real.
+* Linear, quasi-static, homogeneous isotropic elasticity; one finger geometry;
+  point normal contact on one face.  Large-strain / hyperelastic fingers would
+  need a nonlinear (or piecewise-linear) ROM – the q-then-physics split still
+  applies, but K becomes K(q).
+* Self-weight is included as a quasi-static body force (no inertia / dynamics);
+  the marker-free checkpoint was trained on sag-free renders (it is invariant
+  to the 0.35 mm sag in practice; the dataset generator renders the sag, so the
+  retrained checkpoint has the invariance by design).
+* The object is visible and acts as a location cue (Fig. 3 ablation: 1.2 → 7.6 mm
+  without it – still 2.6× better than markers).
+* Marker-free training data comes from the same simulator / camera family.
+* The material sweep changes E and ν of a *known* material; unknown material
+  would need identification (a natural follow-up: E from the ratio of commanded
+  gripper displacement to observed q).
+
+
+6. SUGGESTED TITLE / ABSTRACT SEEDS
+--------------------------------------------------------------------------------
+Title candidates
+  "Predict Geometry, Not Force: Marker-Free Visual Contact Sensing on Compliant
+   Fingers with a Swappable Physics Head"
+  "Deformation Coordinates as the Interface between Vision and Mechanics for
+   Soft-Finger Force Estimation"
+Abstract skeleton: problem (force & contact on soft fingers from one camera) →
+idea (learn q, not force; markers as privileged information; ROM head) → results
+(Fig. 2 closed loop; Fig. 3 17× localisation vs markers; Fig. 5 material swap with
+no retraining) → limitation (simulation).
+
+
+7. VENUE VARIANTS
+--------------------------------------------------------------------------------
+ICLR (primary, representation-learning angle)
+  Lead with (ii)+(iv): a physically meaningful latent (q) as the learning target,
+  privileged-information distillation, and *compositional* generalisation across
+  materials because the learned module is decoupled from the physical parameter.
+  Fig. 3 (why the teacher's high modes are noise → supervise with q, or SNR
+  reweighting) and Fig. 5 are the core; Fig. 2 is the motivating demo.
+  Reviewer asks to expect: real data (no), comparison with a direct image→force
+  CNN baseline (add: train the same ResNet to output λ directly and show it
+  breaks under material change – cheap to add with generate_grasp_nn_dataset.py),
+  more modes / nonlinear.
+
+ICML (methods angle)
+  Same content; emphasise the structured latent + linear operator head as a
+  general recipe (differentiable, closed form, 8×8), the per-mode SNR analysis,
+  and the identifiability argument (E-only change is exactly a scale on q).
+
+ICRA (robotics angle)
+  Lead with Fig. 2 (closed-loop lift with a single fixed camera, marker-free),
+  then Fig. 5 (change finger material, no retraining), Fig. 4 as the design
+  guide (pixels / views / hold budget), Fig. 3 as the ablation.  Add timing
+  (ResNet 1.5 ms, ROM 0.3 ms, 33 Hz loop) and the arm/IK details.  Real-robot
+  experiment would be expected for a strong accept.
+
+
+8. REPRODUCE
+--------------------------------------------------------------------------------
+  python scripts/run_arm_grasp.py --mode world          # Fig. 2a
+  python scripts/run_arm_grasp.py --mode nn             # Fig. 2b
+  python scripts/eval_image_to_q.py                     # Fig. 3 (results/etc/markerfree/eval_*)
+  python scripts/run_snr_sweep.py; run_temporal_eval.py; run_l4_eval.py   # Fig. 4
+  python scripts/run_material_sweep.py                  # Fig. 5
+  python scripts/render_figure1_lateral.py              # Fig. 1 scenes (lateral press + self-weight)
+  python scripts/export_figure1_assets.py               # Fig. 1 panels
+  python scripts/run_rom_analysis.py                    # appendix
+  python -m pytest                                      # 160+ tests
+  (self-weight is on via fem.gravity in grasp.yaml / fem.yaml; set enabled: false
+   or estimator.gravity_compensation: false for the ablations quoted above)

@@ -1,0 +1,27 @@
+vision_dataset: data/processed/vision_top.npz
+fem_dataset: data/processed/contact_sweep_top.npz
+rom_basis: data/processed/rom_basis_top.npz
+q_modes: 8
+seed: 0
+output_dir: results/vision_model
+checkpoint_dir: results/checkpoints/vision_model
+split:
+  hold_every: 3
+  hold_force_above: null
+markers:
+  use_noisy: true
+  ridge_lambda: 0.01
+  geometric_ridge: 0.0001
+  eps: 0.0001
+image_cnn:
+  epochs: 40
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+  hidden: 64
+  dropout: 0.1
+  patience: 8
+force:
+  method: displacement
+  mode: normal
+  nonneg: true

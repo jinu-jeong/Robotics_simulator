@@ -1,0 +1,37 @@
+geometry:
+  length: 0.1
+  width: 0.02
+  height: 0.01
+material:
+  name: benchmark elastic
+  youngs_modulus: 5.0e7
+  poisson_ratio: 0.3
+load:
+  force_magnitude: 1.0
+  direction:
+  - 0.0
+  - 0.0
+  - -1.0
+refinement:
+- - 10
+  - 2
+  - 2
+- - 20
+  - 4
+  - 4
+- - 30
+  - 6
+  - 6
+- - 40
+  - 8
+  - 8
+- - 60
+  - 12
+  - 12
+refinement_fine:
+- - 80
+  - 16
+  - 16
+target_relative_error: 0.1
+output_dir: results/etc/cantilever
+seed: 0

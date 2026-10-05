@@ -1,0 +1,50 @@
+geometry:
+  length: 0.1
+  width: 0.02
+  height: 0.01
+material:
+  name: TPU-like compliant polymer
+  youngs_modulus: 5.0e7
+  poisson_ratio: 0.4
+load:
+  force_magnitude: 1.0
+  direction:
+  - 0.0
+  - -1.0
+  - 0.0
+refinement:
+- - 1
+  - 1
+  - 1
+- - 2
+  - 1
+  - 1
+- - 3
+  - 1
+  - 1
+- - 5
+  - 1
+  - 1
+- - 10
+  - 2
+  - 2
+- - 20
+  - 4
+  - 2
+- - 30
+  - 6
+  - 3
+- - 40
+  - 8
+  - 4
+refinement_fine:
+- - 60
+  - 12
+  - 6
+- - 80
+  - 12
+  - 6
+target_relative_error: 0.1
+output_dir: results/etc/cantilever_lateral
+plot_copy: results/etc/figures/lateral/03_fem_convergence_lateral.png
+seed: 0

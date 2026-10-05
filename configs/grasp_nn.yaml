@@ -1,0 +1,55 @@
+# Stage E – marker-free world-camera state estimation for the arm grasp demo.
+#
+# Data: the Stage D grasp scene (two fingers + object + table, moving with the
+#       flange pose T_ee) rendered through the world camera, twice per state:
+#       with marker discs (teacher) and without (deployment). Labels: q_sim in
+#       the grasp estimator's POD basis, q_marker from the Stage D marker path.
+# Model: marker-free RGB -> ResNet-18 -> q; force / contact from the unchanged ROM.
+
+grasp_config: grasp                       # configs/grasp.yaml (mechanics, world camera, estimator POD)
+output: data/processed/grasp_nn_top.npz
+output_dir: results/etc/grasp_nn
+checkpoint_dir: results/etc/checkpoints/grasp_nn
+seed: 0
+
+image:
+  width: 240                              # network input (world camera pose / FOV, lower resolution)
+  height: 180
+
+samples:
+  contact_x_rel: [0.55, 0.97, 13]         # inner-face contact grid: [min, max, n] as fractions of L
+  contact_z_rel: [0.15, 0.85, 7]          #                                                        of H
+  forces_N: [0.15, 3.5, 10]               # [min, max, n] per contact
+  pose_repeats: 2                         # random T_ee / light jitter per (contact, force)
+  n_free: 300                             # zero-force frames along pregrasp -> grasp -> lift
+  pose_jitter:
+    xy_mm: 4.0                            # flange translation jitter
+    lift_max_m: 0.04                      # extra +z (the lift phase)
+    rot_deg: 2.0
+    light_jitter_m: 0.05
+
+scene:
+  finger_color: [0.75, 0.75, 0.78]
+  object_color: [0.85, 0.45, 0.18]
+  table_color: [0.35, 0.35, 0.38]
+  background_color: [0.10, 0.11, 0.13]
+  ambient: [0.35, 0.35, 0.35]
+  light_color: [0.8, 0.8, 0.8]
+  light_offset: [0.0, 0.0, 0.15]
+  image_noise_std: 0.01
+
+model:
+  arch: resnet18
+  width: 64
+  epochs: 60
+  batch_size: 32
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  patience: 12
+  augment: true
+  target: sim
+  input: raw
+
+split:
+  hold_every: 3
+  hold_force_above: null

@@ -1,0 +1,19 @@
+# Marker-only SNR / view-count sweep for Level 4 (no image regeneration).
+# Re-projects FEM surface markers through calibrated cameras.
+
+e2e_config: e2e
+vision_config: vision
+seed: 0
+output_dir: results/etc/e2e
+
+n_views: [1, 2, 4, 8]
+noise_px: [0.2, 0.5, 1.0]
+res_scales: [1, 2, 4]
+base_noise_px: 0.5          # extra resolutions are run at this noise
+base_width: 192
+base_height: 144
+max_samples: 250            # unique held-out FEM samples (stride across contacts)
+
+n_iter: 2
+huber_px: 1.5
+geometric_ridge: 1.0e-4

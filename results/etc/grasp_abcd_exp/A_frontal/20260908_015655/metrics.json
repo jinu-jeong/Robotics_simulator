@@ -1,0 +1,20 @@
+{
+  "name": "A_frontal",
+  "success": false,
+  "phase": "squeeze",
+  "t_contact": 0.6800000000000004,
+  "t_lock": 2.4199999999999924,
+  "dt_lock_after_contact": 1.739999999999992,
+  "lam_true_at_lock": 1.5045278955355286,
+  "lam_meas_at_lock": 3.662450572351663,
+  "contact_err_mm_at_lock": 36.2646309341502,
+  "n_visible_at_lock": 24,
+  "blind_s": 1.73,
+  "max_true_while_blind": 1.5045278955355286,
+  "post_lock_mae_1s": 1.2287247014769402,
+  "early_prelock_mae": null,
+  "final_contact_err_mm": 36.2646309341502,
+  "obj_z_mm": 5.0,
+  "dual_cam": false,
+  "known_fallback": false
+}

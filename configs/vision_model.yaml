@@ -1,0 +1,40 @@
+# Milestone 6 – vision → q → force.
+#
+# Two estimators of the reduced coordinates q = Φ_rᵀ u:
+#   * markers: geometry-aware Jacobian LS, or learned ridge on Δuv
+#   * image:   small CNN on the observation-camera RGB frame
+# Force then follows from the ROM displacement-space estimator (known contact).
+
+vision_dataset: data/processed/vision_top.npz
+fem_dataset:    data/processed/contact_sweep_top.npz
+rom_basis:      data/processed/rom_basis_top.npz
+q_modes: 8
+seed: 0
+output_dir: results/etc/vision_model
+checkpoint_dir: results/etc/checkpoints/vision_model
+
+split:
+  # Hold out every `hold_every`-th contact location (Test B). Remaining contacts
+  # keep all force levels for training; optionally also hold out high forces (Test A).
+  hold_every: 3
+  hold_force_above: null   # e.g. 2.5 to also withhold large forces from train
+
+markers:
+  use_noisy: true          # train/eval on noisy marker_px (false = clean oracle)
+  ridge_lambda: 1.0e-2     # for learned ridge Δuv → q
+  geometric_ridge: 1.0e-4  # Tikhonov on the per-sample image Jacobian
+  eps: 1.0e-4              # FD step for ∂(uv)/∂q_k in marker 3D space [m of mode amp]
+
+image_cnn:
+  epochs: 60
+  batch_size: 64
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  hidden: 128
+  dropout: 0.2
+  patience: 15
+
+force:
+  method: displacement     # rom displacement-space (robust)
+  mode: normal             # normal-only force (matches dataset)
+  nonneg: true

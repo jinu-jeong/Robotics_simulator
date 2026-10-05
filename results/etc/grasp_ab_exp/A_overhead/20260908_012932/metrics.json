@@ -1,0 +1,17 @@
+{
+  "name": "A_overhead",
+  "success": true,
+  "phase": "hold",
+  "t_contact": 0.6800000000000004,
+  "t_lock": 3.379999999999972,
+  "dt_lock_after_contact": 2.6999999999999718,
+  "lam_true_at_lock": 1.7011423364293896,
+  "lam_meas_at_lock": 1.2596090482490927,
+  "contact_err_mm_at_lock": 15.285351657997335,
+  "n_visible_at_lock": 24,
+  "blind_s": 2.69,
+  "max_true_while_blind": 1.6925938824774824,
+  "post_lock_mae_1s": 0.6007063347790307,
+  "final_contact_err_mm": 15.285351657997335,
+  "obj_z_mm": 39.92435243742804
+}

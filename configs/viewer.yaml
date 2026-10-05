@@ -1,0 +1,117 @@
+# Taichi 3D viewer configuration (src/visualization/taichi_viewer.py).
+#
+# Units: all geometry is in SI meters. GUI text reports displacement in mm and
+# force in N. Sizes marked *_rel are relative to the scene bounding-box diagonal
+# so the same config works for a 10 cm finger and a 1 m beam.
+
+# Taichi backend for the viewer process: auto | cpu | cuda | vulkan | metal | gpu
+# "auto" = cuda -> vulkan -> metal -> cpu (first one that initializes).
+backend: auto
+
+window:
+  title: "Compliant Finger - Taichi Viewer"
+  width: 1600
+  height: 900
+  vsync: true
+
+background_color: [0.10, 0.11, 0.13]
+
+lighting:
+  ambient: [0.40, 0.40, 0.40]
+  # Point lights are placed at  center + rel_offset * bbox_diagonal
+  point_lights:
+    - { rel_offset: [ 1.5,  -2.0,  2.5], color: [0.85, 0.85, 0.85] }
+    - { rel_offset: [-1.5,   2.0,  1.5], color: [0.45, 0.45, 0.50] }
+    - { rel_offset: [ 0.0,   0.0, -2.5], color: [0.25, 0.25, 0.25] }
+
+# Developer (debugging) camera: free orbit / pan / zoom around the scene.
+developer_camera:
+  fov_deg: 40.0
+  yaw_deg: -55.0        # rotation about +z (up) axis
+  pitch_deg: 22.0       # elevation above the xy-plane
+  distance_rel: 1.8     # initial distance = distance_rel * bbox_diagonal
+  orbit_sensitivity: 220.0   # degrees per full-window mouse drag
+  pan_sensitivity: 1.2       # fraction of distance per full-window drag
+  zoom_sensitivity: 3.0      # log-zoom per full-window vertical drag
+  key_orbit_step_deg: 5.0
+  key_zoom_factor: 1.15
+  z_near_rel: 0.01
+  z_far_rel: 50.0
+
+colors:
+  original_surface:    [0.55, 0.58, 0.62]
+  original_wireframe:  [0.75, 0.78, 0.82]
+  deformed_surface:    [0.90, 0.60, 0.25]   # used when color mode is "solid"
+  wireframe:           [0.10, 0.10, 0.10]
+  tet_edges:           [0.35, 0.65, 0.95]
+  nodes:               [0.20, 0.45, 0.95]
+  fixed_nodes:         [0.95, 0.20, 0.20]
+  contact:             [1.00, 0.95, 0.10]
+  gt_force:            [0.10, 0.90, 0.20]
+  estimated_force:     [0.95, 0.20, 0.85]
+  object:              [0.30, 0.75, 0.85]
+  observation_camera:  [1.00, 0.55, 0.10]
+  observation_frustum: [1.00, 0.75, 0.30]
+  keypoint:            [1.00, 0.20, 0.10]   # surface markers seen by the observation camera
+  keypoint_hidden:     [0.45, 0.45, 0.45]   # markers not visible from the observation camera
+
+sizes:
+  node_radius_rel:        0.0045
+  fixed_node_radius_rel:  0.0075
+  contact_radius_rel:     0.014
+  keypoint_radius_rel:    0.006
+  wireframe_width:        1.0
+  wire_offset_rel:        0.003   # push wireframe lines off the surface (anti z-fighting)
+  outline_width:          2.5
+  tet_edge_width:         1.0
+  frustum_line_width:     2.0
+  camera_marker_size_rel: 0.04
+  arrow_shaft_radius_rel: 0.010
+  arrow_head_radius_rel:  0.022
+  arrow_head_length_rel:  0.075
+  arrow_segments:         16
+
+force_display:
+  # Visual arrow length per Newton [m/N]. null -> auto: the largest force in
+  # the state is drawn with length auto_max_length_rel * bbox_diagonal.
+  meters_per_newton: null
+  auto_max_length_rel: 0.55
+  min_length_rel: 0.02
+  # tip  : arrow ends at the force origin (contact force arriving at the surface)
+  # tail : arrow starts at the force origin
+  anchor: tip
+  # Lateral shift of the *estimated* force arrow (fraction of the bbox diagonal),
+  # perpendicular to F_true, so GT and estimate stay visible side by side when
+  # they coincide. 0 -> draw exactly at the contact point (estimate on top).
+  estimate_offset_rel: 0.03
+
+overlay:
+  # How the undeformed reference is drawn in overlay mode (no alpha blending in GGUI):
+  #   wireframe : all surface edges (good for coarse meshes)
+  #   outline   : feature edges only (dihedral angle > outline_angle_deg), good for dense meshes
+  #   auto      : wireframe if faces <= dense_faces_threshold else outline
+  ghost_style: auto
+  outline_angle_deg: 30.0
+  dense_faces_threshold: 2500
+  auto_disable_wireframe: true   # dense meshes start with the surface wireframe off
+
+deformation:
+  amplification: 10.0                        # initial alpha (visual only)
+  amplification_steps: [1, 2, 5, 10, 20, 50, 100]
+  colormap: viridis                          # viridis | jet | grey
+
+# Initial toggle states. All are switchable at runtime (keyboard / GUI panel).
+defaults:
+  mode: overlay                 # original | deformed | overlay
+  show_surface: true
+  show_wireframe: true
+  show_tet_edges: false
+  show_nodes: false
+  show_fixed_nodes: true
+  show_contact: true
+  show_gt_force: true
+  show_estimated_force: true
+  show_objects: true
+  show_observation_camera: true
+  color_by_displacement: true
+  show_gui_panel: true

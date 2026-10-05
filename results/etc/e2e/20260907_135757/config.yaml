@@ -1,0 +1,59 @@
+vision_dataset: data/processed/vision_top.npz
+fem_dataset: data/processed/contact_sweep_top.npz
+rom_basis: data/processed/rom_basis_top.npz
+q_modes: 8
+seed: 0
+output_dir: results/e2e
+checkpoint_dir: results/checkpoints/vision_model
+vision:
+  estimator: ridge
+  use_noisy_markers: true
+  ridge_lambda: 0.01
+  geometric_ridge: 0.0001
+force:
+  method: displacement
+  mode: normal
+  nonneg: true
+split:
+  hold_every: 3
+  hold_force_above: 2.0
+generalization:
+  extra_marker_noise_px:
+  - 0.0
+  - 0.5
+  - 1.0
+  - 2.0
+  pose_jitter_position_rel: 0.05
+  pose_jitter_fov_deg: 2.0
+  pose_trials: 3
+unknown_contact:
+  enabled: true
+  face: top
+  face_stride: 2
+  barycentric:
+  - - 1
+    - 0
+    - 0
+  - - 0
+    - 1
+    - 0
+  - - 0
+    - 0
+    - 1
+  - - 0.333333
+    - 0.333333
+    - 0.333333
+  - - 0.5
+    - 0.5
+    - 0.0
+  - - 0.5
+    - 0.0
+    - 0.5
+  - - 0.0
+    - 0.5
+    - 0.5
+  min_influence: 1.0e-08
+  r_loc: 4
+  weight: leading
+  refine: true
+  refine_n: 7

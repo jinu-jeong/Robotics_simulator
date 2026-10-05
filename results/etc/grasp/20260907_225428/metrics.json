@@ -1,0 +1,13 @@
+{
+  "success": false,
+  "phase": "drop",
+  "held": false,
+  "lam_final": 1.1641876723253886,
+  "lam_meas_final": 1.8577932141947342,
+  "obj_z_final_mm": 5.0,
+  "ik_err_final": 0.000533059741515928,
+  "force_target": 2.2,
+  "hold_force": 1.3075533333333331,
+  "unknown_contact": true,
+  "contact_err_mm": 27.227890566317438
+}

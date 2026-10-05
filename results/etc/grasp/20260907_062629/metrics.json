@@ -1,0 +1,27 @@
+{
+  "summary": {
+    "gt": {
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "lam_final": 2.200030619930512,
+      "lam_meas_final": 2.200030621198631,
+      "obj_z_final_mm": 40.0,
+      "force_target": 2.2,
+      "hold_force": 1.3075533333333331,
+      "tracking_mae_N": 0.5960404883009127
+    },
+    "markers": {
+      "success": true,
+      "phase": "hold",
+      "held": true,
+      "lam_final": 2.1817695250211075,
+      "lam_meas_final": 2.0375760796407,
+      "obj_z_final_mm": 40.0,
+      "force_target": 2.2,
+      "hold_force": 1.3075533333333331,
+      "tracking_mae_N": 0.583746096499166
+    }
+  },
+  "hold_force_N": 1.3075533333333331
+}

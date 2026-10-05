@@ -1,0 +1,17 @@
+{
+  "name": "B_snr",
+  "success": true,
+  "phase": "hold",
+  "t_contact": 0.6800000000000004,
+  "t_lock": 1.9600000000000015,
+  "dt_lock_after_contact": 1.2800000000000011,
+  "lam_true_at_lock": 1.2566227309302254,
+  "lam_meas_at_lock": 1.1932589449420117,
+  "contact_err_mm_at_lock": 1.6666666666666634,
+  "n_visible_at_lock": 24,
+  "blind_s": 1.27,
+  "max_true_while_blind": 1.2480742769783184,
+  "post_lock_mae_1s": 0.14054143023812474,
+  "final_contact_err_mm": 1.6666666666666634,
+  "obj_z_mm": 39.92435243742804
+}

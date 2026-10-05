@@ -1,0 +1,50 @@
+grasp_config: grasp
+output_dir: results/figure5
+seed: 0
+materials:
+  e_factors:
+  - 0.25
+  - 0.5
+  - 1.0
+  - 2.0
+  - 4.0
+  nu_values:
+  - 0.3
+  - 0.35
+  - 0.45
+held_out:
+  x_rel:
+  - 0.585
+  - 0.655
+  - 0.725
+  - 0.795
+  - 0.865
+  - 0.935
+  z_rel:
+  - 0.2083
+  - 0.4417
+  - 0.675
+forces_N:
+- 0.3
+- 0.8
+- 1.3
+- 1.8
+- 2.3
+- 3.0
+sources:
+  oracle: true
+  marker: true
+  marker_frames: 30
+  nn: true
+closed_loop:
+  enabled: true
+  e_factors:
+  - 0.5
+  - 1.0
+  - 2.0
+  - 4.0
+  modes:
+  - world
+  - nn
+  t_max_s: 10.0
+  scale_q_gates: true
