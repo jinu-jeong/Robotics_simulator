@@ -14,6 +14,8 @@ from src.grasp.nn_vision import (
     RemoteGraspRenderer,
     basis_fingerprint,
     compose_grasp_scene,
+    grain_seed,
+    make_photoreal,
     nn_camera,
     two_finger_faces,
 )
@@ -116,3 +118,27 @@ def test_remote_renderer_and_nn_mode_in_arm_loop(tiny_world_sim, tmp_path):
     finally:
         est.close()
         sim.set_mode("gt")
+
+
+def test_scene_appearance_keeps_photoreal_and_rejects_unknown_keys():
+    """Train/serve parity: the checkpoint's photoreal grade must survive the round trip."""
+    meta = GraspSceneAppearance().to_dict()
+    meta["photoreal"] = {"enabled": True, "backend": "auto", "strength": 0.4, "seed": 0}
+    ap = GraspSceneAppearance.from_dict(meta)
+    assert ap.photoreal == meta["photoreal"]
+    assert GraspSceneAppearance.from_dict(ap.to_dict()) == ap
+
+    enh = make_photoreal(ap)
+    assert enh is not None and enh.cfg.backend == "preview"  # "auto" must not switch to diffusers
+    img = np.full((24, 32, 3), 128, np.uint8)
+    out = enh(img, seed=3)
+    assert out.shape == img.shape and out.dtype == np.uint8 and not np.array_equal(out, img)
+    assert np.array_equal(out, enh(img, seed=3))
+
+    assert make_photoreal(GraspSceneAppearance()) is None
+    # film grain must not replay the renderer's image-noise field (same seed -> same normal draws)
+    a = np.random.default_rng(5).normal(size=4000)
+    b = np.random.default_rng(grain_seed(5)).normal(size=4000)
+    assert abs(np.corrcoef(a, b)[0, 1]) < 0.1
+    with pytest.raises(ValueError, match="unknown scene appearance keys"):
+        GraspSceneAppearance.from_dict({**meta, "photorealism": {}})

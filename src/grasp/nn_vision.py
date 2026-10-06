@@ -62,6 +62,7 @@ class GraspSceneAppearance:
     light_color: tuple[float, float, float] = (0.8, 0.8, 0.8)
     light_offset: tuple[float, float, float] = (0.0, 0.0, 0.15)  # relative to the camera position [m]
     image_noise_std: float = 0.01
+    photoreal: dict[str, Any] | None = None  # post-process of every frame (src/vision/photoreal.py); None = off
 
     def to_dict(self) -> dict[str, Any]:
         return {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.__dict__.items()}
@@ -69,12 +70,43 @@ class GraspSceneAppearance:
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> "GraspSceneAppearance":
         d = dict(d or {})
-        kw = {}
+        unknown = set(d) - set(cls.__dataclass_fields__)
+        if unknown:
+            # silently dropping a key here once removed the photoreal grade at deployment only
+            raise ValueError(f"unknown scene appearance keys: {sorted(unknown)}")
+        kw: dict[str, Any] = {}
         for k in cls.__dataclass_fields__:
             if k in d:
                 v = d[k]
-                kw[k] = tuple(float(x) for x in v) if isinstance(v, (list, tuple)) else float(v)
+                if k == "photoreal":
+                    kw[k] = None if v is None else dict(v)
+                else:
+                    kw[k] = tuple(float(x) for x in v) if isinstance(v, (list, tuple)) else float(v)
         return cls(**kw)
+
+
+def make_photoreal(appearance: GraspSceneAppearance):
+    """Frame post-process shared by dataset generation and the deployed estimator (None = off)."""
+    cfg = appearance.photoreal
+    if not cfg or not cfg.get("enabled", False):
+        return None
+    from ..vision.photoreal import PhotorealEnhancer
+
+    cfg = dict(cfg)
+    # Checkpoints store the requested backend, not the resolved one. The existing grasp-NN
+    # data was graded with the PIL preview; "auto" would now pick diffusers if it is installed.
+    if cfg.get("backend", "auto") == "auto":
+        cfg["backend"] = "preview"
+    return PhotorealEnhancer(cfg)
+
+
+def grain_seed(render_seed: int) -> int:
+    """Photoreal film-grain seed, independent of the renderer's image-noise stream.
+
+    Both draw ``default_rng(seed).normal`` over the same image shape, so reusing the render
+    seed adds one noise field twice (coherently); that read 2 N as 1.71 N instead of 2.10 N.
+    """
+    return int(np.random.SeedSequence([int(render_seed), 1]).generate_state(1)[0] & 0x7FFFFFFF)
 
 
 def two_finger_faces(mesh) -> np.ndarray:
@@ -234,6 +266,7 @@ class NNStateEstimator:
     last_image: np.ndarray | None = None
     n_frames: int = 0
     meta: dict = field(default_factory=dict)
+    photoreal: Any = None  # PhotorealEnhancer | None, same as at dataset generation
 
     @classmethod
     def from_checkpoint(
@@ -262,7 +295,13 @@ class NNStateEstimator:
                 f"checkpoint q-basis {fp} != estimator basis {expected_basis_fingerprint} "
                 "(regenerate scripts/generate_grasp_nn_dataset.py with the current grasp config)"
             )
-        ap = appearance or GraspSceneAppearance.from_dict(net.meta.get("scene_appearance"))
+        trained_ap = GraspSceneAppearance.from_dict(net.meta.get("scene_appearance"))
+        if appearance is not None and appearance != trained_ap:
+            raise ValueError(
+                f"scene appearance differs from the one the checkpoint was trained on:\n"
+                f"  config:     {appearance.to_dict()}\n  checkpoint: {trained_ap.to_dict()}"
+            )
+        ap = trained_ap
         mesh = mech.model.mesh
         faces = two_finger_faces(mesh)
         R = RemoteGraspRenderer if remote else GraspSceneRenderer
@@ -270,7 +309,7 @@ class NNStateEstimator:
         return cls(
             net=net, camera=nn_camera(world_camera, width, height), renderer=renderer, appearance=ap,
             table_center=np.asarray(table_center, float), table_size=np.asarray(table_size, float),
-            meta={"checkpoint": str(checkpoint), "basis_fingerprint": fp},
+            meta={"checkpoint": str(checkpoint), "basis_fingerprint": fp}, photoreal=make_photoreal(ap),
         )
 
     def frame(self, mech, u_local: np.ndarray, opening: float, T_ee: np.ndarray, object_center, object_R) -> np.ndarray:
@@ -282,6 +321,8 @@ class NNStateEstimator:
             img = self.renderer.render(nodes, self.camera, objs, seed=self.n_frames)
         else:
             img = self.renderer.render(nodes, self.camera, objs, rng=np.random.default_rng(self.n_frames))
+        if self.photoreal is not None:
+            img = self.photoreal(img, seed=grain_seed(self.n_frames))
         self.n_frames += 1
         self.last_image = img
         return img

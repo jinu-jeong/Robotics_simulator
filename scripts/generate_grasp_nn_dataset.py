@@ -41,7 +41,9 @@ from src.grasp.nn_vision import (  # noqa: E402
     GraspSceneRenderer,
     basis_fingerprint,
     compose_grasp_scene,
+    grain_seed,
     left_markers_world,
+    make_photoreal,
     nn_camera,
     two_finger_faces,
 )
@@ -127,6 +129,7 @@ def main() -> None:
     opening_start = float(gcfg["gripper"]["opening_start"])
 
     renderer = GraspSceneRenderer(W, H, 2 * mesh.n_nodes, two_finger_faces(mesh), ap)
+    photoreal = make_photoreal(ap)  # same frame post-process as NNStateEstimator.frame at deployment
     M = len(est.markers)
     img_marker = np.zeros((S, H, W, 3), np.uint8)
     img_raw = np.zeros((S, H, W, 3), np.uint8)
@@ -180,6 +183,9 @@ def main() -> None:
         img_marker[s] = renderer.render(nodes, cam, objs, markers_xyz=mk_p[vis], marker_normals=mk_n[vis], marker_radius=marker_radius,
                                         light_position=light, rng=np.random.default_rng(noise_seed))
         img_raw[s] = renderer.render(nodes, cam, objs, light_position=light, rng=np.random.default_rng(noise_seed))
+        if photoreal is not None:
+            img_marker[s] = photoreal(img_marker[s], seed=grain_seed(noise_seed))
+            img_raw[s] = photoreal(img_raw[s], seed=grain_seed(noise_seed))
         # Stage D marker teacher on this state (same camera pose, its own resolution-independent LS)
         est.rng = np.random.default_rng(noise_seed + 1)
         q_marker[s] = est._q_from_world(u, T_ee, opening)

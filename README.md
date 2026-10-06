@@ -25,7 +25,7 @@ The arm squeezes and lifts the orange box. The FEM finger is coloured by displac
 the orange frustum is the fixed observation camera, whose view is in the inset.
 The plot compares the ground-truth contact force (blue) with the estimate from
 camera → ResNet-18 → $q$ → ROM (orange, causal EMA for display; ground truth is never used).
-In this run the raw median force error is 25.6 % and the contact error 3.2 mm, and the object is lifted.
+In this run the raw median force error over lift and hold is 5.3 % and the contact error 2.8 mm (single run), and the object is lifted.
 
 <p align="center">
   <img src="docs/assets/pipeline.png" width="900" alt="Pipeline: fixed RGB camera → markers (privileged) or marker-free ResNet-18 → reduced deformation q → linear FEM + Galerkin ROM → grasp controller">

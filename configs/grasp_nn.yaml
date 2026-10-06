@@ -37,6 +37,11 @@ scene:
   light_color: [0.8, 0.8, 0.8]
   light_offset: [0.0, 0.0, 0.15]
   image_noise_std: 0.01
+  photoreal:                              # frame post-process (src/vision/photoreal.py); NNStateEstimator applies the checkpoint's copy
+    enabled: true
+    backend: preview
+    strength: 0.4
+    seed: 0
 
 model:
   arch: resnet18

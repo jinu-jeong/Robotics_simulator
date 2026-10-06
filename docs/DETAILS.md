@@ -226,10 +226,16 @@ option has been removed.)
 
 | folder | stage | object | raw force error / contact | result |
 |---|---|---|---|---|
-| `nn`, `nn_raw` | E marker-free | rigid | 25.6 % / 3.2 mm | lifts |
+| `nn`, `nn_raw` | E marker-free | rigid | 5.3 % / 2.8 mm | lifts |
 | `world`, `world_raw` | D markers | rigid | 10.5 % / 4.1 mm | lifts |
 | `world_soft1000_raw` | D markers | k_obj = 1000 | 2.3 % / 2.7 mm | lifts |
-| `nn_soft1000_raw` | E marker-free | k_obj = 1000 | 91 % / 3.6 mm | **drops** (opening shortcut, above) |
+| `nn_soft1000_raw` | E marker-free | k_obj = 1000 | 73 % / 3.3 mm | **drops** (opening shortcut, above) |
+
+The `nn*` rows were regenerated on 2026-10-05. Before that, the deployed network received flat
+renders while it had been trained on photoreal-graded frames: `GraspSceneAppearance.from_dict`
+silently dropped the checkpoint's `photoreal` setting, and the read-out drifted high during the lift
+(rigid: 25.6 % / 3.2 mm). `NNStateEstimator.frame` now applies the checkpoint's grade, with film grain
+seeded independently of the render noise (`grain_seed`); unknown appearance keys raise.
 
 ## Setup
 
